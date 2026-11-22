@@ -1,19 +1,20 @@
 # -*- coding: utf-8 -*-
-"""本地订单「首页缩略图」：打印时渲染、存在本机、由 stats_server 现取现发。
+"""本地订单缩略图：打印时渲染、存在本机、由 stats_server 现取现发。
 
 为什么需要（2026-11-19 用户反馈）：收支清算的订单明细里，文件名预览只认云端的
 `file_id` + `has_preview`；可**本地单**（本机手动批量打印）上报 `/api/local_orders` 时
 根本不带 file_id —— 后端那几行 order_files 是现建的，file_id 为 NULL。于是"本机打的单"
 永远点不出缩略图，而云端单又只在客户端下载时上传过一次。
 
-这里的做法不碰云端：打印结束（PDF 已生成）时顺手把首页渲染成 640px WebP 存进
-%APPDATA%\\HN打印工具\\order_thumbs\\<订单号>\\<文件名哈希>.webp，结算页改走
-`/api/local/order_thumb/<订单号>?name=<文件名>` —— 离线也能看，也不占云端存储。
+这里的做法不碰云端：打印结束（PDF 已生成）时顺手把**打印实际用的那份 PDF** 渲成
+1024px WebP 存进 %APPDATA%\\HN打印工具\\order_thumbs\\<订单号>\\<文件名哈希>[_pN].webp，
+结算页改走 `/api/local/order_thumb/<订单号>?name=<文件名>&page=N` —— 离线也能看、
+多页可翻，也不占云端存储。
 
 约定：
-  · 渲染绝不影响打印主流程（任何异常都吞掉，调用方只能拿到 None/0）；
-  · 一个订单的文件按**文件名**定位（同名文件内容相同，共用一张图就够）；
-  · 只出第 1 页（结算页的"略缩图"就是这个用途，翻页仍走云端预览）。
+  · 渲染绝不影响打印主流程（任何异常都吞掉，调用方只能拿到 None/0/[]）；
+  · 一个订单的文件按**文件名**定位（同名文件内容相同，共用同一组图就够）；
+  · 首页不带后缀（`<key>.webp`），第 N 页 `<key>_pN.webp`；换号时整个目录跟着改名。
 """
 import hashlib
 import os
@@ -23,12 +24,13 @@ import threading
 import paths
 
 DIR_NAME = "order_thumbs"
-# 单订单最多留几张：一单几十个文件已经超出"快速看一眼"的用途，太多也别把磁盘塞满
+# 单订单最多留几个文件（多页的算一个文件位；几十个文件已超出"快速看一眼"的用途）
 MAX_PER_ORDER = 60
 # 整个目录的总量上限（超出时按 mtime 清最旧订单，启动/写入时顺手做）
 MAX_TOTAL_BYTES = 256 * 1024 * 1024
 
 _SAFE_ORDER_RE = re.compile(r"^[0-9A-Za-z._-]{1,64}$")
+_PAGE_SUFFIX_RE = re.compile(r"^(?P<key>[0-9a-f]{20})(?:_p(?P<page>\d{1,3}))?\.(?P<ext>webp|jpg)$")
 _cache_lock = threading.Lock()
 
 
@@ -52,20 +54,26 @@ def order_dir(order_number: str, create: bool = True) -> str:
 
 
 def name_key(name: str) -> str:
-    """文件名的稳定键（同名文件共用一张图；大小写与路径分隔符不敏感）。"""
+    """文件名的稳定键（同名文件共用一组图；大小写与路径分隔符不敏感）。"""
     base = os.path.basename(str(name or "").replace("\\", "/")).strip().lower()
     return hashlib.sha1(base.encode("utf-8", "replace")).hexdigest()[:20]
 
 
-def save_bytes(order_number: str, name: str, data: bytes, fmt: str = "webp") -> str:
-    """把**已经编码好的**图片字节写进该订单目录，返回路径（失败返回空串）。"""
+def _file_name(key: str, page: int, fmt: str) -> str:
+    e = str(fmt or "").lower().lstrip(".")
+    ext = ".webp" if e == "webp" else ".jpg"
+    return key + ("" if int(page) <= 1 else "_p%d" % int(page)) + ext
+
+
+def save_bytes(order_number: str, name: str, data: bytes, fmt: str = "webp",
+               page: int = 1) -> str:
+    """把**已经编码好的**一页图片写进该订单目录，返回路径（失败返回空串）。"""
     if not data or not name:
         return ""
     d = order_dir(order_number)
     if not d:
         return ""
-    ext = ".webp" if str(fmt).lower() == "webp" else ".jpg"
-    path = os.path.join(d, name_key(name) + ext)
+    path = os.path.join(d, _file_name(name_key(name), page, fmt))
     tmp = path + ".part"
     try:
         with open(tmp, "wb") as f:
@@ -80,31 +88,88 @@ def save_bytes(order_number: str, name: str, data: bytes, fmt: str = "webp") -> 
     return path
 
 
-def find(order_number: str, name: str = "") -> str:
-    """按订单号 + 文件名找现成的缩略图（没有返回空串）。"""
+def find(order_number: str, name: str = "", page: int = 1) -> str:
+    """按订单号 + 文件名 + 页找现成的缩略图（没有返回空串）。"""
     d = order_dir(order_number, create=False)
     if not d or not name:
         return ""
     key = name_key(name)
-    for ext in (".webp", ".jpg"):
-        p = os.path.join(d, key + ext)
+    for ext in ("webp", "jpg"):
+        p = os.path.join(d, _file_name(key, page, ext))
         if os.path.isfile(p):
             return p
     return ""
 
 
+def page_count(order_number: str, name: str = "") -> int:
+    """这个文件已存了几页（0 = 没有缩略图）。"""
+    d = order_dir(order_number, create=False)
+    if not d or not name:
+        return 0
+    key = name_key(name)
+    best = 0
+    try:
+        for n in os.listdir(d):
+            m = _PAGE_SUFFIX_RE.match(n)
+            if m and m.group("key") == key:
+                best = max(best, int(m.group("page") or 1))
+    except OSError:
+        return 0
+    return best
+
+
+def _drop_key(d: str, key: str) -> None:
+    """同一文件重渲前先清掉旧版本（页数变少时不留残页）。"""
+    try:
+        for n in os.listdir(d):
+            m = _PAGE_SUFFIX_RE.match(n)
+            if m and m.group("key") == key:
+                try:
+                    os.remove(os.path.join(d, n))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def save_pages(order_number: str, name: str, pages) -> int:
+    """把多页结果 `[(page_no, bytes, fmt)]` 落盘，返回落盘页数。"""
+    if not name or not pages:
+        return 0
+    d = order_dir(order_number)
+    if not d:
+        return 0
+    _drop_key(d, name_key(name))
+    done = 0
+    for item in pages:
+        try:
+            page_no, data, fmt = item
+        except (TypeError, ValueError):
+            continue
+        if save_bytes(order_number, name, data, fmt, page=page_no):
+            done += 1
+    return done
+
+
+def render_pages(order_number: str, display_name: str, file_path: str = "",
+                 pdf_path: str = "") -> int:
+    """从**实际打印用的 PDF** 渲染全部（≤ MAX_PAGES）页并落盘，返回页数（绝不抛）。"""
+    if not display_name:
+        return 0
+    try:
+        import cloud_thumb            # 复用同一套编码（1024px / WebP q80 / JPEG 兜底）
+        pages = cloud_thumb.make_pages(file_path, display_name, pdf_path=pdf_path)
+        return save_pages(order_number, display_name, pages)
+    except Exception:  # noqa: BLE001  缩略图失败绝不影响打印
+        return 0
+
+
 def render_job(order_number: str, display_name: str, file_path: str = "",
                pdf_path: str = "") -> str:
-    """给一个任务渲染首页缩略图并落盘（失败返回空串，绝不抛）。"""
-    try:
-        import cloud_thumb            # 复用同一套编码（640px / WebP q80 / JPEG 兜底）
-        made = cloud_thumb.make_thumb(file_path, display_name, pdf_path=pdf_path)
-        if not made:
-            return ""
-        data, fmt = made
-        return save_bytes(order_number, display_name or file_path, data, fmt)
-    except Exception:  # noqa: BLE001  缩略图失败绝不影响打印
+    """给一个任务渲染多页缩略图并落盘，返回首页路径（失败返回空串，绝不抛）。"""
+    if not render_pages(order_number, display_name, file_path, pdf_path):
         return ""
+    return find(order_number, display_name, page=1)
 
 
 def render_order(order_number: str, files, limit: int = MAX_PER_ORDER) -> int:
@@ -122,7 +187,7 @@ def render_order(order_number: str, files, limit: int = MAX_PER_ORDER) -> int:
         if find(num, name):
             done += 1
             continue
-        if render_job(num, name, str(f.get("path") or ""), str(f.get("pdf") or "")):
+        if render_pages(num, name, str(f.get("path") or ""), str(f.get("pdf") or "")):
             done += 1
     if done:
         _prune()
@@ -137,6 +202,40 @@ def order_has_thumbs(order_number: str) -> bool:
         return any(not n.endswith(".part") for n in os.listdir(d))
     except OSError:
         return False
+
+
+def rename_order(old: str, new: str) -> str:
+    """订单换号（离线单 -L → 云端号）时把缩略图目录一起改名/合并，返回新目录。
+
+    目标目录已存在同文件时保留目标那份、删掉旧的 —— 两边都是同一单的图，
+    谁先谁后只影响分辨率新旧，不影响正确性。
+    """
+    a = order_dir(old, create=False)
+    b = order_dir(new)
+    if not a or not b or os.path.normcase(a) == os.path.normcase(b):
+        return b
+    if not os.path.isdir(a):
+        return b
+    try:
+        for n in list(os.listdir(a)):
+            if n.endswith(".part"):
+                continue
+            src = os.path.join(a, n)
+            dst = os.path.join(b, n)
+            try:
+                if os.path.exists(dst):
+                    os.remove(src)
+                else:
+                    os.replace(src, dst)
+            except OSError:
+                continue
+        try:
+            os.rmdir(a)
+        except OSError:
+            pass
+    except OSError:
+        return ""
+    return b
 
 
 def _prune() -> None:

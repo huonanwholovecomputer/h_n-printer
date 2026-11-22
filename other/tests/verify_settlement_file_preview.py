@@ -326,37 +326,59 @@ def static_page(html):
         "blob URL 显示": "URL.createObjectURL(r.blob)" in html,
         "收起时 revoke": "URL.revokeObjectURL(_fpObjUrl)" in html,
         "翻页竞态守卫": "seq !== m._fpSeq" in html,
-        # v7.26.2：预览图可放大
-        "放大态 CSS（fp-zoom 大舞台）":
-            re.search(r"#fPrevMenu\.fp-zoom \.fp-stage \{[^}]*width: min\(88vw, 1024px\)", html) is not None,
-        "放大态按原始像素显示（max-width/height: none）":
-            re.search(r"#fPrevMenu\.fp-zoom \.fp-stage img \{[^}]*max-width: none;[^}]*max-height: none", html) is not None,
-        "放大按钮 → fpToggleZoom": 'class="fp-zoom-btn"' in html and 'onclick="fpToggleZoom()"' in html,
-        "点图片本身也能放大/还原（舞台整体可点，点图靠冒泡）":
-            '<div class="fp-stage" onclick="fpToggleZoom()">' in html,
-        "切换缩放后重新贴位（_fpPlace）":
-            "function _fpPlace(m)" in html and "_fpPlace(m);" in html,
-        # v7.29：放大/还原走 FLIP 形变过渡（用户：放大加个自然过渡，缩小也加一下）
-        "放大过渡：切 class 前后各量一次窗体外框（FLIP）":
-            re.search(r"function fpToggleZoom\(\)\s*\{[^}]*getBoundingClientRect\(\)", html, re.S) is not None
-            and re.search(r"var\s+last\s*=\s*m\.getBoundingClientRect\(\)", html) is not None,
-        "放大过渡：反向 transform 落在同一锚点角（与 _fpPlace 同角）":
-            "m._fpBelow" in html and "first.top + first.height) - (last.top + last.height)" in html,
-        "放大过渡：transition 用缓出曲线且有尽头的清理定时器":
-            "_FP_ZOOM_MS + 80" in html and "'transform ' + _FP_ZOOM_MS + 'ms ' + _FP_ZOOM_EASE" in html,
-        "放大过渡：开窗动画 pmIn 的 fill:both 必须先让位（class 关动画）":
-            "#fPrevMenu.fp-zooming { animation: none; }" in html
-            and "classList.add('fp-zooming')" in html,
+        # v7.30：放大 = 全窗口覆盖层（#fpViewer）。小窗不再自己被撑成 1024 的大弹窗。
+        "放大入口 → 全窗口查看器（小窗按钮 + 点图）":
+            'onclick="openFpViewer()"' in html
+            and '<div class="fp-stage" onclick="openFpViewer()"' in html
+            and "⤢ 全屏" in html,
+        "小窗不再走弹窗放大（fp-zoom 大舞台已删除）":
+            "#fPrevMenu.fp-zoom" not in html,
+        "覆盖层结构：fixed 全屏 + 背景 + 图片舞台":
+            re.search(r"#fpViewer \{[^}]*position: fixed;[^}]*inset: 0;", html) is not None
+            and ".fpv-bg" in html and ".fpv-stage" in html
+            and "id = 'fpViewer'" in html,
+        "淡入淡出：背景/主体 opacity 过渡 + 图片切页淡入":
+            re.search(r"#fpViewer \.fpv-bg \{[^}]*opacity: 0;[^}]*transition: opacity", html) is not None
+            and re.search(r"#fpViewer\.fpv-in \.fpv-bg \{ opacity: 1; \}", html) is not None
+            and re.search(r"#fpViewer \.fpv-stage img \{[^}]*opacity: 0;", html) is not None
+            and "classList.add('fpv-shown')" in html,
+        "左右切换按钮（多页时）":
+            'class="fpv-nav fpv-prev"' in html and 'class="fpv-nav fpv-next"' in html
+            and "onclick=\"fpvGo(-1)\"" in html and "onclick=\"fpvGo(1)\"" in html,
+        "键盘 ←/→ 翻页、Esc/✕ 关闭":
+            "ev.key === 'ArrowLeft'" in html and "ev.key === 'ArrowRight'" in html
+            and "ev.key === 'Escape'" in html and 'class="fpv-close"' in html,
+        "底部缩略图条（点击切页 + 滚到视野内才取图）":
+            'class="fpv-strip"' in html and "fpv-thumb" in html
+            and "fpvGoTo(p)" in html and "IntersectionObserver" in html,
+        "每页只取一次：大图 z 档、缩略图条 p 档各缓存各的，关闭时统一 revoke":
+            "function _fpvFetchPage(st, page, small)" in html
+            and "var cache = small ? st.thumbs : st.urls;" in html
+            and "cache[served] = u;" in html
+            and "(small ? 't' : 'z')" in html
+            and "URL.revokeObjectURL(st.urls[k])" in html
+            and "URL.revokeObjectURL(st.thumbs[k])" in html,
+        "本地单缩略图按页取（&page=N）+ 页数等响应头":
+            "f.file_name || '') + '&page=' + page" in html
+            and "m._fpPages = 0;" in html,
+        "滚轮缩放：下限是初始大小、上限 6 倍，以光标为锚点":
+            "function _fpvWheel(ev)" in html and "var _FPV_ZOOM_MAX = 6;" in html
+            and "Math.max(1, Math.min(_FPV_ZOOM_MAX, before * factor))" in html
+            and "_fpvZoomAt(st, Math.pow(1.0015, -dy), ev.clientX, ev.clientY)" in html
+            and "stage.addEventListener('wheel', _fpvWheel, { passive: false })" in html,
+        "放大后左键拖动平移（贴边夹住、拖完不误关）":
+            "function _fpvDown(ev)" in html and "function _fpvMove(ev)" in html
+            and "img.classList.add('fpv-grabbing')" in html
+            and "stage.addEventListener('mousedown', _fpvDown)" in html
+            and "function _fpvBodyClick(ev)" in html,
+        "点图片外关闭、点图/按钮/缩略图条不关":
+            "closest('.fpv-img, .fpv-nav, .fpv-thumb, .fpv-close, .fpv-strip')" in html
+            and "if (st.moved) { st.moved = false; return; }" in html,
         "放大过渡：尊重系统「减少动态效果」":
             "function _fpMotionOff()" in html and "_mqReduce && _mqReduce.matches" in html,
-        # v7.29：放大态下关闭也要有过渡（先缩回缩略舞台再摘），以及 CSS 顺序守卫
-        "放大态关闭走缩回形变（_fpCloseMorph + 0.22s）":
-            "function _fpCloseMorph(m)" in html and "_FP_CLOSE_MS = 220" in html
-            and "if (m.classList.contains('fp-zoom'))" in html,
-        "★ CSS 顺序守卫：.fp-zooming 必须排在 .pm-closing 之前":
-            html.find("#fPrevMenu.fp-zooming") != -1
-            and html.find("#fPrevMenu.pm-closing") != -1
-            and html.find("#fPrevMenu.fp-zooming") < html.find("#fPrevMenu.pm-closing"),
+        "覆盖层开着时底表滚动/点外不再收掉小窗":
+            re.search(r"function _fpOutside\(ev\) \{\s*if \(_fpvState\) return;", html) is not None
+            and re.search(r"function _fpOnScroll\(ev\) \{\s*if \(_fpvState\) return;", html) is not None,
     }
     return checks
 

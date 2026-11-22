@@ -1,28 +1,37 @@
 # -*- coding: utf-8 -*-
-"""云端订单文件的首页缩略图（2026-11-19 阶段二）。
+"""云端订单文件的缩略图（2026-11-19 阶段二；2026-11-21 改为 1024 多页）。
 
 为什么放在本地打印工具里做：
 
 * 服务端渲染 .doc/.xls 必须串行起 soffice（线上 2GB 内存只许一个实例，超时 120s），
-  而本地工具本来就要把同一份文件转成 PDF 打印 —— 顺手光栅化一页几乎零成本；
+  而本地工具本来就要把同一份文件转成 PDF 打印 —— 顺手光栅化几页几乎零成本；
+* **必须从「实际打印用的那份 PDF」出图**：本地 Word/WPS 转出来的版式、字体、分页
+  才是用户真正打印出来的样子；服务端 LibreOffice 重渲同一份 docx 会换字体、换换行，
+  缩略图跟纸面不一致（2026-11-21 用户现场反馈）。
 * 纯文本 txt/csv/md 服务端**没有**「首页」这个概念（`_has_preview_for()` 明确不含），
   只有本地能渲：这里用 PIL 排一页文本，缩略图就长成「文件第一页的样子」；
-* 缩略图跟文件保留期同删（服务端 `_drop_previews` 按前缀清理），本地不承担存储。
+* 缩略图跟文件保留期同删（服务端 `_drop_previews` 按前缀清理），本地不承担云端存储。
 
 契约（与后端 `POST /api/local/file_thumb` 对应）：
 
-* 只做**首页**、只做 640px（p 档）；上传的是 WebP，编不出才回落 JPEG；
+* 长边 1024（后端 z 档 = 结算页「放大」那一档），WebP q80，编不出才回落 JPEG；
+* 每页一个 `(page_no, bytes, fmt)`，页号 1 基；只传前 `MAX_PAGES` 页；
 * 服务端按**真实字节**判定格式，所以这里返回 `(bytes, fmt)`，不要凭扩展名猜；
-* 任何一步失败都返回 None —— 缩略图是锦上添花，**绝不允许**影响下载/打印主流程。
+* 任何一步失败都返回 None/[] —— 缩略图是锦上添花，**绝不允许**影响下载/打印主流程。
 """
 from __future__ import annotations
 
 import io
 import os
 
-THUMB_EDGE = 640                      # 与后端 _PREVIEW_SIZES["p"] 同档
+# 与后端 _PREVIEW_SIZES["z"] 同档（1024）。三档 t=320/p=640/z=1024 由服务端下采样，
+# 客户端只备最大的一档，避免同一页传三份。
+THUMB_EDGE = 1024
 JPEG_QUALITY = 82
 WEBP_QUALITY = 80
+# 一单最多传多少页。超过这个数目的文档，放大查看前 20 页足够定位，剩下的翻页按需
+# 由服务端渲（服务端有 10 分钟失败负缓存 + 全局渲染锁，不会把机器拖死）。
+MAX_PAGES = 20
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
 TEXT_EXTS = {".txt", ".csv", ".md"}
@@ -98,28 +107,41 @@ def _from_image(path: str):
         return _encode(im)
 
 
-def _from_pdf(path: str):
-    """PDF：用 PyMuPDF 只渲第 1 页（与后端同一个渲染器，版式一致）。"""
+def _pages_from_pdf(path: str, max_pages: int = MAX_PAGES, edge: int = THUMB_EDGE):
+    """PDF：用 PyMuPDF 渲前 max_pages 页（与后端同一个渲染器，版式一致）。
+
+    返回 `[(page_no, bytes, fmt)]`（1 基）；空/损坏 PDF 返回 []。
+    """
     import fitz
 
+    out = []
     doc = fitz.open(path)
     try:
-        if doc.page_count < 1:
-            return None
-        page = doc.load_page(0)
-        # 目标长边 640：page.rect 是 pt（72dpi），zoom = 640 / 长边
-        long_side = max(page.rect.width, page.rect.height) or 1.0
-        zoom = max(0.2, min(4.0, THUMB_EDGE / long_side))
-        # 细线保真（2026-11-19 现场）：CAD/工程图里 stroke width = 0 的线在 640px 缩略图上
-        # 只有 0.2 个像素，抗锯齿后几乎全透明 ⇒ 缩略图一片白。把最小线宽抬到 1 个设备像素，
-        # 线条至少占满一格，缩略图才看得出是一张图纸（正文页的文字本来也有 1px 以上）。
-        with _min_line_width(1.0):
-            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-        from PIL import Image
-        im = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        return _encode(im)
+        total = min(int(doc.page_count or 0), max(1, int(max_pages)))
+        for i in range(total):
+            page = doc.load_page(i)
+            # 目标长边 edge：page.rect 是 pt（72dpi），zoom = edge / 长边
+            long_side = max(page.rect.width, page.rect.height) or 1.0
+            zoom = max(0.2, min(4.0, edge / long_side))
+            # 细线保真（2026-11-19 现场）：CAD/工程图里 stroke width = 0 的线在缩略图上
+            # 只有零点几个像素，抗锯齿后几乎全透明 ⇒ 缩略图一片白。把最小线宽抬到 1 个
+            # 设备像素，线条至少占满一格，缩略图才看得出是一张图纸（正文文字本来也 ≥1px）。
+            with _min_line_width(1.0):
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            from PIL import Image
+            im = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            enc = _encode(im, edge)
+            if enc:
+                out.append((i + 1, enc[0], enc[1]))
     finally:
         doc.close()
+    return out
+
+
+def _from_pdf(path: str):
+    """PDF 首页（兼容旧调用方；多页请用 `_pages_from_pdf`）。"""
+    pages = _pages_from_pdf(path, max_pages=1)
+    return (pages[0][1], pages[0][2]) if pages else None
 
 
 def _load_font(size: int):
@@ -142,12 +164,13 @@ def _from_text(path: str, name: str = ""):
 
     不追求排版还原（前端本来也没法预览这些类型），只要让人一眼认出
     「这是我传的那份表格/笔记」即可：白底、等宽感字体、自动折行、超出裁剪。
+    画布就是 724×1024（A4 比例、长边正好 1024，编码时不再缩放）。
     """
     from PIL import Image, ImageDraw
 
-    W, H = 700, 990            # A4 比例的缩略画布（编码时会再缩到 640）
-    margin = 56
-    line_h = 30
+    W, H = 724, 1024
+    margin = 48
+    line_h = 32
     try:
         with open(path, "rb") as fh:
             raw = fh.read(64 * 1024)
@@ -158,15 +181,15 @@ def _from_text(path: str, name: str = ""):
         text = "（空文件）"
     text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", "    ")
 
-    font = _load_font(22)
-    title_font = _load_font(26)
+    font = _load_font(24)
+    title_font = _load_font(28)
     im = Image.new("RGB", (W, H), (255, 255, 255))
     draw = ImageDraw.Draw(im)
     y = margin
     if name:
-        draw.text((margin, y), os.path.basename(name)[:48], font=title_font,
+        draw.text((margin, y), os.path.basename(name)[:64], font=title_font,
                   fill=(40, 40, 46))
-        y += 52
+        y += 56
     max_w = W - margin * 2
     for line in text.split("\n"):
         while line:
@@ -186,30 +209,45 @@ def _from_text(path: str, name: str = ""):
 
 
 def make_thumb(path: str, name: str = "", pdf_path: str = ""):
-    """返回 `(bytes, fmt)`；做不出来返回 None（调用方必须容忍）。
+    """返回首页 `(bytes, fmt)`；做不出来返回 None（调用方必须容忍）。
 
     `pdf_path`：该文件已转换好的 PDF（打印/页数分析顺手留下的缓存）。
     Office 文档只有拿到它才能出图 —— 这里**不**自己去起 Word/WPS/LibreOffice，
     否则会和打印抢同一个 COM 实例池。
     """
+    pages = make_pages(path, name=name, pdf_path=pdf_path, max_pages=1)
+    return (pages[0][1], pages[0][2]) if pages else None
+
+
+def make_pages(path: str, name: str = "", pdf_path: str = "",
+               max_pages: int = MAX_PAGES, edge: int = THUMB_EDGE):
+    """返回 `[(page_no, bytes, fmt)]`（1 基页号）；做不出来返回 []。
+
+    与 `make_thumb` 同一套取图口径，只是多页。图片/文本永远只有 1 页；PDF（含 Office
+    转换出来的 PDF）按实际页数，最多 `max_pages` 页。Office 同样**只认**已转换的
+    `pdf_path` —— 现起 Word/LibreOffice 会和打印抢 COM 实例池。
+    """
     if not path or not os.path.isfile(path):
-        return None
+        return []
     ext = os.path.splitext(name or path)[1].lower()
     try:
         if ext in IMAGE_EXTS:
-            return _from_image(path)
+            one = _from_image(path)
+            return [(1, one[0], one[1])] if one else []
         if ext in TEXT_EXTS:
-            return _from_text(path, name)
+            one = _from_text(path, name)
+            return [(1, one[0], one[1])] if one else []
         if ext == ".pdf":
-            return _from_pdf(path)
+            return _pages_from_pdf(path, max_pages, edge)
         if ext in OFFICE_EXTS:
             if pdf_path and os.path.isfile(pdf_path):
-                return _from_pdf(pdf_path)
-            return None
+                return _pages_from_pdf(pdf_path, max_pages, edge)
+            return []
         # 未知类型：图片能打开就当图片（上传白名单里有 tiff 这类扩展名不常见写法）
         try:
-            return _from_image(path)
+            one = _from_image(path)
+            return [(1, one[0], one[1])] if one else []
         except Exception:  # noqa: BLE001
-            return None
+            return []
     except Exception:  # noqa: BLE001  缩略图失败绝不影响主流程
-        return None
+        return []

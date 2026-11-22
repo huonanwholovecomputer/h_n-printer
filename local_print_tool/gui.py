@@ -11485,9 +11485,11 @@ class MainWindow(QMainWindow):
     #
     # 背景：收支清算的订单明细里，点文件名看缩略图走的是 /api/local/file_preview/<file_id>，
     # 而**本地单**上报 /api/local_orders 时没有 file_id（后端那几行 order_files 是现建的），
-    # 于是本机打的单永远点不出图。现在打印一结束（cached_pdf 已就绪）就在后台把首页渲成
-    # 640px WebP 存在本机（order_thumbs.py），结算页改走 /api/local/order_thumb/<订单号>。
-    # 刻意放在后台线程：渲染一页 Word 要 1~3 秒，绝不能让收尾回调卡在打印队列里。
+    # 于是本机打的单永远点不出图。现在打印一结束（cached_pdf 已就绪）就在后台把**实际打印用的
+    # 那份 PDF** 渲成 1024px 多页 WebP：云端单回传服务器（z 档 = 结算页放大那一档），本地单
+    # 存在本机（order_thumbs.py），结算页分别走 /api/local/file_preview 与
+    # /api/local/order_thumb/<订单号>?page=N。
+    # 刻意放在后台线程：渲一页 Word 要 1~3 秒，绝不能让收尾回调卡在打印队列里。
 
     def _queue_order_thumb(self, job) -> None:
         """把一个已完成任务丢进缩略图渲染队列（去重、绝不影响打印主流程）。"""
@@ -11496,11 +11498,12 @@ class MainWindow(QMainWindow):
             name = str(getattr(job, "display_name", "") or "").strip()
             path = str(getattr(job, "file_path", "") or "")
             pdf = str(getattr(job, "cached_pdf", "") or "")
+            fid = str(getattr(job, "file_id", "") or "").strip()
             if not name:
                 name = os.path.basename(path)
-            if not num or not name or not (pdf or path):
+            if not name or not (pdf or path) or not (num or fid):
                 return
-            item = (num, name, path, pdf)
+            item = (num, name, path, pdf, fid)
             pending = getattr(self, "_thumb_pending", None)
             if pending is None:
                 pending = set()
@@ -11530,20 +11533,31 @@ class MainWindow(QMainWindow):
             item = q.get()
             if item is None:
                 return
-            num, name, path, pdf = item
-            made = ""
+            num, name, path, pdf, fid = item
+            note = ""
             try:
-                made = order_thumbs.render_job(num, name, path, pdf)
+                if fid:
+                    import cloud_thumb
+                    pages = cloud_thumb.make_pages(path, name, pdf_path=pdf)
+                    client = getattr(self, "_cloud_client", None)
+                    done = (client.upload_thumb_pages(fid, pages, label=f"{num}/{name}")
+                            if (client and pages) else 0)
+                    if done:
+                        note = f"🖼 缩略图已回传云端：{num} / {name}（{done} 页）"
+                else:
+                    done = order_thumbs.render_pages(num, name, path, pdf)
+                    if done:
+                        note = f"🖼 本地缩略图已生成：{num} / {name}（{done} 页）"
             except Exception:  # noqa: BLE001
-                made = ""
+                note = ""
             pending = getattr(self, "_thumb_pending", None)
             if isinstance(pending, set):
                 pending.discard(item)
             # 主线程安全通道（_cloudConnSyncLog 已连到 _log）
-            if made:
-                self._cloudConnSyncLog.emit(f"🖼 本地缩略图已生成：{num} / {name}")
+            if note:
+                self._cloudConnSyncLog.emit(note)
             else:
-                logger.debug("本地缩略图渲染失败：%s / %s", num, name)
+                logger.debug("缩略图渲染/上传未成功：%s / %s", num, name)
 
     # ──────── 外部打印监视（A 档最小版：只检测 + 记账，不阻断出纸）────────
 
@@ -16824,6 +16838,12 @@ class MainWindow(QMainWindow):
         if self._offline_sync:
             for old_num, new_num in replacements.items():
                 self._offline_sync.rename_order_number(old_num, new_num)
+        # 本机缩略图目录跟着订单号走：不跟的话离线单换号后结算页就找不到图了（2026-11-21）
+        for old_num, new_num in replacements.items():
+            try:
+                order_thumbs.rename_order(old_num, new_num)
+            except Exception:  # noqa: BLE001  改名失败只影响缩略图，不许中断补报
+                pass
         # 后台线程内不直接操作 Qt 控件：换号刷新/日志经信号回主线程
         self._tabDisplayRefresh.emit()
         self._cloudConnSyncLog.emit(f"📋 已同步 {len(replacements)} 个本地订单号到云端: {' '.join(replacements.values())}")
@@ -22171,6 +22191,10 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.warning(f"晚到云端号改名失败（{fallback} → {cloud}）: {e}")
         try:
+            order_thumbs.rename_order(fallback, cloud)   # 缩略图目录跟着换号（2026-11-21）
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"晚到云端号改名时缩略图目录没跟上（{fallback} → {cloud}）: {e}")
+        try:
             self._save_config(sync_ui=False)
         except Exception as e:
             logger.warning(f"晚到云端号保存配置失败: {e}")
@@ -25257,6 +25281,8 @@ class MainWindow(QMainWindow):
             engine=engine,
             task_id=task.task_id,
             order_id=task.order_id or 0,
+            # 云端文件 ID：收尾时把「实际打印的 PDF」渲出的缩略图回传到这个文件上
+            file_id=str(getattr(task, "file_id", "") or ""),
             source_md5=source_md5,
             blank_tail=blank_tail,
             blank_undo_range=None,

@@ -24,9 +24,9 @@
  *   U9  打开后页面滚动 → 自动收起（滚动即关）
  *   U10 点预览窗外空白 → 自动收起
  *   U11 云端 404（has_preview 但文件已清理）→ 预览窗里显示云端 message，不是白屏
- *   U13 预览图可放大（v7.26.2）：小舞台 300×300 → 视口级大舞台（≥900），
- *      图片按原始像素 800×1600 显示、超高可在窗内滚动、窗口重贴不跑出屏幕、
- *      放大态下窗内滚轮不收起、再点还原回 300×300
+ *   U13 全窗口查看器（v7.30）：小窗保持 300×300，点「⤢ 全屏」原地淡入覆盖层；
+ *      图片 contain 落在视口内、←/→ 键与底部缩略图条都能切页、Esc/✕ 只关覆盖层
+ *      （小窗还在原位），关掉后还能再打开
  *   U12 全程无 pageerror、无外网请求
  *
  * 用法：node other/tests/verify_settlement_file_preview_ui.mjs [settlement.html 路径]
@@ -405,147 +405,260 @@ try {
       hit2.page === 2 && afterNext.pageTxt.indexOf('2 / 2') >= 0 && afterNext.nextDis === true,
       { hit2, afterNext });
 
-  /* U13 预览图可放大（v7.26.2）—— 小舞台 300×300 换成视口级大舞台，图片按原始像素显示。
-     fixture 是 800×1600 的 SVG，所以「放大」在本条测试里可量：300 高 → 1600 高。 */
-  const zoomBefore = await page.evaluate(() => {
+  /* U13（v7.30）：放大不再是「把小窗撑成大弹窗」，而是原地淡入一个全窗口查看器。
+     fixture 是 800×1600 的 SVG：小窗按 300 高显示，查看器里按 contain 缩进视口。 */
+  const viewerBefore = await page.evaluate(() => {
     const m = document.getElementById('fPrevMenu');
     const st = m.querySelector('.fp-stage');
-    const img = m.querySelector('.fp-stage img');
     const btn = m.querySelector('.fp-zoom-btn');
-    return { zoomed: m.classList.contains('fp-zoom'), stageW: st.clientWidth,
-             imgW: Math.round(img.getBoundingClientRect().width),
-             imgH: Math.round(img.getBoundingClientRect().height), natW: img.naturalWidth,
-             btn: (btn.textContent || '').trim() };
+    return { stageW: st.clientWidth, btn: (btn.textContent || '').trim(),
+             viewer: !!document.getElementById('fpViewer'),
+             zoomed: m.classList.contains('fp-zoom') };
   });
-  chk('U13a 默认是 300×300 小舞台（图按高度适配 300），按钮文案「放大」',
-      /* 容差 3px：开窗动画 pmIn 的曲线 cubic-bezier(.2,.9,.3,1.25) 有回弹，
-         正好量在回弹帧上会读到 301（不是布局错，是 transform 把 rect 撑了 0.3%） */
-      zoomBefore.zoomed === false && zoomBefore.stageW === 300 &&
-      Math.abs(zoomBefore.imgH - 300) <= 3 && zoomBefore.natW === PREVIEW_NAT_W &&
-      zoomBefore.btn.indexOf('放大') >= 0, zoomBefore);
+  chk('U13a 小窗仍是 300×300，按钮文案「⤢ 全屏」，没打开前没有覆盖层',
+      /* 容差 3px：开窗动画 pmIn 的回弹帧会让 rect 抖 0.3% */
+      viewerBefore.stageW === 300 && viewerBefore.btn.indexOf('全屏') >= 0 &&
+      viewerBefore.viewer === false && viewerBefore.zoomed === false, viewerBefore);
 
   await page.evaluate(() => document.querySelector('#fPrevMenu .fp-zoom-btn').click());
-  /* U16（v7.29）：放大要有形变过渡 —— 点下去那刻 transform 正在过渡（0.32s），结束时清干净。
-     先断过渡本身（时序稳定），再等它跑完才量尺寸，否则量到的是中间帧。 */
-  const u16 = await page.evaluate(() => {
-    const m = document.getElementById('fPrevMenu');
-    const cs = getComputedStyle(m);
-    const r = m.getBoundingClientRect();
-    return { prop: cs.transitionProperty, dur: cs.transitionDuration,
-             zooming: m.classList.contains('fp-zooming'),
-             anim: cs.animationName,
-             w: Math.round(r.width) };
-  });
-  chk('U16a 放大走 transform 过渡（0.32s），不是瞬间换尺寸',
-      u16.prop.indexOf('transform') >= 0 && u16.dur === '0.32s' && u16.zooming === true
-      && u16.w < 900, u16);
-  chk('U16b 过渡期间开窗动画 pmIn 让位（fill:both 会压住 inline transform）',
-      u16.anim === 'none', u16);
   await page.waitForFunction(() => {
-    const m = document.getElementById('fPrevMenu');
-    return !!m && !m._fpAnimTimer && !m.style.transform && !m.style.transition;
-  }, null, { timeout: 3000 });
-  await page.waitForFunction(() => {
-    const m = document.getElementById('fPrevMenu');
-    return !!m && m.classList.contains('fp-zoom');
+    const v = document.getElementById('fpViewer');
+    return !!v && v.classList.contains('fpv-on') && v.classList.contains('fpv-in');
   }, null, { timeout: 5000 });
-  const zoomed = await page.evaluate(() => {
-    const m = document.getElementById('fPrevMenu');
-    const st = m.querySelector('.fp-stage');
-    const img = m.querySelector('.fp-stage img');
-    const btn = m.querySelector('.fp-zoom-btn');
-    const r = m.getBoundingClientRect();
-    return { stageW: st.clientWidth, stageH: st.clientHeight,
-             display: getComputedStyle(st).display,
-             imgW: Math.round(img.getBoundingClientRect().width),
-             imgH: Math.round(img.getBoundingClientRect().height),
-             scrollH: st.scrollHeight, clientH: st.clientHeight,
-             btn: (btn.textContent || '').trim(),
-             inView: r.left >= 0 && r.top >= 0 &&
+  await page.waitForFunction(() => {
+    const v = document.getElementById('fpViewer');
+    const img = v && v.querySelector('.fpv-img');
+    return !!img && img.naturalWidth === 800 && img.classList.contains('fpv-shown');
+  }, null, { timeout: 8000 });
+  const viewerOpen = await page.evaluate(() => {
+    const v = document.getElementById('fpViewer');
+    const bg = v.querySelector('.fpv-bg');
+    const img = v.querySelector('.fpv-img');
+    const r = img.getBoundingClientRect();
+    const vr = v.getBoundingClientRect();
+    const br = bg.getBoundingClientRect();
+    return { pos: getComputedStyle(v).position,
+             vW: Math.round(vr.width), vH: Math.round(vr.height),
+             bgW: Math.round(br.width), bgH: Math.round(br.height),
+             innerW: window.innerWidth, innerH: window.innerHeight,
+             count: (v.querySelector('.fpv-count') || {}).textContent || '',
+             natW: img.naturalWidth, natH: img.naturalHeight,
+             imgW: Math.round(r.width), imgH: Math.round(r.height),
+             menuStill: !!document.getElementById('fPrevMenu'),
+             inView: r.left >= -1 && r.top >= -1 &&
                      r.right <= window.innerWidth + 1 && r.bottom <= window.innerHeight + 1 };
   });
-  chk('U13b 放大：舞台变视口级（≥900 宽），图片按原始像素 ' + PREVIEW_NAT_W + '×' + PREVIEW_NAT_H + ' 显示',
-      zoomed.display === 'block' && zoomed.stageW >= 900 &&
-      zoomed.imgW === PREVIEW_NAT_W && zoomed.imgH === PREVIEW_NAT_H, zoomed);
-  chk('U13c 放大后超高图可在窗内滚动（scrollHeight > 可视高度）',
-      zoomed.scrollH > zoomed.clientH, zoomed);
-  chk('U13d 放大后窗口重贴、不跑出屏幕，按钮变「还原」',
-      zoomed.inView === true && zoomed.btn.indexOf('还原') >= 0, zoomed);
+  chk('U13b 覆盖层 fixed 铺满视口，图片 contain 缩放后完整落在视口内',
+      viewerOpen.pos === 'fixed' && viewerOpen.vW === viewerOpen.innerW &&
+      viewerOpen.vH === viewerOpen.innerH &&
+      viewerOpen.bgW === viewerOpen.innerW && viewerOpen.bgH === viewerOpen.innerH &&
+      viewerOpen.menuStill === true && viewerOpen.inView === true &&
+      viewerOpen.imgW <= viewerOpen.innerW && viewerOpen.imgH <= viewerOpen.innerH &&
+      viewerOpen.natW === PREVIEW_NAT_W, viewerOpen);
+  chk('U13c 从当前页接着看（小窗刚翻到第 2 页），页码栏「第 2 / 2 页」',
+      viewerOpen.count.indexOf('2 / 2') >= 0, viewerOpen);
 
-  /* 放大态下窗内滚轮只滚图片：_fpOnSlide 对窗内目标放行，预览窗不许被收掉
-     （必须用真实 page.mouse.wheel —— 合成 WheelEvent 打不到 window 上的 capture 监听） */
-  const stCenter = await page.evaluate(() => {
-    const st = document.querySelector('#fPrevMenu .fp-stage');
-    const r = st.getBoundingClientRect();
-    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+  /* 键盘 ←：覆盖层里不碰小窗，直接换页 */
+  await page.keyboard.press('ArrowLeft');
+  await page.waitForFunction(() => {
+    const v = document.getElementById('fpViewer');
+    return !!v && ((v.querySelector('.fpv-count') || {}).textContent || '').indexOf('1 / 2') >= 0;
+  }, null, { timeout: 8000 });
+  await page.waitForFunction(() => {
+    const v = document.getElementById('fpViewer');
+    const on = v && v.querySelector('.fpv-thumb.on');
+    return !!on && on.getAttribute('data-page') === '1';
+  }, null, { timeout: 8000 });
+  const afterLeft = await page.evaluate(() => {
+    const v = document.getElementById('fpViewer');
+    const thumbs = Array.prototype.slice.call(v.querySelectorAll('.fpv-thumb'));
+    return { count: (v.querySelector('.fpv-count') || {}).textContent || '',
+             thumbs: thumbs.map((t) => t.getAttribute('data-page')),
+             on: (v.querySelector('.fpv-thumb.on') || {}).getAttribute &&
+                 v.querySelector('.fpv-thumb.on').getAttribute('data-page'),
+             menuPage: (document.getElementById('fPrevMenu') || {})._fpPage };
   });
-  await page.mouse.move(stCenter.x, stCenter.y);
-  await page.mouse.wheel(0, 300);
-  await page.waitForTimeout(250);
-  const stillHere = await page.evaluate(() => {
+  chk('U13d ← 键翻到第 1 页：底部缩略图条两页都在，第 1 个高亮',
+      afterLeft.thumbs.length === 2 && afterLeft.thumbs[0] === '1' &&
+      afterLeft.thumbs[1] === '2' && afterLeft.on === '1', afterLeft);
+
+  /* 点底部缩略图切页（用户要的「像 Windows 图片那样」） */
+  await page.evaluate(() => {
+    const v = document.getElementById('fpViewer');
+    v.querySelector('.fpv-thumb[data-page="2"]').click();
+  });
+  await page.waitForFunction(() => {
+    const v = document.getElementById('fpViewer');
+    return !!v && ((v.querySelector('.fpv-count') || {}).textContent || '').indexOf('2 / 2') >= 0;
+  }, null, { timeout: 8000 });
+  const afterThumb = await page.evaluate(() => {
+    const v = document.getElementById('fpViewer');
+    const on = v.querySelector('.fpv-thumb.on');
+    return { on: on ? on.getAttribute('data-page') : null,
+             shown: (v.querySelector('.fpv-img') || {}).classList
+                    ? v.querySelector('.fpv-img').classList.contains('fpv-shown') : false };
+  });
+  chk('U13e 点第 2 个缩略图 → 回到第 2 页且高亮跟随、图有淡入类',
+      afterThumb.on === '2' && afterThumb.shown === true, afterThumb);
+
+  /* Esc 只关覆盖层，小窗必须还在原位（用户明确要求小窗不变） */
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => {
+    const v = document.getElementById('fpViewer');
+    return !!v && !v.classList.contains('fpv-on');
+  }, null, { timeout: 5000 });
+  const afterEsc = await page.evaluate(() => {
+    const v = document.getElementById('fpViewer');
     const m = document.getElementById('fPrevMenu');
     const st = m && m.querySelector('.fp-stage');
-    return { here: !!m, scrollTop: st ? Math.round(st.scrollTop) : -1, winScrollY: window.scrollY };
+    return { display: v ? getComputedStyle(v).display : 'missing',
+             menu: !!m, stageW: st ? st.clientWidth : 0,
+             imgH: st ? Math.round(st.querySelector('img').getBoundingClientRect().height) : 0 };
   });
-  chk('U13e 放大态下窗内滚轮 → 预览窗不收起（只滚图片）',
-      stillHere.here === true && stillHere.scrollTop > 0, stillHere);
+  chk('U13f Esc 关掉覆盖层（display:none），小窗还在、仍是 300×300 小舞台',
+      afterEsc.display === 'none' && afterEsc.menu === true &&
+      afterEsc.stageW === 300 && Math.abs(afterEsc.imgH - 300) <= 3, afterEsc);
 
-  await page.evaluate(() => document.querySelector('#fPrevMenu .fp-stage img').click());
-  await page.waitForFunction(() => {
-    const m = document.getElementById('fPrevMenu');
-    return !!m && !m.classList.contains('fp-zoom');
-  }, null, { timeout: 5000 });
-  /* v7.29：还原也有 320ms 过渡，等它跑完再量（否则量到中间帧） */
-  await page.waitForFunction(() => {
-    const m = document.getElementById('fPrevMenu');
-    return !!m && !m._fpAnimTimer && !m.style.transform && !m.style.transition;
-  }, null, { timeout: 3000 });
-  const restored = await page.evaluate(() => {
-    const m = document.getElementById('fPrevMenu');
-    const st = m.querySelector('.fp-stage');
-    const img = m.querySelector('.fp-stage img');
-    const btn = m.querySelector('.fp-zoom-btn');
-    return { stageW: st.clientWidth, imgH: Math.round(img.getBoundingClientRect().height),
-             btn: (btn.textContent || '').trim() };
-  });
-  chk('U13f 点图片还原：回到 300×300 缩略舞台，按钮文案回到「放大」',
-      restored.stageW === 300 && restored.imgH === 300 && restored.btn.indexOf('放大') >= 0,
-      restored);
-
-  /* U17（v7.29）：放大态下关闭也要有动画 —— 先缩回缩略舞台（220ms）再摘节点，
-     不能一个视口级大窗硬切掉。用户当场问过「放大的状态没做关闭动画吗」。 */
+  /* 再打开一次：覆盖层还能开，从第 2 页接着看（查看器自己按页缓存） */
+  const hitsBeforeReopen = previewHits.length;
   await page.evaluate(() => document.querySelector('#fPrevMenu .fp-zoom-btn').click());
   await page.waitForFunction(() => {
-    const m = document.getElementById('fPrevMenu');
-    return !!m && !m._fpAnimTimer && !m.style.transform && !m.style.transition;
-  }, null, { timeout: 3000 });
-  await page.evaluate(() => {
-    const btns = Array.prototype.slice.call(document.querySelectorAll('#fPrevMenu .fp-bar button'));
-    (btns.find((b) => (b.textContent || '').indexOf('✕') >= 0) || btns[btns.length - 1]).click();
+    const v = document.getElementById('fpViewer');
+    return !!v && v.classList.contains('fpv-on') && v.classList.contains('fpv-in');
+  }, null, { timeout: 5000 });
+  await page.waitForFunction(() => {
+    const v = document.getElementById('fpViewer');
+    const img = v && v.querySelector('.fpv-img');
+    return !!img && img.classList.contains('fpv-shown') && img.naturalWidth > 0;
+  }, null, { timeout: 8000 });
+  const reopened = await page.evaluate(() => {
+    const v = document.getElementById('fpViewer');
+    return { count: (v.querySelector('.fpv-count') || {}).textContent || '',
+             name: (v.querySelector('.fpv-name') || {}).textContent || '' };
   });
-  const closing = await page.evaluate(() => {
-    const m = document.getElementById('fPrevMenu');
-    if (!m) return { here: false };
-    const cs = getComputedStyle(m);
-    return { here: true, prop: cs.transitionProperty, dur: cs.transitionDuration,
-             closing: m.classList.contains('pm-closing'),
-             stillZoom: m.classList.contains('fp-zoom'),
-             w: Math.round(m.getBoundingClientRect().width) };
+  chk('U13g 关掉后能再打开，从第 2 页接着看，标题还是文件名',
+      reopened.count.indexOf('2 / 2') >= 0 && reopened.name.indexOf('可预览讲义.pdf') >= 0,
+      { reopened, hitsBeforeReopen });
+
+  /* U18（v7.31）：滚轮缩放（下限 = 初始大小）、放大后左键拖动、点图片外关闭。 */
+  const imgCenter = await page.evaluate(() => {
+    const r = document.querySelector('#fpViewer .fpv-img').getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
   });
+  await page.mouse.move(imgCenter.x, imgCenter.y);
+  await page.mouse.wheel(0, -300);
+  await page.waitForTimeout(100);
+  const zoomIn = await page.evaluate(() => {
+    const img = document.querySelector('#fpViewer .fpv-img');
+    const m = /scale\(([\d.]+)\)/.exec(img.style.transform || '');
+    return { scale: m ? parseFloat(m[1]) : 1,
+             cls: img.classList.contains('fpv-zoomed'),
+             cursor: getComputedStyle(img).cursor };
+  });
+  chk('U18a 滚轮向上放大：scale > 1、加 fpv-zoomed、光标变抓手',
+      zoomIn.scale > 1.3 && zoomIn.cls === true && zoomIn.cursor === 'grab', zoomIn);
+
+  await page.mouse.wheel(0, 4000);
   await page.waitForTimeout(120);
-  const midClose = await page.evaluate(() => {
-    const m = document.getElementById('fPrevMenu');
-    return { here: !!m, w: m ? Math.round(m.getBoundingClientRect().width) : 0 };
+  const zoomOut = await page.evaluate(() => {
+    const img = document.querySelector('#fpViewer .fpv-img');
+    return { tf: img.style.transform || '', cls: img.classList.contains('fpv-zoomed') };
   });
-  await page.waitForTimeout(320);
-  const closedAt = await page.evaluate(() => !document.getElementById('fPrevMenu'));
-  chk('U17a 放大态关闭：先缩回缩略舞台（transform 过渡 0.22s），不是瞬间消失',
-      closing.here === true && closing.prop.indexOf('transform') >= 0
-      && closing.dur.indexOf('0.22s') >= 0 && closing.stillZoom === false && closing.w >= 600,
-      closing);
-  chk('U17b 放大态关闭：120ms 时浮层还在且正在缩小，约 440ms 后摘干净',
-      midClose.here === true && midClose.w > 0 && midClose.w < closing.w && closedAt === true,
-      { closingW: closing.w, midClose, closedAt });
+  chk('U18b 滚轮向下缩到最小就停在初始大小（不会被缩成 0.x）',
+      zoomOut.tf === '' && zoomOut.cls === false, zoomOut);
+
+  /* 放大后左键拖动：平移量跟着走，松手后不关 */
+  await page.mouse.move(imgCenter.x, imgCenter.y);
+  await page.mouse.wheel(0, -300);
+  await page.waitForTimeout(100);
+  const tfBeforeDrag = await page.evaluate(
+    () => document.querySelector('#fpViewer .fpv-img').style.transform || '');
+  await page.mouse.move(imgCenter.x, imgCenter.y);
+  await page.mouse.down();
+  await page.mouse.move(imgCenter.x + 90, imgCenter.y + 50, { steps: 8 });
+  await page.mouse.up();
+  await page.waitForTimeout(120);
+  const afterDrag = await page.evaluate(() => {
+    const v = document.getElementById('fpViewer');
+    const img = v.querySelector('.fpv-img');
+    const m = /translate\((-?[\d.]+)px,\s*(-?[\d.]+)px\)/.exec(img.style.transform || '');
+    return { tf: img.style.transform || '', on: v.classList.contains('fpv-on'),
+             tx: m ? parseFloat(m[1]) : 0, ty: m ? parseFloat(m[2]) : 0,
+             grabbing: img.classList.contains('fpv-grabbing') };
+  });
+  chk('U18c 放大后按住左键拖动：图片跟着平移，松手不触发关闭、光标复位',
+      afterDrag.on === true && afterDrag.ty > 10 &&
+      afterDrag.tf !== tfBeforeDrag && afterDrag.grabbing === false,
+      { tfBeforeDrag, afterDrag });
+
+  await page.mouse.click(imgCenter.x, imgCenter.y);
+  await page.waitForTimeout(150);
+  const afterImgClick = await page.evaluate(
+    () => document.getElementById('fpViewer').classList.contains('fpv-on'));
+  chk('U18d 点图片本身不关闭（用户口径：点图片外的部分才关）', afterImgClick === true, afterImgClick);
+
+  /* 回到初始大小，点舞台空白（图片外）→ 关闭 */
+  await page.mouse.move(imgCenter.x, imgCenter.y);
+  await page.mouse.wheel(0, 4000);
+  await page.waitForTimeout(150);
+  const blankPt = await page.evaluate(() => {
+    const stage = document.querySelector('#fpViewer .fpv-stage');
+    const img = document.querySelector('#fpViewer .fpv-img');
+    const s = stage.getBoundingClientRect();
+    const r = img.getBoundingClientRect();
+    const x = s.left + 6, y = s.bottom - 6;
+    return { x, y, inImg: x >= r.left && x <= r.right && y >= r.top && y <= r.bottom };
+  });
+  await page.mouse.click(blankPt.x, blankPt.y);
+  await page.waitForFunction(() => {
+    const v = document.getElementById('fpViewer');
+    return !!v && !v.classList.contains('fpv-on');
+  }, null, { timeout: 5000 });
+  const afterBlank = await page.evaluate(() => {
+    const v = document.getElementById('fpViewer');
+    const m = document.getElementById('fPrevMenu');
+    return { display: v ? getComputedStyle(v).display : 'missing', menu: !!m,
+             stageW: m ? m.querySelector('.fp-stage').clientWidth : 0 };
+  });
+  chk('U18e 点图片外的舞台空白 → 关闭覆盖层，小窗还在 300×300',
+      blankPt.inImg === false && afterBlank.display === 'none' &&
+      afterBlank.menu === true && afterBlank.stageW === 300, { blankPt, afterBlank });
+
+  /* 重新打开覆盖层，交给 U17 测 ✕ 关闭 */
+  await page.evaluate(() => document.querySelector('#fPrevMenu .fp-zoom-btn').click());
+  await page.waitForFunction(() => {
+    const v = document.getElementById('fpViewer');
+    const img = v && v.querySelector('.fpv-img');
+    return !!v && v.classList.contains('fpv-on') && !!img && img.classList.contains('fpv-shown') &&
+           img.naturalWidth > 0;
+  }, null, { timeout: 8000 });
+
+  /* U17（v7.30）：✕ 关的是覆盖层，不是小窗 —— 小窗留给用户继续看缩略图/翻页。 */
+  await page.evaluate(() => {
+    const v = document.getElementById('fpViewer');
+    v.querySelector('.fpv-close').click();
+  });
+  await page.waitForFunction(() => {
+    const v = document.getElementById('fpViewer');
+    return !!v && !v.classList.contains('fpv-on');
+  }, null, { timeout: 5000 });
+  await page.waitForTimeout(260);
+  const afterClose = await page.evaluate(() => {
+    const v = document.getElementById('fpViewer');
+    const m = document.getElementById('fPrevMenu');
+    const img = v && v.querySelector('.fpv-img');
+    return { display: v ? getComputedStyle(v).display : 'missing',
+             strip: v ? v.querySelectorAll('.fpv-thumb').length : -1,
+             src: img ? img.getAttribute('src') : 'missing',
+             menu: !!m, stageW: m ? m.querySelector('.fp-stage').clientWidth : 0,
+             bodyLocked: document.body.style.overflow };
+  });
+  chk('U17a ✕ 关闭：覆盖层隐藏、缩略图清空、blob 释放、body 滚动锁解除，小窗仍在',
+      afterClose.display === 'none' && afterClose.strip === 0 &&
+      (afterClose.src === null || afterClose.src === '') &&
+      afterClose.menu === true && afterClose.stageW === 300 &&
+      (afterClose.bodyLocked || '') === '', afterClose);
+
 
   /* 重新开一个（U8 要用小窗去关） */
   await page.click('tr.file-expand.open .fn.pv-can');

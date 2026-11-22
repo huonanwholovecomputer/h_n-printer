@@ -7721,11 +7721,11 @@ _PREVIEW_UPLOAD_MAX_BYTES = 512 * 1024     # 正常 7~30 KB；512 KB 只是防�
 # `<stem>_t.jpg` / `<stem>_p.webp`：中段是档位字母、后面直接跟扩展名。
 # 老的多页缓名叫 `<stem>_p2.jpg`（中段是页号），两者只差一个字符 —— 必须用正则区分，
 # 否则「第 2 页的 JPEG」会被当成 p 档。
-_PREVIEW_TIER_RE = re.compile(r"_\d+_[tp]\.(?:jpe?g|webp)$")
+_PREVIEW_TIER_RE = re.compile(r"_\d+_[tpz]\.(?:jpe?g|webp)$")
 
 
 def _preview_tier_files(file_id: str) -> list[str]:
-    """该文件已上传的首页缩略图（t/p 档、不分格式）。"""
+    """该文件已上传的首页缩略图（t/p/z 档、不分格式）。"""
     safe_id = re.sub(r"[^0-9A-Za-z_-]", "", str(file_id))[:64]
     if not safe_id or not os.path.isdir(PREVIEW_DIR):
         return []
@@ -7745,10 +7745,11 @@ _PREVIEW_INDEX_CACHE = {"stamp": None, "ids": frozenset()}
 def _preview_id_index():
     """PREVIEW_DIR 里已有首页缩略图的 safe_id 集合；目录读不到时返回 None（退回逐个 glob）。
 
-    命名规则与 `_preview_stem` 同源：`<safe_id>_<mtime>[_p<页号>]_<t|p>.<ext>`。
-    用 `_PREVIEW_TIER_RE` 找末尾的 `_<mtime>_<t|p>.<ext>`，它前面的那段就是 safe_id ——
+    命名规则与 `_preview_stem` 同源：`<safe_id>_<mtime>[_p<页号>]_<t|p|z>.<ext>`。
+    用 `_PREVIEW_TIER_RE` 找末尾的 `_<mtime>_<t|p|z>.<ext>`，它前面的那段就是 safe_id ——
     与老实现（`glob(f"{safe_id}_*")` + 同一条正则）逐 id 等价，见
-    other/tests/verify_revenue_perf.py 的 B 段对拍。
+    other/tests/verify_revenue_perf.py 的 B 段对拍。`_p<页号>` 那些是第 2 页起的图，
+    不算「有首页缩略图」（正则不带 `_pN`，多页上传不会把第 1 页的判断撑开）。
     """
     try:
         stamp = os.stat(PREVIEW_DIR).st_mtime_ns
@@ -7785,7 +7786,7 @@ def _preview_tier_exists(file_id: str) -> bool:
 
 def _preview_tier_file(file_id: str, mtime_token: str, size_tok: str = "p",
                        fmt_tok: str = _PREVIEW_FMT_JPEG) -> str:
-    """服务端不会渲染的类型，退回客户端上传的缩略图（先精确档位，再逐级放宽）。"""
+    """首页现成的缩略图（先精确档位，再逐级放宽；返回原图路径，不做转码）。"""
     seen = set()
     for sz in (size_tok, "p", "t", "z"):
         for fm in (fmt_tok, _PREVIEW_FMT_WEBP, _PREVIEW_FMT_JPEG):
@@ -7793,6 +7794,82 @@ def _preview_tier_file(file_id: str, mtime_token: str, size_tok: str = "p",
                 continue
             seen.add((sz, fm))
             p = _preview_cache_path(file_id, mtime_token, 1, sz, fm)
+            if os.path.isfile(p):
+                return p
+    return ""
+
+
+def _preview_scale_file(src_path: str, dst_path: str, max_px: int, fmt: str) -> str:
+    """把已有的一页缩略图缩到 max_px/目标格式写进 dst（成功返回落盘路径，失败空串）。
+
+    只缩不放：源图比目标档位小就原样转码 —— 放大只会糊，没有信息量。
+    编码器可能悄悄回落成 JPEG（服务端没 WebP 能力时）：字节格式必须和落盘扩展名一致，
+    否则 `_send_preview_file` 按扩展名报 MIME，浏览器可能拒收，所以这里改回 .jpg 落盘。
+    """
+    if os.path.normcase(src_path) == os.path.normcase(dst_path):
+        return dst_path
+    try:
+        from PIL import Image
+        with Image.open(src_path) as im:
+            im = _flatten_to_rgb(im)
+            im.thumbnail((max(64, int(max_px)), max(64, int(max_px))), Image.LANCZOS)
+            data = _encode_preview_image(im, fmt)
+        target = dst_path
+        if fmt == _PREVIEW_FMT_WEBP and not data.startswith(b"RIFF"):
+            target = os.path.splitext(dst_path)[0] + ".jpg"
+        os.makedirs(PREVIEW_DIR, exist_ok=True)
+        tmp = target + ".part"
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, target)
+        return target
+    except Exception as e:  # noqa: BLE001  转码失败就换下一份候选，绝不让预览 500
+        print(f"  [PREVIEW] 档位转码失败 {src_path} → {dst_path}: {e}")
+        try:
+            os.remove(dst_path + ".part")
+        except OSError:
+            pass
+        return ""
+
+
+def _preview_reuse_page(file_id: str, mtime_token: str, page_no: int,
+                        size_tok: str, fmt_tok: str) -> str:
+    """缓存未命中时，复用同页任何一份现成的图（客户端从「实际打印用的 PDF」渲的、或历史渲的）。
+
+    这是 2026-11-21 的关键口径：客户端上传的是 1024（z）档，而小额预览要 320/640；
+    以前换档位会重新走 `_render_preview_page`（Office 又起一次 LibreOffice 重渲，
+    字体/分页跟本地 Word 打出来的不一样）。现在先找现成图，需要时**只做本地缩图/转码**，
+    服务端渲染只在「这一页真的谁都没渲过」时才发生。
+    """
+    dst = _preview_cache_path(file_id, mtime_token, page_no, size_tok, fmt_tok)
+    seen = set()
+    fallback = ""
+    for sz in (size_tok, "z", "p", "t"):
+        for fm in (fmt_tok, _PREVIEW_FMT_JPEG, _PREVIEW_FMT_WEBP):
+            if (sz, fm) in seen:
+                continue
+            seen.add((sz, fm))
+            src = _preview_cache_path(file_id, mtime_token, page_no, sz, fm)
+            if not os.path.isfile(src):
+                continue
+            if os.path.normcase(src) == os.path.normcase(dst):
+                return src
+            got = _preview_scale_file(src, dst, _PREVIEW_SIZES[size_tok], fmt_tok)
+            if got:
+                return got
+            # 转档失败（服务端没装 Pillow / 编码器缺失 / 图损坏）时的兜底：原样发这张
+            # 现成的图。绝不能掉进渲染分支 —— 纯文本服务端根本不会渲，硬渲就是 415，
+            # 等于把客户端已经传上来的缩略图弄丢（v7.30 之前的 tier 分支就是这个语义）。
+            if not fallback:
+                fallback = src
+    return fallback
+
+
+def _preview_any_cached(file_id: str, mtime_token: str, page_no: int = 1) -> str:
+    """该页有没有任何档位的现成图（给 415 闸门用：有图就该放行，不管是不是服务端渲的）。"""
+    for sz in ("z", "p", "t"):
+        for fm in (_PREVIEW_FMT_JPEG, _PREVIEW_FMT_WEBP):
+            p = _preview_cache_path(file_id, mtime_token, page_no, sz, fm)
             if os.path.isfile(p):
                 return p
     return ""
@@ -8385,7 +8462,10 @@ def _preview_request_context(file_id, openid, allow_any=False, actor="user"):
         mtime_token = "0"
     # 2026-11-19：服务端自己不会渲的类型（txt/csv/md …），只要本地工具上传过首页缩略图
     # 就照样算「有预览」—— 否则 415 闸门会挡在缓存检查之前，上传的图永远打不开。
-    if not _has_preview_for(display) and not _preview_tier_exists(file_id):
+    # 2026-11-21：客户端现在传 z 档（1024）且可能是 z+jpeg（沿用旧文件名，不在 tier 索引里），
+    # 所以再兜一层「这一页到底有没有现成文件」，避免有图却被 415 挡掉。
+    if (not _has_preview_for(display) and not _preview_tier_exists(file_id)
+            and not _preview_any_cached(file_id, mtime_token, 1)):
         _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor=actor,
                            ext=os.path.splitext(display)[1].lower().lstrip("."))
         return jsonify({"success": False, "message": "该类型没有预览图"}), 415
@@ -8428,14 +8508,14 @@ def _preview_page_response(file_id, ctx, openid="", actor="user"):
         _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor=actor)
         return _send_preview_file(cache_path, page_no, int(meta.get("pages") or page_no))
     ext = os.path.splitext(display)[1].lower()
-    # 服务端不会渲的类型（txt/csv/md）：有本地工具上传的首页缩略图就直接发那张。
-    # 只认第 1 页 —— 客户端只传首页，拿首页冒充第 2 页比没有更糟。
-    if page_no == 1 and not _has_preview_for(display):
-        tier = _preview_tier_file(file_id, mtime_token, size_tok, fmt_tok)
-        if tier:
-            _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor=actor,
-                               ext=ext.lstrip("."))
-            return _send_preview_file(tier, 1, 1)
+    # 缓存未命中：同页只要有任何一份现成的图（客户端从「实际打印 PDF」渲的，或历史服务端
+    # 渲的），就复用/下采样 —— 绝不为了换档位重渲 Office：LibreOffice 的字体/分页跟本地
+    # Word 打出来的不一致，放大看时差异最刺眼（2026-11-21 用户现场反馈）。
+    reused = _preview_reuse_page(file_id, mtime_token, page_no, size_tok, fmt_tok)
+    if reused:
+        _audit_file_access("preview", "ok", file_id=file_id, openid=openid, actor=actor,
+                           ext=os.path.splitext(reused)[1].lower().lstrip("."))
+        return _send_preview_file(reused, page_no, int(meta.get("pages") or page_no))
     fail_key = (str(file_id), mtime_token, int(page_no))
     if _preview_fail_hit(fail_key):
         # 刚失败过（典型：损坏的 docx / 服务器内存吃紧）：这次不再重试，直接回落图标。
@@ -8541,17 +8621,18 @@ def admin_file_preview(file_id):
 @app.route("/api/local/file_thumb", methods=["POST"])
 @require_printer_scope("admin")
 def local_file_thumb():
-    """本地打印工具回传首页缩略图（2026-11-19 阶段二）。
+    """本地打印工具回传缩略图（2026-11-19 阶段二；2026-11-21 起多页 + 1024 z 档）。
 
     为什么由客户端生成：服务端渲 .doc/.xls 要串行起 soffice（2GB 内存只许一个，超时 120s），
-    而客户端本来就要把文件转成 PDF 打印，顺手光栅化一页几乎零成本；纯文本 txt/csv/md
-    更是只有客户端能渲（服务端没有「文本首页」这个概念）。
+    而客户端本来就要把文件转成 PDF 打印，顺手光栅化几页几乎零成本；纯文本 txt/csv/md
+    更是只有客户端能渲。**必须从「实际打印用的那份 PDF」出图**：服务端 LibreOffice 重渲
+    docx 会换字体/分页，缩略图跟真正打出来的纸面不一致（2026-11-21 用户现场反馈）。
 
-    请求体 JSON：`{file_id, page:1, size:"t|p|z", fmt:"jpeg|webp", data:<base64>}`
+    请求体 JSON：`{file_id, page:1..999, size:"t|p|z", fmt:"jpeg|webp", data:<base64>}`
     - 图片格式按**真实字节**判定，不信请求里的 fmt（客户端传错也收，落盘名跟着真实格式走）
     - 落盘路径就是 GET 先查的那条缓存路径 ⇒ 服务端从此直接命中，不再自己渲染
     - 与文件保留期同删：`_drop_previews` 按 `{file_id}_*` 前缀把档位文件一并清掉
-    - 幂等：同一 (file_id, mtime, 档位) 重复上传就是覆盖（mtime 变了才换新前缀）
+    - 幂等：同一 (file_id, mtime, 页, 档位) 重复上传就是覆盖（mtime 变了才换新前缀）
     """
     payload = request.get_json(silent=True) or {}
     file_id = str(payload.get("file_id") or "").strip()
@@ -8561,8 +8642,7 @@ def local_file_thumb():
         page_no = int(payload.get("page") or 1)
     except (TypeError, ValueError):
         page_no = 1
-    if page_no != 1:
-        return jsonify({"success": False, "message": "只接受首页缩略图"}), 400
+    page_no = max(1, min(999, page_no))
     try:
         data = base64.b64decode(str(payload.get("data") or ""), validate=True)
     except Exception:  # noqa: BLE001  坏 base64 当参数错
@@ -8595,7 +8675,7 @@ def local_file_thumb():
     except OSError:
         mtime_token = "0"
 
-    cache_path = _preview_cache_path(file_id, mtime_token, 1, size_tok, actual_fmt)
+    cache_path = _preview_cache_path(file_id, mtime_token, page_no, size_tok, actual_fmt)
     try:
         os.makedirs(PREVIEW_DIR, exist_ok=True)
         tmp = cache_path + ".part"
@@ -8610,12 +8690,25 @@ def local_file_thumb():
         print(f"  [PREVIEW] 保存上传缩略图失败 {file_id}: {e}")
         return jsonify({"success": False, "message": "保存失败"}), 500
     # 之前渲染失败留下的负缓存要清掉，否则 10 分钟内 GET 还是回落图标
-    _preview_fail_cache.pop((str(file_id), mtime_token, 1), None)
+    _preview_fail_cache.pop((str(file_id), mtime_token, int(page_no)), None)
+    # 多页回传要把「总页数」记进 meta：GET 的 X-Preview-Pages 与 /info 都读它。
+    # 不写的话，客户端明明传了 5 页，结算页查看器仍以为只有 1 页（底部缩略图条不会出现）。
+    try:
+        prev = _read_preview_meta(file_id, mtime_token)
+        pages_prev = int(prev.get("pages") or 0)
+        rendered_prev = int(prev.get("rendered") or 0)
+        # 只有 PDF / Office 才可能有多页；图片、txt/csv/md 永远 1 页（客户端也只传 1 张）。
+        _ext = os.path.splitext(src_path)[1].lower()
+        _multi = _ext == ".pdf" or _ext in _PREVIEW_OFFICE_EXTS
+        _pages = max(pages_prev, page_no) if _multi else max(pages_prev, 1)
+        _write_preview_meta(file_id, mtime_token, _pages, max(rendered_prev, 1))
+    except Exception as e:  # noqa: BLE001  元信息写不进去不影响回图
+        print(f"  [PREVIEW] 更新页数元信息失败 {file_id}: {e}")
     _audit_file_access("preview", "upload", file_id=file_id, openid="", actor="printer")
     print(f"  [PREVIEW] 已接收客户端缩略图 file_id={file_id[:8]}… "
-          f"{size_tok}/{actual_fmt} {len(data)} B")
-    return jsonify({"success": True, "size": size_tok, "fmt": actual_fmt,
-                    "bytes": len(data)})
+          f"p{page_no} {size_tok}/{actual_fmt} {len(data)} B")
+    return jsonify({"success": True, "page": int(page_no), "size": size_tok,
+                    "fmt": actual_fmt, "bytes": len(data)})
 
 
 @app.route("/api/file_preview/<file_id>/info", methods=["GET"])

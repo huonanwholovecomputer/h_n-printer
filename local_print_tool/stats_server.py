@@ -2748,13 +2748,13 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         self._send_json({"success": False, "message": msg or "云端没有返回预览图"}, code)
 
     def _handle_local_order_thumb(self, path: str, query: str):
-        """本地订单的首页缩略图（打印时由本地工具渲染，存在本机）。
+        """本地订单缩略图（打印时由本地工具从**实际打印用的 PDF** 渲染，存在本机，可多页）。
 
-        GET /api/local/order_thumb/<订单号>?name=<文件名>
+        GET /api/local/order_thumb/<订单号>?name=<文件名>&page=N
           · 订单号/文件名都只当**查表键**用（order_thumbs 自己做路径净化，绝不拼接
-            用户输入到路径里）；
-          · 命中就回 image/webp，并带 X-Preview-Page/Pages: 1/1（结算页的翻页条
-            据此隐藏"下一页"——本地只渲染首页）；
+            用户输入到路径里）；页号 1 基、默认 1；
+          · 命中就回原图字节，并带 X-Preview-Page: N / X-Preview-Pages: <该文件已存页数>
+            （结算页的翻页条与底部缩略图条据此渲染）；
           · 没有就 404 + JSON message（页面 toast 一句人话，而不是一个破图标）。
         """
         order_number = urllib.parse.unquote(path[len(_LOCAL_ORDER_THUMB_PREFIX):] or "")
@@ -2764,15 +2764,22 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         qs = urllib.parse.parse_qs(query or "", keep_blank_values=True)
         name = urllib.parse.unquote((qs.get("name", [""])[0] or "")).strip()
         try:
+            page_no = int(qs.get("page", ["1"])[0] or 1)
+        except (TypeError, ValueError):
+            page_no = 1
+        page_no = max(1, min(999, page_no))
+        try:
             import order_thumbs
-            thumb = order_thumbs.find(order_number, name)
+            thumb = order_thumbs.find(order_number, name, page=page_no)
+            pages = order_thumbs.page_count(order_number, name) or (1 if thumb else 0)
         except Exception as e:                        # noqa: BLE001
             logger.warning("本地订单缩略图查询失败 %s: %s", order_number, type(e).__name__)
-            thumb = ""
+            thumb, pages = "", 0
         if not thumb:
-            return self._send_json({"success": False,
-                                    "message": "这一单还没有本地缩略图（换新版本地工具重打一次即可生成）"},
-                                   404)
+            msg = "这一单还没有本地缩略图（换新版本地工具重打一次即可生成）"
+            if page_no > 1 and pages:
+                msg = f"这一页没有本地缩略图（本机这份文件共 {pages} 页）"
+            return self._send_json({"success": False, "message": msg}, 404)
         try:
             with open(thumb, "rb") as f:
                 body = f.read()
@@ -2784,8 +2791,8 @@ class _StatsHandler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", len(body))
-        self.send_header("X-Preview-Page", "1")
-        self.send_header("X-Preview-Pages", "1")
+        self.send_header("X-Preview-Page", str(int(page_no)))
+        self.send_header("X-Preview-Pages", str(int(pages or page_no)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         return self._write_body(body)

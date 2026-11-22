@@ -117,6 +117,27 @@ def test_module():
         read_bin(p) == data and not any(n.endswith(".part") for n in os.listdir(os.path.dirname(p))),
         os.listdir(os.path.dirname(p)))
 
+    # A4c 多页：第 N 页带 _pN 后缀，find 只认请求的那页（v7.30）
+    p2 = order_thumbs.save_bytes("HN20261119-0040", "第三次作业-选择结构1.docx", data, "webp",
+                                 page=2)
+    chk("A4c 第 2 页落盘成 <key>_p2.webp，find(page=2) 取回它",
+        bool(p2) and p2.endswith("_p2.webp") and os.path.isfile(p2)
+        and order_thumbs.find("HN20261119-0040", "第三次作业-选择结构1.docx", page=2) == p2,
+        p2)
+    chk("A4d 没存过的第 3 页返回空串（不拿第 2 页顶替）",
+        order_thumbs.find("HN20261119-0040", "第三次作业-选择结构1.docx", page=3) == "")
+    chk("A4e page_count 报已存页数（2 页）",
+        order_thumbs.page_count("HN20261119-0040", "第三次作业-选择结构1.docx") == 2,
+        order_thumbs.page_count("HN20261119-0040", "第三次作业-选择结构1.docx"))
+
+    # A4f save_pages 重渲时先把旧页清掉（页数变少不许留残页）
+    n0 = order_thumbs.save_pages("HN20261119-0040", "第三次作业-选择结构1.docx",
+                                 [(1, data, "webp")])
+    chk("A4f 重渲只剩 1 页：旧的第 2 页被清掉、page_count 回 1",
+        n0 == 1
+        and order_thumbs.find("HN20261119-0040", "第三次作业-选择结构1.docx", page=2) == ""
+        and order_thumbs.page_count("HN20261119-0040", "第三次作业-选择结构1.docx") == 1)
+
     # A5 没写过的订单 / 文件名 → 空串（不抛）
     chk("A5 查不到时返回空串", order_thumbs.find("HN20261119-9999", "x.pdf") == "" and
         order_thumbs.find("", "x.pdf") == "")
@@ -168,6 +189,15 @@ def test_module():
         ok and order_thumbs.MAX_PER_ORDER > 0 and order_thumbs.MAX_TOTAL_BYTES > 0,
         "" if ok else detail)
 
+    # A11 换号（离线单 -L → 云端号）：目录跟着改名，旧目录不留空壳
+    made = order_thumbs.render_job("HN20261119-0099-L", "换号文件.png", img, "")
+    new_dir = order_thumbs.rename_order("HN20261119-0099-L", "HN20261120-0099")
+    chk("A11 rename_order 把缩略图搬到新订单号下、旧目录删掉",
+        bool(made) and bool(new_dir)
+        and order_thumbs.find("HN20261120-0099", "换号文件.png", page=1) != ""
+        and not os.path.isdir(os.path.dirname(made)),
+        (made, new_dir))
+
 
 def read_bin(path):
     try:
@@ -217,6 +247,9 @@ def test_route():
         # 先备好一单的图（走模块真实落盘，与打印时同一条路径）
         img = make_png(os.path.join(_TMP_ROOT, "route_src.png"), 120, 160)
         made = order_thumbs.render_job("HN20261119-0040", "route_src.png", img, "")
+        # v7.30：再补第 2 页（打印收尾时从打印 PDF 逐页落盘的样子）
+        order_thumbs.save_bytes("HN20261119-0040", "route_src.png",
+                                read_bin(made) or b"", "webp", page=2)
 
         # B1 没令牌 → 403（/api/* 统一门）
         st, hd, _ = get("/api/local/order_thumb/HN20261119-0040?name=route_src.png",
@@ -229,11 +262,25 @@ def test_route():
         chk("B2 命中 → 200 图片字节（image/webp|jpeg）",
             st == 200 and ctype.startswith("image/") and len(body) == os.path.getsize(made),
             (st, ctype, len(body), made))
-        chk("B2b 带 X-Preview-Page/Pages = 1/1（页面据此禁用「下一页」）",
-            hd.get("x-preview-page") == "1" and hd.get("x-preview-pages") == "1",
+        chk("B2b 带 X-Preview-Page/Pages = 1/2（两页时页面要能翻）",
+            hd.get("x-preview-page") == "1" and hd.get("x-preview-pages") == "2",
             {k: v for k, v in hd.items() if k.startswith("x-")})
         chk("B2c Cache-Control: no-store（重打后要看到新图）",
             hd.get("cache-control") == "no-store", hd.get("cache-control"))
+
+        # B2d 第 2 页也走同一条路由（&page=N）
+        st, hd, body = get("/api/local/order_thumb/HN20261119-0040?name=route_src.png&page=2")
+        chk("B2d ?page=2 → 200 且 X-Preview-Page=2 / Pages=2",
+            st == 200 and hd.get("x-preview-page") == "2"
+            and hd.get("x-preview-pages") == "2" and len(body) > 0,
+            (st, {k: v for k, v in hd.items() if k.startswith("x-")}, len(body)))
+        st, hd, body = get("/api/local/order_thumb/HN20261119-0040?name=route_src.png&page=9")
+        try:
+            msg = _json.loads(body.decode("utf-8")).get("message", "")
+        except Exception:                                              # noqa: BLE001
+            msg = ""
+        chk("B2e 不存在的第 9 页 → 404 且说明本地只有 2 页",
+            st == 404 and "这一页没有本地缩略图" in msg, (st, msg))
 
         # B3 订单存在但文件名对不上 → 404 + 人话 message
         st, hd, body = get("/api/local/order_thumb/HN20261119-0040?name=别的文件.pdf")

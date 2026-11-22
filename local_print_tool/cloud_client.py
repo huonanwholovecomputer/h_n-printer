@@ -2718,7 +2718,7 @@ class CloudClient(QObject):
         import base64
 
         try:
-            from cloud_thumb import OFFICE_EXTS, make_thumb
+            from cloud_thumb import OFFICE_EXTS, make_pages
         except Exception as e:  # noqa: BLE001  模块缺失（旧安装包）就当没这功能
             logger.info(f"缩略图模块不可用，跳过 #{task.task_id}: {e}")
             return
@@ -2731,11 +2731,16 @@ class CloudClient(QObject):
                 pdf_path, _meta = self._get_cached_pdf(task.source_md5, task.image_orientation)
             except Exception:  # noqa: BLE001
                 pdf_path = ""
-        result = make_thumb(local_path, original_name, pdf_path=pdf_path)
-        if not result:
+        # 下载时只传 p 档（640）首页：这时手里只有源文件/转换缓存，还不是「打印稿」；
+        # 打印收尾的 upload_thumb_pages 会用实际打印的 PDF 覆盖成 z 档（1024）多页。
+        # edge 必须显式给 640 —— 全局 THUMB_EDGE 已是 1024，不传就会把 1024 的图
+        # 塞进 p 档缓存，档位名与像素对不上。
+        pages = make_pages(local_path, original_name, pdf_path=pdf_path,
+                           max_pages=1, edge=640)
+        if not pages:
             logger.info(f"缩略图生成不了，跳过 #{task.task_id} {original_name}")
             return
-        data, fmt = result
+        _pno, data, fmt = pages[0]
         url = (self.api_url or "").rstrip("/") + "/api/local/file_thumb"
         try:
             headers = dict(self._auth_headers())
@@ -2758,6 +2763,48 @@ class CloudClient(QObject):
                 logger.info(f"缩略图回传未成功 #{task.task_id}: HTTP {resp.status_code}")
         except Exception as e:  # noqa: BLE001  网络问题不影响主流程
             logger.info(f"缩略图回传失败 #{task.task_id}: {e}")
+
+    def upload_thumb_pages(self, file_id: str, pages, label: str = "") -> int:
+        """把「实际打印用的 PDF」渲出来的多页缩略图上传到服务端（z 档 = 1024）。
+
+        为什么不在下载时传：那时还没有本地转好的 PDF，Office 只能让服务端 LibreOffice
+        重渲，字体会跟真正打出来的一致不了（2026-11-21 用户现场反馈）。打印收尾时
+        `cached_pdf` 就在手边，从它出图才是纸面的样子。返回成功页数。
+        """
+        import base64
+
+        if os.environ.get("HN_CLOUD_THUMB", "1").strip().lower() in ("0", "false", "no", "off"):
+            return 0
+        pages = list(pages or [])
+        if not file_id or not pages:
+            return 0
+        url = (self.api_url or "").rstrip("/") + "/api/local/file_thumb"
+        ok = 0
+        for page_no, data, fmt in pages:
+            try:
+                headers = dict(self._auth_headers())
+                headers["Content-Type"] = "application/json"
+                resp = http_requests.post(url, headers=headers, timeout=30, json={
+                    "file_id": file_id,
+                    "page": int(page_no),
+                    "size": "z",
+                    "fmt": fmt,
+                    "data": base64.b64encode(data).decode("ascii"),
+                })
+                good = False
+                try:
+                    good = resp.status_code == 200 and bool((resp.json() or {}).get("success"))
+                except Exception:  # noqa: BLE001  非 JSON 响应（网关错误页）
+                    good = False
+                if good:
+                    ok += 1
+                else:
+                    logger.info(f"缩略图回传未成功 {label} p{page_no}: HTTP {resp.status_code}")
+            except Exception as e:  # noqa: BLE001  网络问题不影响主流程
+                logger.info(f"缩略图回传失败 {label} p{page_no}: {e}")
+        if ok:
+            logger.info(f"缩略图已回传 {label}: {ok}/{len(pages)} 页")
+        return ok
 
     def _report_page_count(self, file_id: str, file_name: str, page_count: int, orientation: str):
         """回报页数分析结果到后端。"""

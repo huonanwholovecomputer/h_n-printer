@@ -424,10 +424,8 @@ mark.hit { background: #fff3b0; color: #3b2f00; border-radius: 3px; padding: 0 1
 .file-grid .fn.pv-can:hover { color: var(--accent, #4f6ef7); text-decoration: underline dotted rgba(127,127,127,.6); text-underline-offset: 3px; }
 #fPrevMenu { position: fixed; z-index: 240; padding: 8px; background: var(--card); border: 1px solid var(--border-strong);
   border-radius: 12px; box-shadow: 0 14px 34px rgba(0,0,0,.26); animation: pmIn .16s cubic-bezier(.2,.9,.3,1.25) both; }
-/* v7.29：放大/还原做形变过渡时要把开窗动画停掉 —— pmIn 带 fill:both，会一直压着 inline transform，
-   过渡根本看不到。这条必须排在 .pm-closing 之**前**：两者同特异度、靠源码顺序决胜，
-   排在后面会把收起动画 pmOut 一起压死（放大态下关闭就没动画了，2026-11-19 用户当场发现）。 */
-#fPrevMenu.fp-zooming { animation: none; }
+/* v7.30：小窗不再放大/形变，`fp-zooming` 这条规则随 FLIP 方案一起删除；
+   收起动画仍靠 .pm-closing（同特异度、源码顺序在 pmIn 之后）。 */
 #fPrevMenu.pm-closing { animation: pmOut .13s ease both; pointer-events: none; }
 #fPrevMenu .fp-title { font-size: .7rem; color: var(--muted); padding: 2px 4px 6px; line-height: 1.5; border-bottom: 1px solid var(--border); margin-bottom: 6px;
   max-width: 300px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -441,17 +439,74 @@ mark.hit { background: #fff3b0; color: #3b2f00; border-radius: 3px; padding: 0 1
   border-radius: 8px; padding: 3px 9px; font-size: .76rem; cursor: pointer; font-family: inherit; }
 #fPrevMenu .fp-bar button:disabled { opacity: .4; cursor: default; }
 #fPrevMenu .fp-page { font-size: .72rem; color: var(--muted); white-space: nowrap; }
-/* v7.26.2：预览图可放大。点图或按「⤢ 放大」把 300×300 的小舞台换成视口级大舞台，
-   图片按**原始像素**显示（云端预览长边本来就 ≤1024，放大后是真细节，不是把小图撑糊）。
-   大舞台上超出的部分在窗内滚动查看：_fpOnScroll / _fpOnSlide 对窗内目标一律放行，
-   所以在预览窗里滚轮/触控滑动不会把它收掉。 */
+/* v7.30：预览「放大」不再把弹窗撑大（v7.26.2 的做法已废弃），改成全窗口查看器：
+   小窗保持 300px 不动，点图 / 「⤢ 全屏」直接从原地淡入覆盖层。
+   覆盖层：图片居中不裁切、左右按钮 + ←/→ 键翻页、Esc / ✕ 关闭、底部缩略图条（点一下切页）。
+   切页只做 160ms 的淡入 + 极轻微 scale，不搞花哨动效（2026-11-21 用户口径）。 */
 #fPrevMenu .fp-stage img { cursor: zoom-in; }
-#fPrevMenu.fp-zoom { padding: 10px; }
-#fPrevMenu.fp-zoom .fp-stage { display: block; overflow: auto; cursor: zoom-out;
-  width: min(88vw, 1024px); height: min(78vh, 1024px); }
-#fPrevMenu.fp-zoom .fp-stage img { max-width: none; max-height: none; display: block;
-  margin: 0 auto; cursor: zoom-out; }
-#fPrevMenu.fp-zoom .fp-title { max-width: min(88vw, 1024px); }
+#fpViewer { position: fixed; inset: 0; z-index: 320; display: none; }
+#fpViewer.fpv-on { display: block; }
+#fpViewer .fpv-bg { position: absolute; inset: 0; background: rgba(8,10,16,.88);
+  backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  opacity: 0; transition: opacity .18s ease; }
+#fpViewer.fpv-in .fpv-bg { opacity: 1; }
+#fpViewer .fpv-body { position: absolute; inset: 0; display: flex; flex-direction: column;
+  padding: 0 64px; opacity: 0; transition: opacity .18s ease; }
+#fpViewer.fpv-in .fpv-body { opacity: 1; }
+#fpViewer .fpv-top { display: flex; align-items: center; gap: 12px; padding: 14px 4px 6px;
+  color: #e8eaf0; font-size: .8rem; }
+#fpViewer .fpv-name { max-width: 62vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#fpViewer .fpv-count { color: rgba(232,234,240,.65); font-size: .74rem; white-space: nowrap; }
+#fpViewer .fpv-spacer { flex: 1; }
+#fpViewer .fpv-close { width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(255,255,255,.22);
+  background: rgba(255,255,255,.08); color: #f0f2f7; font-size: 1rem; line-height: 1; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; font-family: inherit; }
+#fpViewer .fpv-close:hover { background: rgba(255,255,255,.18); }
+#fpViewer .fpv-stage { position: relative; flex: 1; min-height: 0; display: flex; align-items: center;
+  justify-content: center; padding: 6px 0; overflow: hidden; }
+#fpViewer .fpv-stage img { max-width: 100%; max-height: 100%; object-fit: contain; display: block;
+  border-radius: 4px; box-shadow: 0 24px 70px rgba(0,0,0,.55);
+  user-select: none; -webkit-user-select: none; -webkit-user-drag: none; touch-action: none;
+  opacity: 0; transform: scale(.992);
+  transition: opacity .16s ease, transform .16s ease; }
+#fpViewer .fpv-stage img.fpv-shown { opacity: 1; transform: none; }
+/* v7.31：滚轮缩放后不再走过渡（transform 每帧都在变），拖动时换抓手光标 */
+#fpViewer .fpv-stage img.fpv-zoomed { cursor: grab; transition: opacity .16s ease; }
+#fpViewer .fpv-stage img.fpv-grabbing { cursor: grabbing; }
+#fpViewer .fpv-hint { position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; color: rgba(232,234,240,.7); font-size: .82rem; text-align: center;
+  padding: 0 18px; line-height: 1.7; pointer-events: none; }
+#fpViewer .fpv-nav { position: absolute; top: 50%; transform: translateY(-50%); z-index: 2;
+  width: 44px; height: 70px; border-radius: 10px; border: 1px solid rgba(255,255,255,.16);
+  background: rgba(255,255,255,.06); color: #eef1f7; font-size: 1.5rem; line-height: 1; cursor: pointer;
+  display: flex; align-items: center; justify-content: center; font-family: inherit;
+  transition: background .15s ease, opacity .15s ease; }
+#fpViewer .fpv-nav:hover { background: rgba(255,255,255,.16); }
+#fpViewer .fpv-nav:disabled { opacity: 0; pointer-events: none; }
+#fpViewer .fpv-prev { left: 12px; }
+#fpViewer .fpv-next { right: 12px; }
+#fpViewer .fpv-strip { display: flex; gap: 8px; overflow-x: auto; overflow-y: hidden;
+  padding: 8px 2px 14px; scrollbar-width: thin; }
+#fpViewer .fpv-strip:empty { display: none; }
+#fpViewer .fpv-thumb { flex: 0 0 auto; width: 46px; height: 60px; padding: 0; border-radius: 5px;
+  border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.05); cursor: pointer;
+  overflow: hidden; position: relative; font-family: inherit; }
+#fpViewer .fpv-thumb img { width: 100%; height: 100%; object-fit: cover; display: block;
+  opacity: .62; transition: opacity .14s ease; }
+#fpViewer .fpv-thumb.on { border-color: #6d8bff; box-shadow: 0 0 0 1px #6d8bff; }
+#fpViewer .fpv-thumb.on img { opacity: 1; }
+#fpViewer .fpv-thumb .fpv-no { position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; font-size: .62rem; color: rgba(232,234,240,.55); }
+@media (max-width: 720px) {
+  #fpViewer .fpv-body { padding: 0 10px; }
+  #fpViewer .fpv-prev { left: 2px; }
+  #fpViewer .fpv-next { right: 2px; }
+  #fpViewer .fpv-nav { width: 36px; height: 56px; }
+  #fpViewer .fpv-thumb { width: 38px; height: 50px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  #fpViewer .fpv-bg, #fpViewer .fpv-body, #fpViewer .fpv-stage img { transition: none; }
+}
 /* timeout=超时：琥珀色（与 failed 的红、offline_unknown 的黄区分开） */
 .tag.st-timeout { background: #FFF8E1; color: #B45309; }
 [data-theme="dark"] .tag.st-timeout { background: rgba(245,158,11,.18); color: #FBBF24; }
@@ -1255,7 +1310,7 @@ function mergeStores(localStore, cloudStore) {
 /* ==================== 全局状态 ==================== */
 /* 版本号唯一来源：关于页标题 + 版本说明的最末条目都从它取。发版时只改这一处，
    别再在 renderAbout 里写死字面量（2026-11-16 现场：标题还停在 v7.10，日志已到 v7.25）。 */
-var APP_VER = 'v7.29';
+var APP_VER = 'v7.31';
 var STORE = migrateConfig(null);
 var currentKey = currentMonthKey();
 var currentTab = 'dash';
@@ -6317,40 +6372,12 @@ function _fpReleaseUrl() {
     _fpObjUrl = '';
   }
 }
-/* v7.29：放大态下关闭要「缩回缩略舞台」再摘节点。
-   原来放大的大窗直接播 pmOut（130ms 淡出 + scale .96）—— 一个 1024 的窗只缩 4%，眼里就是「啪」地
-   消失，用户当场问「放大的状态没做关闭动画吗」。这里复用放大那套 FLIP：把窗从当前大框缩回小框
-   （锚点角一起回去）、顺带淡到 .35，够 220ms 再摘。返回过渡时长；0 表示没做成形变，交回老路径。 */
-var _FP_CLOSE_MS = 220;
-function _fpCloseMorph(m) {
-  var first = m.getBoundingClientRect();
-  if (!first.width || !first.height) return 0;
-  m.classList.remove('fp-zoom');
-  if (!m.classList.contains('fp-zooming')) m.classList.add('fp-zooming');
-  m.style.pointerEvents = 'none';
-  _fpPlace(m);
-  _fpEndZoomAnim(m);   /* 连点/动画未收时先清干净，再按新尺寸量 */
-  var last = m.getBoundingClientRect();
-  if (!last.width || !last.height) return 0;
-  var sx = first.width / last.width, sy = first.height / last.height;
-  if (!isFinite(sx) || !isFinite(sy) || !sx || !sy) return 0;
-  var below = (m._fpBelow !== false);
-  var tx = first.left - last.left;
-  var ty = below ? (first.top - last.top)
-                 : ((first.top + first.height) - (last.top + last.height));
-  m.style.willChange = 'transform, opacity';
-  m.style.transition = 'none';
-  m.style.transform = 'translate(' + tx.toFixed(2) + 'px,' + ty.toFixed(2) + 'px) scale(' +
-                      sx.toFixed(5) + ',' + sy.toFixed(5) + ')';
-  m.style.opacity = '1';
-  void m.offsetWidth;
-  m.style.transition = 'transform ' + _FP_CLOSE_MS + 'ms ' + _FP_ZOOM_EASE +
-                       ', opacity ' + _FP_CLOSE_MS + 'ms ease';
-  m.style.transform = 'none';
-  m.style.opacity = '.35';
-  return _FP_CLOSE_MS;
-}
+/* v7.30：放大态改成独立覆盖层（#fpViewer），小窗自身不再形变；
+   关闭时先把覆盖层淡出，小窗原样留着（用户要「小窗不变」）。 */
 function closeFilePreview(immediate) {
+  /* v7.30：覆盖层开着就一起收（否则小窗摘了、全屏还挂着，Esc 就没人接了） */
+  if (_fpvState) closeFpViewer();
+  _fpUnbindKeys();
   document.removeEventListener('click', _fpOutside, true);
   _fpUnbindScroll();
   var m = document.getElementById('fPrevMenu');
@@ -6362,17 +6389,6 @@ function closeFilePreview(immediate) {
     _fpReleaseUrl();
   };
   if (immediate === true || !m.classList || _prefersReduced()) { drop(); return; }
-  /* 放大态：先缩回小舞台再摘（v7.29），别让一个视口级大窗硬切掉 */
-  if (m.classList.contains('fp-zoom')) {
-    var morphMs = 0;
-    try { morphMs = _fpCloseMorph(m); } catch (e) { morphMs = 0; }
-    if (morphMs > 0) {
-      if (!m.classList.contains('pm-closing')) m.classList.add('pm-closing');
-      m.style.animation = 'none';   /* 形变已经够，别让 pmOut 再把 transform 抢回去 */
-      _fpCloseTimer = setTimeout(drop, morphMs + 40);
-      return;
-    }
-  }
   if (!m.classList.contains('pm-closing')) m.classList.add('pm-closing');
   /* 每次 close 都（重新）挂一个摘除定时器。旧写法在「已经 pm-closing 就 return」之前
      先把上一个定时器清掉了 —— 二次 close（点 ✕ 的同时又滚动/点外部）会留下一个
@@ -6391,18 +6407,21 @@ function _fpUnbindScroll() {
   window.removeEventListener('touchmove', _fpOnSlide, { passive: true, capture: true });
 }
 function _fpOnScroll(ev) {
+  if (_fpvState) return;   /* 全屏覆盖层开着时，底表滚动跟它无关 */
   var m = document.getElementById('fPrevMenu');
   if (!m) { _fpUnbindScroll(); return; }
   if (ev && ev.target && m.contains && m.contains(ev.target)) return;
   closeFilePreview();
 }
 function _fpOnSlide(ev) {
+  if (_fpvState) return;
   var m = document.getElementById('fPrevMenu');
   if (!m) { _fpUnbindScroll(); return; }
   if (ev && m.contains && m.contains(ev.target)) return;
   closeFilePreview();
 }
 function _fpOutside(ev) {
+  if (_fpvState) return;
   var m = document.getElementById('fPrevMenu');
   if (!m) { document.removeEventListener('click', _fpOutside, true); return; }
   if (ev && m.contains(ev.target)) return;
@@ -6439,64 +6458,426 @@ function _fpPlace(m) {
   m.style.left = x + 'px';
   m.style.top = y + 'px';
 }
-/* 放大 / 还原（v7.26.2）：切 class 与按钮文案，图片本身不动 —— 翻页时保持当前缩放。
-   v7.29（2026-11-19 用户要求「放大加个自然过渡的动画，缩小也加一下」）：用 FLIP 做形变过渡。
-   做法：切 class 前后各量一次窗体外框 → 先把「新尺寸的窗」反向缩放+平移到「旧框」的位置，
-   再用 transform 过渡回 none。看上去就是小窗从文件名那里长成大窗、大窗缩回小窗，锚点角钉住不动。 */
-var _FP_ZOOM_MS = 320;
-var _FP_ZOOM_EASE = 'cubic-bezier(.22,.85,.24,1)';
+/* v7.30：放大改成全窗口覆盖层（#fpViewer）；小窗尺寸不再变化。 */
+/* 小窗自身不再形变：放大 = 打开 #fpViewer 覆盖层（淡入淡出 + 左右翻页 + 底部缩略图条）。 */
 function _fpMotionOff() {
   return !!(_mqReduce && _mqReduce.matches);
 }
-function _fpEndZoomAnim(m) {
-  if (!m) return;
-  if (m._fpAnimTimer) { clearTimeout(m._fpAnimTimer); m._fpAnimTimer = null; }
-  m.style.transition = '';
-  m.style.transform = '';
-  m.style.willChange = '';
+/* ── v7.30：全窗口预览查看器 ──────────────────────────────────────────────
+   小窗（#fPrevMenu）只负责「贴住文件名的小图」；点图 / 「⤢ 全屏」进入 #fpViewer：
+   覆盖层淡入、图片居中、左右按钮 + ←/→ 翻页、Esc / ✕ 关闭、底部缩略图条点选切页。
+   取图仍走小窗那套接口（云端 /api/local/file_preview/<id>、本地 /api/local/order_thumb/<订单号>），
+   z 档（1024，WebP 优先）一页只取一次：大图与缩略图条共用同一个 blob: URL。 */
+var _fpvState = null;
+function _fpvLockBody(on) {
+  if (on) {
+    if (document.body.dataset.fpvOverflow == null) {
+      document.body.dataset.fpvOverflow = document.body.style.overflow || '';
+    }
+    document.body.style.overflow = 'hidden';
+  } else {
+    document.body.style.overflow = document.body.dataset.fpvOverflow || '';
+    delete document.body.dataset.fpvOverflow;
+  }
 }
-function fpToggleZoom() {
+function _fpvEnsure() {
+  var el = document.getElementById('fpViewer');
+  if (el) return el;
+  el = document.createElement('div');
+  el.id = 'fpViewer';
+  el.innerHTML =
+    '<div class="fpv-bg" onclick="closeFpViewer()"></div>' +
+    '<div class="fpv-body">' +
+      '<div class="fpv-top"><span class="fpv-name"></span><span class="fpv-count"></span>' +
+      '<span class="fpv-spacer"></span>' +
+      '<button type="button" class="fpv-close" title="关闭（Esc）" onclick="closeFpViewer()">✕</button></div>' +
+      '<div class="fpv-stage">' +
+        '<img class="fpv-img" alt="预览" draggable="false" style="display:none">' +
+        '<div class="fpv-hint">正在读取预览…</div>' +
+      '</div>' +
+      /* 左右钮挂在 .fpv-body 上：.fpv-stage 开了 overflow:hidden（缩放后不许盖住页脚），
+         钮留在 stage 里会被一起裁掉。 */
+      '<button type="button" class="fpv-nav fpv-prev" title="上一页（←）" onclick="fpvGo(-1)">‹</button>' +
+      '<button type="button" class="fpv-nav fpv-next" title="下一页（→）" onclick="fpvGo(1)">›</button>' +
+      '<div class="fpv-strip"></div>' +
+    '</div>';
+  document.body.appendChild(el);
+  /* 缩放/拖动/点空白关闭：挂在常驻元素上，处理函数内部只看当前的 _fpvState。 */
+  var stage = el.querySelector('.fpv-stage');
+  var img = el.querySelector('.fpv-img');
+  if (stage) {
+    stage.addEventListener('wheel', _fpvWheel, { passive: false });
+    stage.addEventListener('mousedown', _fpvDown);
+  }
+  if (img) img.addEventListener('dragstart', function (ev) { ev.preventDefault(); });
+  el.querySelector('.fpv-body').addEventListener('click', _fpvBodyClick);
+  return el;
+}
+/* 一页只取一次：大图（z 档 1024）与底部缩略图条（p 档 640）各取各的。
+   返回 Promise<{url, page, pages}>；失败 resolve(null)，message 记进 st.errors。 */
+function _fpvFetchPage(st, page, small) {
+  if (!st || st.closed || page < 1) return Promise.resolve(null);
+  if (st.pages && page > st.pages) return Promise.resolve(null);
+  var cache = small ? st.thumbs : st.urls;
+  var busy = small ? st.thumbLoading : st.loading;
+  if (cache[page]) return Promise.resolve({ url: cache[page], page: page, pages: st.pages });
+  if (busy[page]) return busy[page];
+  var f = st.m._fpFile || {};
+  var cloud = st.m._fpCloud !== false;
+  var url = cloud
+    ? ('/api/local/file_preview/' + encodeURIComponent(f.file_id || '') +
+       '?page=' + page + '&size=' + (small ? 't' : 'z') + '&fmt=webp')
+    : ('/api/local/order_thumb/' + encodeURIComponent((st.m._fpOrder && st.m._fpOrder.order_number) || '') +
+       '?name=' + encodeURIComponent(f.file_name || '') + '&page=' + page);
+  var p = fetch(url, { headers: { 'X-Launch-Token': LAUNCH_TOKEN } })
+    .then(function (res) {
+      if (!res.ok) {
+        return res.json().catch(function () { return {}; }).then(function (j) {
+          throw new Error((j && j.message) || ('预览不可用（HTTP ' + res.status + '）'));
+        });
+      }
+      var pages = parseInt(res.headers.get('X-Preview-Pages') || '0', 10) || 0;
+      var served = parseInt(res.headers.get('X-Preview-Page') || String(page), 10) || page;
+      return res.blob().then(function (b) {
+        if (!st || st.closed) return null;
+        var u = URL.createObjectURL(b);
+        cache[served] = u;
+        if (pages && !st.pages) st.pages = pages;
+        return { url: u, page: served, pages: pages || st.pages || 0 };
+      });
+    })
+    .catch(function (e) {
+      st.errors[page] = (e && e.message) || '预览不可用';
+      return null;
+    })
+    .then(function (r) { delete busy[page]; return r; },
+          function () { delete busy[page]; return null; });
+  busy[page] = p;
+  return p;
+}
+function _fpvMarkThumb(st) {
+  var strip = st.el.querySelector('.fpv-strip');
+  if (!strip) return;
+  Array.prototype.forEach.call(strip.children, function (c) {
+    c.classList.toggle('on', parseInt(c.dataset.page, 10) === st.page);
+  });
+  var on = strip.querySelector('.fpv-thumb.on');
+  if (on && on.scrollIntoView) {
+    try { on.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'smooth' }); } catch (e) {}
+  }
+}
+function _fpvBuildStrip(st) {
+  var strip = st.el.querySelector('.fpv-strip');
+  var want = (st.pages > 1) ? st.pages : 0;
+  if (st.stripBuilt === want) { _fpvMarkThumb(st); return; }
+  st.stripBuilt = want;
+  if (st.thumbIo) { try { st.thumbIo.disconnect(); } catch (e) {} st.thumbIo = null; }
+  strip.innerHTML = '';
+  if (!want) return;
+  for (var i = 1; i <= want; i++) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'fpv-thumb';
+    b.dataset.page = String(i);
+    b.title = '第 ' + i + ' 页';
+    b.innerHTML = '<span class="fpv-no">' + i + '</span>';
+    b.onclick = (function (p) { return function () { fpvGoTo(p); }; })(i);
+    strip.appendChild(b);
+  }
+  _fpvMarkThumb(st);
+  /* 缩略图条可能几十页：只给滚到视野内的格子发请求（没有 IO 就只先取前 24 页） */
+  if (typeof IntersectionObserver === 'function') {
+    st.thumbIo = new IntersectionObserver(function (rows) {
+      rows.forEach(function (r) {
+        if (r.isIntersecting) _fpvThumbFetch(st, parseInt(r.target.dataset.page, 10));
+      });
+    }, { root: strip, rootMargin: '140px' });
+    Array.prototype.forEach.call(strip.children, function (c) { st.thumbIo.observe(c); });
+  } else {
+    for (var j = 1; j <= Math.min(want, 24); j++) _fpvThumbFetch(st, j);
+  }
+}
+function _fpvThumbFetch(st, page) {
+  if (!st || st.closed || !page) return;
+  if (st.thumbs[page]) { _fpvThumbPaint(st, page, st.thumbs[page]); return; }
+  if (st.thumbLoading[page]) return;
+  _fpvFetchPage(st, page, true).then(function (r) {
+    if (r && !st.closed) _fpvThumbPaint(st, r.page, r.url);
+  });
+}
+function _fpvThumbPaint(st, page, url) {
+  var t = st.el.querySelector('.fpv-thumb[data-page="' + page + '"]');
+  if (!t || t.querySelector('img')) return;
+  var im = document.createElement('img');
+  im.alt = '';
+  im.onload = function () {
+    var no = t.querySelector('.fpv-no');
+    if (no && no.parentNode) no.parentNode.removeChild(no);
+  };
+  im.src = url;
+  t.appendChild(im);
+}
+function _fpvChrome(st) {
+  var el = st.el;
+  el.querySelector('.fpv-count').textContent = (st.pages > 1)
+    ? ('第 ' + st.page + ' / ' + st.pages + ' 页') : ('第 ' + st.page + ' 页');
+  el.querySelector('.fpv-prev').disabled = (st.page <= 1);
+  el.querySelector('.fpv-next').disabled = (!st.pages || st.page >= st.pages);
+  _fpvBuildStrip(st);
+}
+/* ── v7.31：全屏查看器的缩放 / 拖动 / 点空白关闭 ─────────────────────────
+   用户口径（2026-11-21）：滚轮放大缩小，但最小就是「初始大小」（contain 铺满可视区，
+   不许再缩）；放大后按住左键拖动图片；点图片以外的地方关闭。
+   缩放用 transform: translate(tx,ty) scale(z)，以光标为锚点（放大时光标下的那一点不动）。 */
+var _FPV_ZOOM_MAX = 6;
+function _fpvResetView(st) {
+  if (!st || !st.el) return;
+  st.zoom = 1; st.tx = 0; st.ty = 0; st.drag = null; st.moved = false;
+  var img = st.el.querySelector('.fpv-img');
+  if (img) {
+    img.style.transform = '';
+    img.classList.remove('fpv-zoomed', 'fpv-grabbing');
+  }
+  window.removeEventListener('mousemove', _fpvMove, true);
+  window.removeEventListener('mouseup', _fpvUp, true);
+}
+function _fpvApplyView(st) {
+  if (!st || !st.el) return;
+  var img = st.el.querySelector('.fpv-img');
+  var stage = st.el.querySelector('.fpv-stage');
+  if (!img || !stage) return;
+  if (st.zoom <= 1.001) {
+    st.zoom = 1; st.tx = 0; st.ty = 0;
+    img.style.transform = '';
+    img.classList.remove('fpv-zoomed');
+    return;
+  }
+  /* 夹住平移量：图边缘最多贴到舞台边缘，不许拖出视野（centered transform-origin）。 */
+  var maxX = Math.max(0, (img.offsetWidth * st.zoom - stage.clientWidth) / 2);
+  var maxY = Math.max(0, (img.offsetHeight * st.zoom - stage.clientHeight) / 2);
+  st.tx = Math.max(-maxX, Math.min(maxX, st.tx));
+  st.ty = Math.max(-maxY, Math.min(maxY, st.ty));
+  img.style.transform = 'translate(' + st.tx.toFixed(1) + 'px,' + st.ty.toFixed(1) + 'px) scale(' +
+                        st.zoom.toFixed(3) + ')';
+  img.classList.add('fpv-zoomed');
+}
+function _fpvZoomAt(st, factor, cx, cy) {
+  if (!st || !st.el) return;
+  var img = st.el.querySelector('.fpv-img');
+  var stage = st.el.querySelector('.fpv-stage');
+  if (!img || !stage) return;
+  var before = st.zoom;
+  var next = Math.max(1, Math.min(_FPV_ZOOM_MAX, before * factor));
+  if (Math.abs(next - before) < 0.002) return;
+  var r = stage.getBoundingClientRect();
+  /* 光标相对「舞台中心 + 当前平移」的偏移；缩放后按 k 反向补偿，光标下那点保持不动 */
+  var ox = (cx - (r.left + r.width / 2)) - st.tx;
+  var oy = (cy - (r.top + r.height / 2)) - st.ty;
+  var k = next / before;
+  st.tx -= ox * (k - 1);
+  st.ty -= oy * (k - 1);
+  st.zoom = next;
+  _fpvApplyView(st);
+}
+function _fpvWheel(ev) {
+  var st = _fpvState;
+  if (!st || st.closed) return;
+  var dy = ev.deltaY || 0;
+  if (!dy) return;
+  ev.preventDefault();
+  /* 1.0015^100 ≈ 1.16：一格滚轮大约 +16%，触控板的小增量也能平滑累计 */
+  _fpvZoomAt(st, Math.pow(1.0015, -dy), ev.clientX, ev.clientY);
+}
+function _fpvDown(ev) {
+  var st = _fpvState;
+  if (!st || st.closed || ev.button !== 0) return;
+  var img = st.el.querySelector('.fpv-img');
+  if (!img || ev.target !== img || st.zoom <= 1.001) return;
+  ev.preventDefault();
+  st.drag = { x: ev.clientX, y: ev.clientY, tx: st.tx, ty: st.ty };
+  st.moved = false;
+  img.classList.add('fpv-grabbing');
+  window.addEventListener('mousemove', _fpvMove, true);
+  window.addEventListener('mouseup', _fpvUp, true);
+}
+function _fpvMove(ev) {
+  var st = _fpvState;
+  if (!st || !st.drag) return;
+  ev.preventDefault();
+  var dx = ev.clientX - st.drag.x;
+  var dy = ev.clientY - st.drag.y;
+  if (Math.abs(dx) + Math.abs(dy) > 3) st.moved = true;
+  st.tx = st.drag.tx + dx;
+  st.ty = st.drag.ty + dy;
+  _fpvApplyView(st);
+  /* 贴边被夹住后重新记锚点，避免「拖到边再往回拖」时手指先空走一段 */
+  if (st.zoom > 1.001) {
+    st.drag.x = ev.clientX;
+    st.drag.y = ev.clientY;
+    st.drag.tx = st.tx;
+    st.drag.ty = st.ty;
+  }
+}
+function _fpvUp() {
+  window.removeEventListener('mousemove', _fpvMove, true);
+  window.removeEventListener('mouseup', _fpvUp, true);
+  var st = _fpvState;
+  if (!st) return;
+  st.drag = null;
+  var img = st.el && st.el.querySelector('.fpv-img');
+  if (img) img.classList.remove('fpv-grabbing');
+}
+function _fpvBodyClick(ev) {
+  var st = _fpvState;
+  if (!st || st.closed) return;
+  var t = ev.target;
+  /* 图、左右钮、缩略图条（含其间隙）、✕ 都不算「点空白」 */
+  if (t && t.closest && t.closest('.fpv-img, .fpv-nav, .fpv-thumb, .fpv-close, .fpv-strip')) return;
+  if (st.moved) { st.moved = false; return; }   /* 刚拖完那一下 mouseup 合成的 click 不算关闭 */
+  closeFpViewer();
+}
+function _fpvPaint(st, url) {
+  var img = st.el.querySelector('.fpv-img');
+  var hint = st.el.querySelector('.fpv-hint');
+  _fpvResetView(st);              /* 换页 / 重画一律回到初始大小 */
+  img.classList.remove('fpv-shown');
+  img.style.display = 'block';
+  void img.offsetWidth;   /* 让 opacity:0 先落一帧，切页才有淡入 */
+  var done = function () {
+    if (!st || st.closed) return;
+    img.classList.add('fpv-shown');
+    hint.style.display = 'none';
+  };
+  img.onload = done;
+  img.src = url;
+  if (img.complete && img.naturalWidth) done();
+}
+function _fpvShow(st, page) {
+  var want = Math.max(1, page);
+  st.page = want;
+  var seq = ++st.seq;
+  _fpvChrome(st);
+  var img = st.el.querySelector('.fpv-img');
+  if (st.urls[want]) { _fpvPaint(st, st.urls[want]); return; }
+  img.classList.remove('fpv-shown');
+  img.style.display = 'none';
+  var hint = st.el.querySelector('.fpv-hint');
+  hint.style.display = 'flex';
+  hint.textContent = (want > 1 ? ('正在读取第 ' + want + ' 页…') : '正在读取预览…');
+  _fpvFetchPage(st, want).then(function (r) {
+    if (!r || st.closed || seq !== st.seq) return;
+    _fpvChrome(st);
+    _fpvPaint(st, r.url);
+    /* 顺手预热相邻页：翻页基本无等待，又不至于一次拉整本 */
+    if (want > 1) _fpvFetchPage(st, want - 1);
+    if (!st.pages || want < st.pages) _fpvFetchPage(st, want + 1);
+  });
+}
+function _fpvKey(ev) {
+  if (!ev) return;
+  if (_fpvState) {
+    if (ev.key === 'Escape') { ev.preventDefault(); closeFpViewer(); return; }
+    if (ev.key === 'ArrowLeft') { ev.preventDefault(); fpvGo(-1); return; }
+    if (ev.key === 'ArrowRight') { ev.preventDefault(); fpvGo(1); return; }
+    return;
+  }
+  var m = document.getElementById('fPrevMenu');
+  if (!m) { _fpUnbindKeys(); return; }
+  if (ev.key === 'Escape') { ev.preventDefault(); closeFilePreview(); }
+  else if (ev.key === 'ArrowLeft') { ev.preventDefault(); fpGo(-1); }
+  else if (ev.key === 'ArrowRight') { ev.preventDefault(); fpGo(1); }
+}
+var _fpKeyBound = false;
+function _fpBindKeys() {
+  if (_fpKeyBound) return;
+  document.addEventListener('keydown', _fpvKey, true);
+  _fpKeyBound = true;
+}
+function _fpUnbindKeys() {
+  if (!_fpKeyBound) return;
+  if (_fpvState || document.getElementById('fPrevMenu')) return;   /* 还有一层开着就别解绑 */
+  document.removeEventListener('keydown', _fpvKey, true);
+  _fpKeyBound = false;
+}
+/* 打开全窗口查看器：从小窗当前这页开始，覆盖层原地淡入（不做 FLIP 位移）。 */
+function openFpViewer() {
   var m = document.getElementById('fPrevMenu');
   if (!m) return;
-  var first = m.getBoundingClientRect();
-  var on = !m.classList.contains('fp-zoom');
-  if (on) m.classList.add('fp-zoom'); else m.classList.remove('fp-zoom');
-  var b = m.querySelector('.fp-zoom-btn');
-  if (b) {
-    b.textContent = on ? '⤡ 还原' : '⤢ 放大';
-    b.title = on ? '恢复缩略尺寸' : '按原始像素放大查看（画质更好）';
-  }
-  _fpPlace(m);
-  /* 量终态前先把上一轮的动画收干净（连点两下时不能叠着算） */
-  _fpEndZoomAnim(m);
-  if (_fpMotionOff() || !first.width || !first.height) return;
-  var last = m.getBoundingClientRect();
-  if (!last.width || !last.height) return;
-  var sx = first.width / last.width, sy = first.height / last.height;
-  if (!isFinite(sx) || !isFinite(sy) || sx === 0 || sy === 0) return;
-  /* 锚点角：贴位在上方 ⇒ 底左角，否则左上角（与 transform-origin 一致） */
-  var below = (m._fpBelow !== false);
-  var tx = first.left - last.left;
-  var ty = below ? (first.top - last.top)
-                 : ((first.top + first.height) - (last.top + last.height));
-  /* pmIn 动画带 fill:both，会一直压着 inline transform —— 过渡期间先把它关掉（class 而不是 inline
-     animation，否则收起动画 pmOut 也会被 inline 压死） */
-  if (!m.classList.contains('fp-zooming')) m.classList.add('fp-zooming');
-  m.style.willChange = 'transform';
-  m.style.transition = 'none';
-  m.style.transform = 'translate(' + tx.toFixed(2) + 'px,' + ty.toFixed(2) + 'px) scale(' +
-                      sx.toFixed(5) + ',' + sy.toFixed(5) + ')';
-  void m.offsetWidth;   /* 让反向变换先落一帧，否则会被合并掉、看不到过渡 */
-  m.style.transition = 'transform ' + _FP_ZOOM_MS + 'ms ' + _FP_ZOOM_EASE;
-  m.style.transform = 'none';
-  m._fpAnimTimer = setTimeout(function () {
-    m._fpAnimTimer = null;
-    if (!m.parentNode) return;
-    m.style.transition = '';
-    m.style.transform = '';
-    m.style.willChange = '';
-  }, _FP_ZOOM_MS + 80);
+  if (_fpvState) { closeFpViewer(); return; }
+  closeOrderStatusMenu(); closeOrderTypeMenu(); closeOrderUserMenu(); closePriceMenu(true);
+  var st = _fpvState = { m: m, page: m._fpPage || 1, pages: m._fpPages || 0, seq: 0,
+                         urls: {}, thumbs: {}, loading: {}, thumbLoading: {}, errors: {}, stripBuilt: null,
+                         thumbIo: null, el: null, closed: false,
+                         zoom: 1, tx: 0, ty: 0, drag: null, moved: false };
+  var el = st.el = _fpvEnsure();
+  _fpvResetView(st);   /* 上一个会话可能停在放大态；共用一个元素，这里先归位 */
+  var name = (m._fpFile && m._fpFile.file_name) || '';
+  var nm = el.querySelector('.fpv-name');
+  nm.textContent = name;
+  nm.title = name;
+  el.querySelector('.fpv-strip').innerHTML = '';
+  st.stripBuilt = null;
+  el.classList.remove('fpv-in');
+  el.classList.add('fpv-on');
+  void el.offsetWidth;
+  el.classList.add('fpv-in');
+  _fpvLockBody(true);
+  _fpBindKeys();
+  _fpvShow(st, st.page);
 }
+function fpvGo(delta) {
+  var st = _fpvState;
+  if (!st) return;
+  fpvGoTo(st.page + delta);
+}
+function fpvGoTo(page) {
+  var st = _fpvState;
+  if (!st) return;
+  var p = parseInt(page, 10);
+  if (!isFinite(p) || p < 1) return;
+  if (st.pages && p > st.pages) return;
+  if (p === st.page && st.urls[p]) return;
+  _fpvShow(st, p);
+}
+function closeFpViewer() {
+  var st = _fpvState;
+  if (!st || st.closed) return;
+  st.closed = true;
+  _fpvState = null;
+  window.removeEventListener('mousemove', _fpvMove, true);
+  window.removeEventListener('mouseup', _fpvUp, true);
+  var el = st.el;
+  if (!el) return;
+  el.classList.remove('fpv-in');
+  var drop = function () {
+    /* 关了又立刻重开：旧的淡出定时器 190ms 后才到，别把新会话的图和缩放一起清掉 */
+    if (_fpvState && _fpvState.el === el) return;
+    el.classList.remove('fpv-on');
+    _fpvResetView(st);
+    if (st.thumbIo) { try { st.thumbIo.disconnect(); } catch (e) {} st.thumbIo = null; }
+    el.querySelector('.fpv-strip').innerHTML = '';
+    var img = el.querySelector('.fpv-img');
+    img.classList.remove('fpv-shown');
+    img.removeAttribute('src');
+    img.style.display = 'none';
+    Object.keys(st.urls).forEach(function (k) {
+      try { URL.revokeObjectURL(st.urls[k]); } catch (e) {}
+    });
+    Object.keys(st.thumbs).forEach(function (k) {
+      try { URL.revokeObjectURL(st.thumbs[k]); } catch (e) {}
+    });
+    st.urls = {};
+    st.thumbs = {};
+    _fpvLockBody(false);
+    _fpUnbindKeys();
+    var m = document.getElementById('fPrevMenu');
+    if (m) _fpRenderBar(m, m._fpPage || 1, m._fpPages || 0);
+  };
+  if (_fpMotionOff()) { drop(); return; }
+  setTimeout(drop, 190);
+}
+/* 兼容旧内联调用名（历史按钮 onclick="fpToggleZoom()"）：一律走全屏查看器 */
+function fpToggleZoom() { openFpViewer(); }
 /* 打开预览：rowKey 与价格气泡同一套（云端=order_id，外部=extrow-…），fileIdx 是明细下标 */
 function openFilePreview(ev, rowKey, fileIdx) {
   ev = ev || window.event;
@@ -6521,19 +6902,19 @@ function openFilePreview(ev, rowKey, fileIdx) {
   m._fpOrder = o;
   m._fpCloud = cloud;
   m._fpPage = 1;
-  m._fpPages = cloud ? 0 : 1;
+  m._fpPages = 0;   /* v7.30：本地单也能多页了，页数一律等响应头 X-Preview-Pages 告知 */
   m._fpSeq = ++_fpSeq;
   m.innerHTML = '<div class="fp-title" title="' + esc(f.file_name) + '">📄 ' + esc(f.file_name) + '</div>' +
-    '<div class="fp-stage" onclick="fpToggleZoom()"><img alt="预览" style="display:none" title="点击放大"><div class="fp-hint">' +
+    '<div class="fp-stage" onclick="openFpViewer()"><img alt="预览" style="display:none" title="点击全屏查看"><div class="fp-hint">' +
     (cloud ? '正在生成预览…' : '正在读取本地缩略图…') + '</div></div>' +
     '<div class="fp-bar"><button type="button" class="fp-prev" onclick="fpGo(-1)">‹ 上一页</button>' +
     '<span class="fp-page"></span>' +
     '<button type="button" class="fp-next" onclick="fpGo(1)">下一页 ›</button>' +
-    '<button type="button" class="fp-zoom-btn" title="按原始像素放大查看（画质更好）" onclick="fpToggleZoom()">⤢ 放大</button>' +
+    '<button type="button" class="fp-zoom-btn" title="全屏查看（支持 ←/→ 翻页）" onclick="openFpViewer()">⤢ 全屏</button>' +
     '<button type="button" title="关闭" onclick="closeFilePreview()">✕</button></div>';
   document.body.appendChild(m);
-  /* 本机缩略图只渲染首页 ⇒ 一开始就把页数定成 1，别让「下一页」先亮后可点（点了也只有同一张） */
-  _fpRenderBar(m, 1, cloud ? 0 : 1);
+  _fpRenderBar(m, 1, 0);
+  _fpBindKeys();
   /* 贴住被点的文件名：默认下方 8px；右侧/下方越界就翻到左侧、上方（_fpPlace 负责，放大后重贴） */
   m._fpAnchor = (ev && ev.currentTarget && ev.currentTarget.getBoundingClientRect)
     ? ev.currentTarget.getBoundingClientRect()
@@ -6567,15 +6948,16 @@ function _fpLoad(page) {
                       : '正在读取本地缩略图…');
   var img = m.querySelector('.fp-stage img');
   if (img) img.style.display = 'none';
-  // 2026-11-19：要 1024 档的 WebP（同尺寸比 JPEG 小 60%，而这张图既当 300px 缩略图
-  // 又当「放大」后的大图 —— 一份数据两种用法，省一次请求）。服务端编不出 WebP 会自动回 JPEG，
-  // 两种字节浏览器都认，所以这里不需要回退逻辑。
-  // v7.27：本地单没有 file_id，改查本机渲染的缩略图（订单号 + 文件名；只渲染首页）。
+  // 2026-11-19：小窗原来要 1024 档（一份数据既当 300px 缩略图又当放大后的大图）。
+  // v7.30：放大改走独立的全屏查看器（它自己取 z 档），小窗只画 300px，所以这里降到 p 档 640
+  // —— 2K 屏上依然锐利，字节数少一半。服务端编不出 WebP 会自动回 JPEG，两种字节浏览器都认。
+  // v7.27：本地单没有 file_id，改查本机渲染的缩略图（订单号 + 文件名）。
+  // v7.30：本机缩略图按页存（打印收尾时从实际打印 PDF 逐页渲），所以要带 &page=N。
   var url = cloud
     ? ('/api/local/file_preview/' + encodeURIComponent(f.file_id) +
-       '?page=' + page + '&size=z&fmt=webp')
+       '?page=' + page + '&size=p&fmt=webp')
     : ('/api/local/order_thumb/' + encodeURIComponent((m._fpOrder && m._fpOrder.order_number) || '') +
-       '?name=' + encodeURIComponent(f.file_name || ''));
+       '?name=' + encodeURIComponent(f.file_name || '') + '&page=' + page);
   fetch(url, { headers: { 'X-Launch-Token': LAUNCH_TOKEN } })
     .then(function (res) {
       if (!res.ok) {
@@ -11397,6 +11779,24 @@ function renderAbout() {
     '② 现在用形变过渡：小窗从文件名那一角<b>长成</b>大窗，点「⤡ 还原」再<b>缩回</b>小窗，锚点角钉住不动，' +
     '320ms 缓出曲线；系统开了「减少动态效果」时自动不加动画（直接切）。' +
     '③ 只改这段过渡，取图、翻页、窗内滚动、点窗外收起的行为都与原来一致。</p>' +
+    '<p style="margin-top:10px">v7.30：<b>放大变成全窗口查看器，缩略图也换成本机打印稿</b> —— ' +
+    '① 现场反馈：点「⤢ 放大」只是把那个小弹窗撑大，还压着半张表，看大图很不舒服。' +
+    '现在小窗照旧贴在文件名旁（300px 预览），放大直接<b>原地淡入一个全窗口查看器</b>：' +
+    '左右两侧有翻页按钮、键盘 ←/→ 也能翻，Esc 或右上 ✕ 关闭；底部一排缩略图，点哪页看哪页' +
+    '（页数多时才出现）；切页有轻微淡入，关掉后小窗还在原位。' +
+    '② 缩略图改成<b>由本地打印工具在打印收尾时，用实际打印的那份 PDF 逐页渲出来</b>' +
+    '（1024px WebP，最多 20 页），所以字体、分页、表格线跟打出来的纸面一致；' +
+    '云端单会把这些页回传到服务器，离线单存在本机，两种模式看到的是同一套图。' +
+    '③ 服务端再也不会为了放大去用 LibreOffice 重渲 Office 文档（字体跟 Word 不一样，' +
+    '以前放大看经常「这不是我打出来的样子」）；已经有图时只做缩图/转码。' +
+    '④ 离线单换号（-L → 云端号）时，本机缩略图目录跟着改名，不会换号就看不到图。</p>' +
+    '<p style="margin-top:10px">v7.31：'+'<b>全屏查看器可以缩放和拖动了</b> —— ' +
+    '① 滚轮在全屏图上滚一下就是放大/缩小，最大 6 倍、<b>最小缩回初始大小就停住</b>' +
+    '（不会把图越滚越小、也不会缩成一个小点）；缩放以鼠标指针为中心，想看哪块就往哪块滚。' +
+    '② 放大之后按住鼠标左键拖动画面，看边角和表格右侧不用再左右拽滚动条；缩回初始大小就恢复成普通光标。' +
+    '③ 点图片外那块深色区域直接关闭（拖动过程中的松手不算点击，不会看一半被关掉）；' +
+    '左右翻页按钮和底部缩略图挪到了图片层外面，放大后也不会被图片边缘裁掉。' +
+    '④ 换页、关闭、重开都会回到初始大小，不会带着上页的缩放糊在下一张。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');

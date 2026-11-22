@@ -202,6 +202,10 @@ class PrintJob:
     image_orientation: str = "auto"   # 图片打印方向: 'auto' | 'landscape' | 'portrait'
     task_id: int = 0         # 云端任务子任务 ID (order_files.id)，0=本地任务
     order_id: int = 0        # 云端父订单 ID (orders.id)，0=本地任务
+    # 云端文件 ID（files.id）。打印收尾时要把「本地实际打印的 PDF」渲出来的缩略图
+    # 回传到这个 file_id 上（2026-11-21）：服务端 LibreOffice 重渲 docx 会换字体，
+    # 只有从本地打印用 PDF 出图才跟纸面一致。本地任务恒为 ""。
+    file_id: str = ""
     source_md5: str = ""     # 源文件 MD5，用于 PDF 缓存查找
     source_path: str = ""    # 用户原始文件路径（file_path 为暂存副本时记录原件，见 staging.py）
     display_name: str = ""   # 显示用的文件名（云端任务用原始文件名，本地任务为空则用 file_path 的 basename）
@@ -299,6 +303,7 @@ class PrintJob:
             "display_name": self.display_name,
             "task_id": self.task_id,
             "order_id": self.order_id,
+            "file_id": str(self.file_id or ""),
             "order_number": self.order_number,
             "remark": self.remark,
             "sent": self.sent,
@@ -337,6 +342,7 @@ class PrintJob:
             dpi=_num_or_default(data.get("dpi"), 0, int),
             display_name=data.get("display_name", ""),
             task_id=_num_or_default(data.get("task_id"), 0, int),
+            file_id=str(data.get("file_id", "") or ""),
             sent=bool(data.get("sent", False)),
             finished_at=str(data.get("finished_at", "") or ""),
             remedy_pending=str(data.get("remedy_pending", "") or ""),

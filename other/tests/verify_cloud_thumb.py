@@ -6,13 +6,13 @@
 只会觉得「点了没反应」。这里逐类型真跑一遍，并钉住「失败必须返回 None 而不是抛」。
 
 钉住的契约：
-  ① 图片：长边缩到 640，输出是真 WebP（Pillow 有 WebP 时）或 JPEG
-  ② PDF：只渲第 1 页，长边 640
+  ① 图片：长边缩到 1024（THUMB_EDGE，与后端 z 档同档），输出是真 WebP 或 JPEG
+  ② PDF：可逐页渲（make_pages，页号 1..N），长边 1024
   ③ 纯文本：排出一页可辨认的内容（不是纯白图）
   ④ Office：**没有**已转换的 PDF 就返回 None（绝不为缩略图去起 Word/WPS/LibreOffice）
   ⑤ 坏文件/未知类型不抛异常，只返回 None
   ⑥ 上传接线：下载成功与缓存命中两条路都要回传；HN_CLOUD_THUMB=0 可一键关掉
-  ⑦ 后端契约：print_task 载荷带 file_id，/api/local/file_thumb 只收首页
+  ⑦ 后端契约：print_task 载荷带 file_id，/api/local/file_thumb 收多页（page 1..999）且落盘即命中
 """
 import io
 import os
@@ -60,7 +60,7 @@ try:
         data, fmt = r
         check("图片缩略图格式与真实字节一致", sniff(data) == fmt, f"{fmt} vs {sniff(data)}")
         w, h = decode_size(data)
-        check("图片长边缩到 640", max(w, h) == T.THUMB_EDGE, f"{w}x{h}")
+        check("图片长边缩到 THUMB_EDGE(1024)", max(w, h) == T.THUMB_EDGE, f"{w}x{h}")
         check("图片缩略图体积很小（<100KB）", len(data) < 100 * 1024, f"{len(data)}B")
 
     # ── ② PDF ────────────────────────────────────────────────────────────
@@ -77,8 +77,24 @@ try:
         if r:
             data, fmt = r
             w, h = decode_size(data)
-            check("PDF 缩略图是竖版 A4 比例且长边 640",
+            check("PDF 缩略图是竖版 A4 比例且长边 ≤ 1024",
                   max(w, h) == T.THUMB_EDGE and h > w, f"{w}x{h}")
+        # 多页：make_pages 逐页出图（v7.30 起缩略图从「打印实际用的 PDF」多页生成）
+        pdf3 = os.path.join(tmp, "three.pdf")
+        d = fitz.open()
+        for i in range(3):
+            p = d.new_page(width=595, height=842)
+            p.insert_text((72, 120), f"第 {i + 1} 页", fontsize=28)
+        d.save(pdf3)
+        d.close()
+        pages = T.make_pages(pdf3, "三页.pdf")
+        check("多页 PDF 逐页出图（3 页 → 3 张，页号 1..3）",
+              len(pages) == 3 and [p[0] for p in pages] == [1, 2, 3],
+              str([p[0] for p in pages]))
+        check("多页每张长边都不超过 THUMB_EDGE",
+              all(max(decode_size(p[1])) <= T.THUMB_EDGE for p in pages),
+              str([decode_size(p[1]) for p in pages]))
+        check("max_pages 能截断（只渲前 2 页）", len(T.make_pages(pdf3, "三页.pdf", max_pages=2)) == 2)
     except ImportError:
         check("PDF 缩略图（本机无 PyMuPDF，跳过）", True)
 
@@ -94,7 +110,7 @@ try:
         data, fmt = r
         check("txt 缩略图格式正确", sniff(data) == fmt, f"{fmt} vs {sniff(data)}")
         w, h = decode_size(data)
-        check("txt 缩略图长边 640 且竖版", max(w, h) == T.THUMB_EDGE and h > w, f"{w}x{h}")
+        check("txt 缩略图长边 1024 且竖版", max(w, h) == T.THUMB_EDGE and h > w, f"{w}x{h}")
         # 「排出了字」而不是一张白图：细笔画缩到 453px 后暗像素很少，
         # 所以判据是「确实有墨」+「不是整片黑」，不看固定百分比。
         with Image.open(io.BytesIO(data)) as im:

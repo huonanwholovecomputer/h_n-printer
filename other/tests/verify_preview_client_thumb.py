@@ -128,7 +128,8 @@ check("无 printer token 拒绝", client.post("/api/local/file_thumb", json={}).
 check("缺 file_id → 400",
       client.post("/api/local/file_thumb", json={"data": "AA=="},
                   headers=HDR, content_type="application/json").status_code == 400)
-check("page=2 不收（只认首页）", thumb(JPEG_BYTES, page=2).status_code == 400)
+check("page=2 也收（v7.30：多页缩略图从打印 PDF 逐页回传）",
+      thumb(JPEG_BYTES, page=2).status_code == 200)
 check("坏 base64 → 400", thumb(b"not-base64", fmt="jpeg").status_code == 400)
 check("超 512KB → 400", thumb(b"\xff\xd8\xff" + b"0" * (backend._PREVIEW_UPLOAD_MAX_BYTES + 16),
                              fmt="jpeg").status_code == 400)
@@ -166,8 +167,33 @@ if HAS_WEBP:
           and r.mimetype == ("image/webp" if r.data == WEBP_BYTES else "image/jpeg"),
           f"{r.status_code} {r.mimetype} {len(r.data)}B")
 
-check("第 2 页不拿首页顶替", get_preview(page=2).status_code != 200,
-      str(get_preview(page=2).status_code))
+r = get_preview(page=2, size="p", fmt="jpeg")
+check("第 2 页回传后 GET page=2 拿到的是第 2 页那张（不是首页顶替）",
+      r.status_code == 200 and r.data == JPEG_BYTES
+      and r.headers.get("X-Preview-Page") == "2",
+      f"{r.status_code} {r.headers.get('X-Preview-Page')} {len(r.data)}B")
+r = get_preview(page=3)
+check("没回传的第 3 页不拿首页顶替", r.status_code != 200, str(r.status_code))
+
+# 纯文本永远只有 1 页：就算客户端（理论上）传了第 2 页，也不许把页数撑成 2
+# —— 否则结算页查看器会出一排缩略图，点进去全是 415。
+r = get_preview(size="p", fmt="jpeg")
+check("txt 传了第 2 页也仍报 Pages=1（纯文本没有多页）",
+      r.status_code == 200 and int(r.headers.get("X-Preview-Pages") or 0) == 1,
+      f"{r.status_code} {r.headers.get('X-Preview-Pages')}")
+
+# 转档失败（服务端没 Pillow / 编码器坏了）时必须原样发已有那张图，不能掉进渲染分支：
+# 纯文本没有「服务端渲染」这条路，掉进去就是 415，等于把客户端传上来的缩略图弄丢。
+_orig_scale = backend._preview_scale_file
+backend._preview_scale_file = lambda *a, **k: False
+try:
+    r = get_preview(size="z", fmt="jpeg")
+    check("转档失败时原样发已有缩略图（txt 不因换档位变 415）",
+          r.status_code == 200 and len(r.data or b"") > 0
+          and r.mimetype in ("image/jpeg", "image/webp"),
+          f"{r.status_code} {r.mimetype} {len(r.data or b'')}B")
+finally:
+    backend._preview_scale_file = _orig_scale
 
 r = get_preview_user(size="p", fmt="jpeg")
 check("用户端入口（?token=）同样命中上传的图",
