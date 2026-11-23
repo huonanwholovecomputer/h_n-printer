@@ -85,6 +85,11 @@ def post_worker_init(worker):
         cleanup_abandoned_reserved_orders,
         recover_stale_printing_tasks,
         expire_stale_queued_orders,
+        rotate_due_download_codes,
+        expire_stale_scheduled_orders,
+        purge_test_devices,
+        resync_pending_prices,
+        release_stuck_frozen_orders,
     )
 
     # 先执行数据库初始化/迁移（生产环境 Gunicorn 不会触发 __main__）
@@ -120,6 +125,14 @@ def post_worker_init(worker):
     _ensure_job("cleanup_reserved", cleanup_abandoned_reserved_orders, minutes=5)
     # 防滥用：排队超时淘汰（阈值由 /api/admin/security 调整）
     _ensure_job("expire_stale_queued", expire_stale_queued_orders, minutes=10)
+    # 与 app.py 直跑分支（__main__）保持同一份清单：这 5 个任务此前只在直跑模式注册，
+    # 生产走 gunicorn 时**从未跑过** —— 预约单长期不打不取消、改价失败不补算、冻结单不自愈、
+    # 下载码不轮换、测试设备越积越多，全是那次漏注册的后遗症（2026-11-23 排查）。
+    _ensure_job("rotate_dl_codes", rotate_due_download_codes, minutes=10)
+    _ensure_job("expire_stale_scheduled", expire_stale_scheduled_orders, minutes=10)
+    _ensure_job("purge_test_devices", purge_test_devices, minutes=30)
+    _ensure_job("resync_prices", resync_pending_prices, minutes=10)
+    _ensure_job("release_stuck_frozen", release_stuck_frozen_orders, minutes=5)
 
     try:
         scheduler.start()
