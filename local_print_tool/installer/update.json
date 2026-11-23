@@ -1,9 +1,9 @@
 {
-  "version": "4.6.17",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.6.17.exe",
-  "md5": "856d0fd1677a98ef2a2476eb4d768d8c",
-  "sha256": "b27f7d957ce700204f89c63bffb290a89eb2d815ceafff39566fbcb56a260ffb",
-  "notes": "v4.6.17：四个现场问题一次修完。① 本机外部打印监视以前在装机版里一条都记不到——打包漏收了 win32timezone，枚举打印队列每轮直接报错又被日志吞掉；现已补全依赖、加了兜底并让扫描异常可见。② 收支清算里现在每一单都有首页缩略图（本地单由本机渲染，不再依赖云端文件）。③ 同一批纸被记成两张单（取号超时后晚到的云端号另起一单）已修，晚到的号会接管本地临时号。④ 没有自动双面器的打印机有了「第一趟中/第二趟等待中/第二趟中」三个中间状态，哪一趟被跳过会写进失败原因，半成品补救补打成功后状态自动修回。另外：CAD 里 0 宽细线以前会被打成白纸，现在保真；收支清算取数改成压缩传输 + 索引化，整月数据从 3~4 秒降到 0.3 秒内；结算页预览放大/还原加了过渡动画。",
+  "version": "4.7.0",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.0.exe",
+  "md5": "bbfced11ba8c49ef3c4b6c2e712c81d8",
+  "sha256": "d7cf3d1c62c90b5fed01aafa6ed004e7a4a2870dde1f57b974e53e469fe3aa9d",
+  "notes": "v4.7.0：这次是功能版。① 升级通道变了：默认从 GitHub Release 下载，国内慢的时候可以用「下载码」走云端加速；帮助菜单里能看到当前内部下载码。② 打印前的字体检查改成和文件列表同一判据——本机已经装了的字体不再弹「缺少字体」，同一个字体也不会重复列两遍。③ 手动双面的第 2 趟还在出纸时，任何新任务都会在送纸前停下来确认，不会再插队搅乱上一单的背面；第 1 趟的等待时间按张数放宽，不会纸还在出就宣布打完。④ 云端无障碍多文件订单会等所有文件下载齐再一次性建页开打，不再边下边打。⑤ 缩略图改用实际打印的那份本地 PDF 渲染多页；结算页的文件预览支持缩放、平移和翻页。",
   "sig_algo": "ed25519",
-  "sig": "lY+OR9ekCPbLQ+N7MKXB1t68I6G0o7lBeShaMOAv88UyiKFQusXcmdwnhNXRCoFjMO4u9oa8mLcjWH39z5zBAg=="
+  "sig": "6nH4o4qDS8mNt5dyrtPhoHNi59F7nQcWl6eVOdq409rVTan4MfwlsU7A9uQ2zbZhlPfr4khV5zIBwbCr1oK1Dw=="
 }

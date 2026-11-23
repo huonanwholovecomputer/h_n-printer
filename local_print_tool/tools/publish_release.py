@@ -29,6 +29,12 @@ import shutil
 import subprocess
 import sys
 
+# Windows 控制台常是 GBK：打印 ✅/❌ 或中文路径会 UnicodeEncodeError 打断发布流程
+# （2026-11-23 实测：资产已传完，最后一行 "✅ GitHub Release 完成" 把脚本炸了）。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 REPO_DEFAULT = "huonanwholovecomputer/h_n-printer"
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL_DIR = os.path.dirname(HERE)                     # local_print_tool/
