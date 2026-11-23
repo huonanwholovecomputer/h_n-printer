@@ -1,9 +1,9 @@
 {
-  "version": "4.7.1",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.1.exe",
-  "md5": "106290d191d435929019b41ca4341e3d",
-  "sha256": "9061f7fed9b0d39d86b425fb76a1d2cb94daa27b6124d6ee9d47785129b3865a",
-  "notes": "v4.7.1：① 从 WinRAR / Bandizip / 7-Zip 直接把文件拖进窗口不再报「工作副本不可用」（拖放那一刻就搬进暂存副本）。② 新增「空白页率拆单」：单面与双面文件混打、背面空着的纸太多时（人工翻纸 ≥40%、自动双面 ≥60%，可在「选项 → 空白页率拆单…」改）先问一句，选拆就把只需单面的先打完、取走，再打双面的。③ 打印列表可排队：上一批在打时点「开始打印」不再被拒，而是排进「🖨 打印列表」，前面打完自动接上；支持上移 / 置顶 / 移出队列 / 继续队列，并会落盘，重启后点「继续队列」才开打。正在打的那条不能删不能移。④ 本地单也有预览图了：打印本地单时把前几页缩略图回传云端，小程序「我」页与「我的订单」的文件详情可翻看；老订单没有图时照旧显示说明文字。",
+  "version": "4.7.2",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.2.exe",
+  "md5": "0abf0c2e9575880354748ec4537999b6",
+  "sha256": "cd42c660e43fb987e1c9b7dfc53e38e2d379ee48a4d9d2d9b225bfb27956b7b4",
+  "notes": "v4.7.2：①「空白页率拆单」的提示文案按打印机分两套 —— 支持自动双面的机型不再说「单面文件白走一趟」「会变成两个打印作业」，改成「双面一次成型、不用翻纸；拆开只买两叠不混，纸一张不多、一张不少」；需要人工翻纸的机型文案不变，仍然提示打完要翻一次纸。② 拆单后的取纸提示改成等单面那叠纸真的出完才弹（主机型的打印作业会先消失、纸还在往外吐，原来会催你提前去取），等待期间点「取消」立即中断。③ 拆单确认框里的空白页率不再重复显示两次。",
   "sig_algo": "ed25519",
-  "sig": "dF+Xn4erZ0lf+chTFao86jAPwYI5KfrXmfzvaEISc7tR1SAixYqfbWdOKlIOc6nIzLpbtfdKbCVlcXHtZA0pBw=="
+  "sig": "iWmLyotjkGfq58HlH0gFtNfDl41TYcbJLEs3HFon12akOoSTFB2RrDN0bTIJjOWYGNXYLP4pH7RkXpQTM8UrAg=="
 }

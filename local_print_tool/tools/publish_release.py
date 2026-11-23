@@ -104,7 +104,9 @@ def main(argv=None):
     ver = args.version.strip().lstrip("v")
     if not VERSION_RE.match(ver):
         _die(2, "版本号格式不对：%r（形如 4.7.0）" % args.version)
-    tag = "v" + ver
+    # Release 标签一律裸版本号（4.7.1 / 4.7.0 / 4.6.13 …，与历史一致）：
+    # 曾经这里加过 v 前缀，结果 gh release view v4.7.1 找不到 4.7.1，只能手工补。
+    tag = ver
 
     exe = args.exe.strip() or os.path.join(DIST_DIR, "h_n-printer_setup_v%s.exe" % ver)
     exe = os.path.abspath(exe)
@@ -155,7 +157,7 @@ def main(argv=None):
     if rc != 0:
         rc = _run(["gh", "release", "create", tag,
                    "--repo", args.repo,
-                   "--title", "v" + ver,
+                   "--title", "h_n-printer v" + ver,
                    "--notes", notes], dry_run=args.dry_run)
         if rc != 0:
             _die(3, "创建 Release 失败（检查 gh auth status / 仓库权限）")
