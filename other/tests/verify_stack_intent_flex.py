@@ -171,21 +171,35 @@ dev = {d["client_id"]: d for d in (r.get_json() or {}).get("devices") or []}.get
 check("期望关闭 → stack_desired=False（不是 None，也不丢）",
       dev.get("stack_desired") is False, str(dev.get("stack_desired")))
 
-# ==================== ② 离线反复改：后写覆盖先写 ====================
-section("② 离线连点（开→关→开）只留最后一条")
+# ==================== ② 离线改状态：有变化才记期望，改回现状直接清 ====================
+section("② 离线连点（开→关→开）：改回设备现状不算待应用，最后一条有变化的生效")
 go_offline()
 backend._set_stack_state(CID, False, False)
 clear_all()
-for want in (True, False, True):
-    r = post(want)
-    j = r.get_json() or {}
-    if not (r.status_code == 200 and j.get("success") is True and j.get("pending") is True):
-        check(f"离线 POST enable={want} 返回 success+pending", False, f"{r.status_code} {j}")
-        break
+# 第 1 次：开（设备当前是关）→ 记期望、待应用
+r = post(True)
+j = r.get_json() or {}
+check("离线开启（与设备现状不同）→ success+pending",
+      r.status_code == 200 and j.get("success") is True and j.get("pending") is True,
+      f"{r.status_code} {j}")
+f = intent_file()
+check("期望已落盘（enable=True）", (f.get(CID) or {}).get("enable") is True, str(f))
+# 第 2 次：又关回去（设备本来就是关）→ 没有变化，不留期望、不显示待应用
+r = post(False)
+j = r.get_json() or {}
+check("改了又改回设备现状 → success=true / pending=false / 文案说明无需应用",
+      r.status_code == 200 and j.get("success") is True and j.get("pending") is False
+      and "已是该状态" in (j.get("message") or ""), f"{r.status_code} {j}")
+check("没有变化 → 期望被清掉、不落盘",
+      intent_file() == {} and backend._stack_intent_pending(CID) is False, str(intent_file()))
+# 第 3 次：再开 → 重新记期望（后写仍覆盖先写）
+r = post(True)
+j = r.get_json() or {}
+check("再次开启 → pending 恢复", j.get("pending") is True, f"{r.status_code} {j}")
 f = intent_file()
 check("落盘只有一条（同 client_id 后写覆盖）",
       list(f.keys()) == [CID], str(list(f.keys())))
-check("最终期望 = 最后一次点击（True）", (f.get(CID) or {}).get("enable") is True,
+check("最终期望 = 最后一次有效点击（True）", (f.get(CID) or {}).get("enable") is True,
       str((f.get(CID) or {}).get("enable")))
 check("内存副本与落盘一致（stack_desired=True）",
       backend._stack_desired_of(CID) is True, str(backend._stack_desired_of(CID)))

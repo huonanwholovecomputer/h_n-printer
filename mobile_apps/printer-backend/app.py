@@ -3831,6 +3831,10 @@ def init_db():
             # 里改价异常被 `except: print + rollback()` 吞掉 —— 而 _recalc_prices_for_file 的
             # SQL 又跳过终态，于是这一单永远停在"估价"，重推/补算都不会再来。
             ("needs_repricing", "ALTER TABLE order_files ADD COLUMN needs_repricing INTEGER DEFAULT 0"),
+            # v17（2026-11-23，用户口径）：页数还没回报时提交页按 1 页兜底算价 —— 那只是
+            # 「临时价」，前端不许展示金额、不许复制价格。历史行默认 1（都已终结/已重算过），
+            # 之后每单在插入时写真实值，设备回报页数时再置 1。
+            ("page_count_verified", "ALTER TABLE order_files ADD COLUMN page_count_verified INTEGER DEFAULT 1"),
         ):
             if _col not in _of_cols:
                 conn.execute(_ddl)
@@ -4427,6 +4431,10 @@ def order_status_reason(conn, order_id):
     给一个订单级的 status_reason（子任务级 reject_reason 照旧保留，一个文件一条原因），
     列表页/详情页一行就能显示。多文件订单只取第一条：真要看每个文件的原因，
     前端仍可读 order.files[i].reject_reason。
+
+    2026-11-23（用户口径）：用户自己取消的订单，原因就是「用户取消了该订单」——
+    以前子任务没有 reject_reason，前端只能显示兜底文案「该订单未提供具体原因」。
+    只有在没有任何真实原因（timeout/文件损坏等）时才补这句，真实原因优先保留。
     """
     row = conn.execute(
         "SELECT reject_reason FROM order_files WHERE order_id = ?"
@@ -4434,7 +4442,40 @@ def order_status_reason(conn, order_id):
         " ORDER BY id ASC LIMIT 1",
         (order_id,),
     ).fetchone()
-    return (row["reject_reason"] or "").strip() if row else ""
+    reason = (row["reject_reason"] or "").strip() if row else ""
+    if reason:
+        return reason
+    return CANCELED_BY_USER_REASON if _order_is_canceled(conn, order_id) else ""
+
+
+CANCELED_BY_USER_REASON = "用户取消了该订单"
+
+
+def _order_price_pending(files):
+    """这一单的金额是不是「临时价」（还有文件没回报页数，提交时按 1 页兜底算的）。
+
+    口径（2026-11-23 用户要求）：未知页数不允许展示价格、不允许复制价格 —— 页数没回来之前
+    金额一定是错的（截图那单 5 个 docx 真实 44 页，临时价只算 5 页 ¥1.50）。
+    · order_files.page_count_verified=0 → 待定；历史行/本地单没这列值 → 视为已可信；
+    · page_count<=0 或缺失 → 也待定（页面统计都出不来，价不可能是准的）。"""
+    for f in files or []:
+        if int(f.get("is_free") or 0):
+            continue
+        if f.get("page_count") is None or int(f.get("page_count") or 0) <= 0:
+            return True
+        verified = f.get("page_count_verified")
+        if verified is not None and not int(verified or 0):
+            return True
+    return False
+
+
+def _order_is_canceled(conn, order_id):
+    """订单当前状态是否 canceled（取不到就按否，绝不因查库失败编造原因）。"""
+    try:
+        row = conn.execute("SELECT status FROM orders WHERE id = ?", (order_id,)).fetchone()
+    except Exception:
+        return False
+    return bool(row) and (row["status"] or "") == "canceled"
 
 
 def calc_wait_seconds(created_at, print_started_at):
@@ -6532,7 +6573,8 @@ def _recalc_prices_for_file(file_id, page_count):
                                        simplex_pages=_row_simplex_pages(r))
             new_total = round(per_copy * (r["copies"] or 1), 2)
             conn.execute(
-                "UPDATE order_files SET page_count = ?, total_price = ? WHERE id = ?",
+                "UPDATE order_files SET page_count = ?, total_price = ?, page_count_verified = 1"
+                " WHERE id = ?",
                 (page_count, new_total, r["id"]),
             )
             order_ids.add(r["order_id"])
@@ -6597,6 +6639,8 @@ def _sync_subtask_config(task_id, copies, duplex, page_range, page_count):
                 pc = int(page_count)
                 if pc > 0:
                     set_parts.append("page_count = ?"); params.append(pc)
+                    # 设备回报了真实页数 = 页数已可信，前端可以展示/复制这一单的价格了
+                    set_parts.append("page_count_verified = 1")
             except (ValueError, TypeError):
                 pass
         if not set_parts:
@@ -10114,12 +10158,13 @@ def submit_order():
             conn.execute(
                 """INSERT INTO order_files (order_id, file_id, file_name, copies, page_count,
                                             page_range, price_per_page, total_price, is_free, status, created_at, duplex, reject_reason, image_orientation,
-                                            simplex_pages, blank_tail_exclude)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                            simplex_pages, blank_tail_exclude, page_count_verified)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (order_id, item["file_id"], item["file_name"], item["copies"], item["page_count"],
                  item["page_range"], 0, item["total_price"], 0, item["status"], created_at,
                  item["duplex"], item["reject_reason"], item["image_orientation"],
-                 item.get("simplex_pages", ""), item.get("blank_tail_exclude", 0)),
+                 item.get("simplex_pages", ""), item.get("blank_tail_exclude", 0),
+                 1 if item.get("page_count_verified") else 0),
             )
             sub_task_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             sub_tasks.append({
@@ -10612,6 +10657,16 @@ def printer_stack_mode():
             print(f"[stack_intent] {client_id} 离线期望被拒：该机型不需要攒批")
             return jsonify({"success": False,
                             "message": _stack_toggle_problem(client_id, enable),
+                            "stack_mode": st["mode"], "stack_busy": st["busy"]})
+        # 2026-11-23（用户第6条）：先开又关、目标恰好等于设备**当前**状态时，这里不留「待应用」。
+        # 没有变化就不该显示 ⏳，更不该让打印工具上线后先开一次再关一次 —— 直接清掉旧期望。
+        # 老设备未上报过攒批状态（mode=None）时判不出来，仍按"记下期望"的老路走。
+        if st.get("mode") is not None and bool(st["mode"]) == bool(enable):
+            _clear_stack_intent(client_id, "离线期望与设备当前状态一致，无需应用")
+            print(f"[stack_intent] {client_id} 期望与当前状态一致"
+                  f"（{'开启' if enable else '关闭'}）→ 不留待应用")
+            return jsonify({"success": True, "pending": False,
+                            "message": "设备当前已是该状态，无需应用",
                             "stack_mode": st["mode"], "stack_busy": st["busy"]})
         by = operator_display_name(getattr(g, "openid", "")) or role
         saved = _set_stack_intent(client_id, enable, by=by, by_role=role)
@@ -11288,7 +11343,7 @@ def get_orders():
         of_rows = conn.execute(
             """SELECT id, file_id, file_name, copies, page_count, page_range,
                       page_range_original, page_range_truncated,
-                      simplex_pages, blank_tail_exclude,
+                      simplex_pages, blank_tail_exclude, page_count_verified,
                       reject_reason,
                       total_price, is_free, status, created_at, duplex
                FROM order_files WHERE order_id = ? ORDER BY id ASC""",
@@ -11352,11 +11407,17 @@ def get_orders():
         order["total_pages"] = total_pages
         order["total_sheets"] = total_sheets
         order["file_summary"] = file_summary
+        # 2026-11-23（用户口径）：还有文件的页数没经设备回报 → total_price 是按 1 页兜底的
+        # 临时价，前端不许显示、不许复制，等 page_count 回报后自动变正常。
+        order["price_pending"] = _order_price_pending(files)
         # 订单级失败/超时原因（与 /api/order/<id> 详情同口径：第一条非空 reject_reason）。
         # 列表页据此显示一行原因，避免用户只看到"失败"却不知道为什么。
         order["status_reason"] = next(
             (str(f.get("reject_reason") or "").strip()
              for f in files if str(f.get("reject_reason") or "").strip()), "")
+        # 2026-11-23：用户取消的单没有 reject_reason，不能显示「未提供具体原因」。
+        if not order["status_reason"] and (order.get("status") or "") == "canceled":
+            order["status_reason"] = CANCELED_BY_USER_REASON
         # 向前端保持一致：旧字段仍保留（兼容性），但语义标注为聚合值
         order["file"] = file_summary
         order["copies"] = total_copies
@@ -11432,7 +11493,8 @@ def get_order_detail(order_id):
         """SELECT of.id, of.file_id, of.file_name, of.copies, of.page_count,
                   of.page_range, of.page_range_original, of.page_range_truncated,
                   of.total_price, of.is_free, of.status, of.duplex, of.image_orientation,
-                  of.simplex_pages, of.blank_tail_exclude, of.reject_reason
+                  of.simplex_pages, of.blank_tail_exclude, of.reject_reason,
+                  of.page_count_verified
            FROM order_files of WHERE of.order_id = ? ORDER BY of.id ASC""",
         (order_id,),
     ).fetchall()
@@ -11482,6 +11544,8 @@ def get_order_detail(order_id):
         order["total_copies"] = total_copies
         order["total_pages"] = total_pages
         order["total_sheets"] = total_sheets
+        # 2026-11-23（用户口径）：页数未回报时的金额只是临时价，不许展示/复制。
+        order["price_pending"] = _order_price_pending(files)
         # 用聚合状态
         order["status"] = aggregate_order_status(conn, order_id) or order["status"]
         # 订单级失败原因（子任务级 reject_reason 仍逐个保留在 files 里）

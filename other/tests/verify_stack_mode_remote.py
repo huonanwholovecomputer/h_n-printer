@@ -276,8 +276,10 @@ check("★ 离线期望已落盘 stack_intent.json（applied=False，重启不�
       and (intent_file.get(CID) or {}).get("applied") is False, intent_file)
 j2 = (post({"client_id": CID, "enable": False}).get_json() or {})
 intent2 = backend._stack_intent_of(CID) or {}
-check("★ 离线再点关闭 → 覆盖同一条期望（enable=False，不是再记一条）",
-      j2.get("pending") is True and intent2.get("enable") is False, intent2)
+check("★ 离线再点关闭且设备本来就是关闭 → 不留期望 / pending=false（没有变化就不显示待应用）",
+      j2.get("success") is True and j2.get("pending") is False
+      and "已是该状态" in (j2.get("message") or "")
+      and (intent2 or {}).get("enable") is None, f"{j2} {intent2}")
 # 复位期望，免得干扰后面的在线用例（在线成功切换本来也会清，这里显式清更好读）
 with backend._stack_intent_lock:
     backend._stack_intent.pop(CID, None)
