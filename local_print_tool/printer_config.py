@@ -1620,6 +1620,31 @@ class PrinterConfig:
     # 默认 fit（调整为可打印区域大小）= 旧行为（只缩不放）⇒ 老配置缺键零回归。
     scale_mode: str = SCALE_FIT
     scale_percent: int = SCALE_PERCENT_DEFAULT
+    # ---- 空白页率拆单（2026-11-23 用户需求；口径与阈值见 blank_split.py）----
+    # 一单里「整份单面」和「双面」的文件混在一起时，单面文件各占一张纸、背面全空；
+    # 空白页率达到阈值就把这一单拆成「先打单面组 → 操作员取走 → 再打双面组」两次。
+    # blank_split_ask = True ⇒ 拆之前先问一句（默认按钮是「拆成两次」）；
+    #                   False ⇒ 达到阈值直接拆（用户勾了「以后不再问」）。
+    # 两个阈值：无自动双面器（人工翻纸）40%、自动双面机型 60%（用户 2026-11-23 选定）。
+    # 老配置没有这三个键 ⇒ 40% / 60% / 先询问 = 与改动前逐字一致的行为（不拆也得问一次，
+    # 但只有真的达到阈值才会弹，见 PrintWorker._blank_split_decision）。
+    blank_split_ask: bool = True
+    blank_split_threshold_manual: float = 0.40
+    blank_split_threshold_auto: float = 0.60
+
+    def blank_split_threshold(self, auto_duplex: bool) -> float:
+        """按机型取空白页率阈值（已夹到 (0, 1]；坏值回落默认）。"""
+        raw = (self.blank_split_threshold_auto if auto_duplex
+               else self.blank_split_threshold_manual)
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            v = 0.60 if auto_duplex else 0.40
+        if v > 1.0:            # 老配置里可能存成 40 这种百分数写法
+            v = v / 100.0
+        if not (0.0 < v <= 1.0):
+            v = 0.60 if auto_duplex else 0.40
+        return v
 
     def print_scale(self) -> tuple[str, int]:
         """打印缩放（模式, 百分比），已收敛到合法值；透传给 pdf_printer 的那两个参数。"""
@@ -1706,6 +1731,10 @@ class PrinterConfig:
             # 打印缩放（老配置没有 ⇒ fit/100 = 旧行为「只缩不放」，零回归）
             "scale_mode": self.print_scale()[0],
             "scale_percent": self.print_scale()[1],
+            # 空白页率拆单（老配置没有这三个键 ⇒ 40% / 60% / 先询问）
+            "blank_split_ask": bool(self.blank_split_ask),
+            "blank_split_threshold_manual": self.blank_split_threshold(False),
+            "blank_split_threshold_auto": self.blank_split_threshold(True),
         }
 
     @classmethod
@@ -1788,6 +1817,13 @@ class PrinterConfig:
             # 打印缩放（老配置没有这两个键 ⇒ fit/100 = 旧行为；坏值由 normalize_scale 收敛）
             scale_mode=_scale_pair(data)[0],
             scale_percent=_scale_pair(data)[1],
+            # 空白页率拆单（老配置没有这三个键 ⇒ 40% / 60% / 先询问；坏值由
+            # blank_split_threshold() 夹回去，这里只保证类型对）
+            blank_split_ask=_bool_or_default(data.get("blank_split_ask"), True),
+            blank_split_threshold_manual=_num_or_default(
+                data.get("blank_split_threshold_manual"), 0.40, float),
+            blank_split_threshold_auto=_num_or_default(
+                data.get("blank_split_threshold_auto"), 0.60, float),
         )
 
     def save(self, path: str) -> None:
