@@ -65,7 +65,9 @@ function _orderTotalsText(o) {
    轮询那条分支必须也过这一遍：它在结构变化时整片替换 orders，派生字段（statPages 等）不重算
    就会全丢，卡片上三个数字变成空白。 */
 function _normalizeOrderRow(order) {
-  order.totalPriceDisplay = (order.total_price || 0).toFixed(2)
+  // 2026-11-23（用户口径）：页数没回齐的单，后端金额只是按 1 页兜底的临时价 → 不显示、不许复制
+  order.pricePending = !!order.price_pending
+  order.totalPriceDisplay = order.pricePending ? '' : (order.total_price || 0).toFixed(2)
   if (order.files) {
     order.files.forEach(f => {
       f.sizeDisplay = f.size ? (f.size / 1024).toFixed(1) + ' KB' : ''
@@ -547,6 +549,12 @@ Component({
     // 也不会被订单卡片的 overflow:hidden / max-height 裁剪。
     onPriceTap(e) {
       const id = e.currentTarget.dataset.id
+      const o = this._orderById(id)
+      // 页数未回齐：金额是临时价，禁止弹复制气泡
+      if (o && o.pricePending) {
+        wx.showToast({ title: '页数计算中，价格待定', icon: 'none' })
+        return
+      }
       if (this.data.showPricePop && String(this.data.pricePopOrderId) === String(id)) {
         this.setData({ showPricePop: false })
         return
@@ -601,6 +609,10 @@ Component({
       const o = this._orderById(e.currentTarget.dataset.id)
       this.setData({ showPricePop: false })
       if (!o) return
+      if (o.pricePending) {
+        wx.showToast({ title: '页数计算中，价格待定', icon: 'none' })
+        return
+      }
       this._copyPriceText(priceCopy.priceLine(o), '已复制价格')
     },
 
@@ -609,6 +621,10 @@ Component({
       const o = this._orderById(e.currentTarget.dataset.id)
       this.setData({ showPricePop: false })
       if (!o) return
+      if (o.pricePending) {
+        wx.showToast({ title: '页数计算中，价格待定', icon: 'none' })
+        return
+      }
       _getPriceRules((rules) => {
         this._copyPriceText(
           priceCopy.priceDetailLines(o, rules).join(String.fromCharCode(10)),

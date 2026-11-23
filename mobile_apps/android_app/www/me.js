@@ -979,7 +979,9 @@ function orderTotalsText(o) {
 }
 
 function normalizeOrder(o) {
-  o.totalPriceDisplay = Number(o.total_price || 0).toFixed(2);
+  // 2026-11-23（用户口径）：页数没回齐的单，后端金额只是按 1 页兜底的临时价 → 不显示、不许复制
+  o.pricePending = !!o.price_pending;
+  o.totalPriceDisplay = o.pricePending ? '' : Number(o.total_price || 0).toFixed(2);
   if (o.files) {
     o.files.forEach(f => {
       f.sizeDisplay = f.size ? (f.size / 1024).toFixed(1) + ' KB' : '';
@@ -1149,7 +1151,9 @@ function orderCardHTML(o, expanded, deliveredLabel, allowCancel) {
       ${extRows}
       ${remarkRows}
       <view class="detail-section">
-        <view class="detail-row detail-price-row"><text class="detail-label">合计价格</text><view class="detail-price-tap" data-price-copy="${o.id}"><text class="detail-price-value status-${o.status || 'queued'}${(o.is_admin_print && o.status === 'sent') ? ' is-self-sent' : ''}">¥${o.totalPriceDisplay || '0.00'}</text><text class="price-copy-icon">📋</text></view></view>
+        <view class="detail-row detail-price-row"><text class="detail-label">合计价格</text>${o.pricePending
+          ? '<text class="detail-price-pending">待定</text>'
+          : `<view class="detail-price-tap" data-price-copy="${o.id}"><text class="detail-price-value status-${o.status || 'queued'}${(o.is_admin_print && o.status === 'sent') ? ' is-self-sent' : ''}">¥${o.totalPriceDisplay || '0.00'}</text><text class="price-copy-icon">📋</text></view>`}</view>
       </view>
       <view class="detail-actions">
         ${canCancel ? `<button class="btn-cancel-sm" data-cancel-order="${o.id}">取消任务</button>` : ''}
@@ -1553,7 +1557,10 @@ function orderStatusReasonText(o) {
   // 缺时间与小程序「我的订单」/「最近订单」/ settlement.html 同口径：写「未知时间」
   if (by) return by + '在' + (_fmtStatusTime(o.manual_status_at) || '未知时间') + '被标记为' + label;
   const reason = String(o.status_reason || '').trim();
-  return reason || REASON_FALLBACK_TEXT;
+  if (reason) return reason;
+  // 2026-11-23：用户取消的单后端没写 reject_reason，别显示「未提供具体原因」。
+  if (String(o.status || '') === 'canceled') return '用户取消了该订单';
+  return REASON_FALLBACK_TEXT;
 }
 
 let _statusPopEl = null;
@@ -1722,6 +1729,8 @@ function openPricePop(anchor, orderId) {
   closePricePop();
   const o = _priceOrderById(orderId);
   if (!o || !anchor) return;
+  // 页数未回齐：金额是临时价，禁止弹复制气泡
+  if (o.pricePending) { showToast('页数计算中，价格待定'); return; }
   const mask = document.createElement('div');
   mask.className = 'price-pop-mask is-pass-through';
   mask.innerHTML =
@@ -3412,7 +3421,7 @@ function renderMyFiles(onlyFile) {
     // 页数：列表给的 preview_pages 先乐观用，0/缺失就按 1 页渲染，随后一律向 /info 核对一次
     let pages = (st && st.pages) ? Number(st.pages) : (Number(f.preview_pages) || 0);
     if (!(pages > 0)) pages = 1;
-    if (pages > 12) pages = 12;      // 与 PREVIEW_MAX_PAGES 同值（此处引不到顶层常量，见上）
+    if (pages > 200) pages = 200;    // 与 PREVIEW_MAX_PAGES 同值（此处引不到顶层常量，见上）
     let cur = (st && st.page) ? Number(st.page) : 1;
     if (!(cur >= 1)) cur = 1;
     if (cur > pages) cur = pages;
@@ -3534,7 +3543,9 @@ function deleteMyFile(fileId, name) {
    （Office 转 PDF 后页数可能变多），所以每次展开都按对象缓存向 /info 核对一次，同一文件本页只问一次。
    --------------------------------------------------------------------------------- */
 
-const PREVIEW_MAX_PAGES = 12;   // 一次最多渲染 12 页；再多只提示总页数（12 张图同时解码会吃爆 WebView）
+const PREVIEW_MAX_PAGES = 200;  // 可翻到的页数上限（防超长文档撑爆 DOM）；滑动按当前页 ±1 懒加载，
+                                // 所以「12 张图同时解码吃爆 WebView」不再是限制理由。
+                                // 后端 app.py 的 PREVIEW_MAX_PAGES=12 仅指上传时预热页数，别拿它当可看页数。
 // 2026-11-19 分层尺寸 + 格式协商：列表/详情用 p 档（640），全屏才要 z 档（1024）；
 // WebP 同尺寸比 JPEG 小 34~39%（APP 的 WebView 是 Chromium，WebP 自 Chrome 32 起支持）。
 // 真机上万一解码不了，myFilePreviewError 会整块退回 JPEG 重渲染一次。
@@ -3586,7 +3597,7 @@ function previewHostsOf(fileId) {
   return out;
 }
 
-/* 页数：/info 核对过的优先，否则列表 preview_pages 的乐观值，兜底 1 页，上限 12 页 */
+/* 页数：/info 核对过的优先，否则列表 preview_pages 的乐观值，兜底 1 页，上限 PREVIEW_MAX_PAGES */
 function previewPagesOf(f, st) {
   let pages = (st && Number(st.pages) > 0) ? Number(st.pages) : (Number(f && f.preview_pages) || 0);
   if (!(pages > 0)) pages = 1;

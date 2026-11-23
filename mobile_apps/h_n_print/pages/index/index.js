@@ -268,6 +268,9 @@ Component({
     scrollConfig: {
       minY: 0, maxY: 0, scrollerH: 0, contentH: 0,
       nestedSel: '.file-list-scroll', nestedTrackSel: '.file-list-track',
+      // 内层轨道复位版本号（见 _resetFileListTrack）：列表清空后残留的 translateY 会把
+      // 下一批卡片顶出可视区（现场：「打印文件」角标有 1、框很高但看不见卡片）。
+      nestedReset: 0,
     },
     // 滑块拖动状态：segDrag = 分段滑块指示条位移百分比（>=0 拖动中），swDrag = 开关拇指位移 px（>=0 拖动中）
     segDrag: {},
@@ -940,8 +943,18 @@ Component({
           // 内层文件列表选择器（WXS 直驱；每次推送都带上，保证视图层始终知道内层框在哪）
           nestedSel: '.file-list-scroll',
           nestedTrackSel: '.file-list-track',
+          // 恒带上复位版本号：只有版本变了 WXS 才把轨道 transform 归零（其余推送不动内层位置）
+          nestedReset: this._fileListResetRev || 0,
         },
       })
+    },
+
+    // 内层文件列表轨道复位（translateY → 0）。列表清空/换单后必须复位的理由见 scrollConfig 注释：
+    // 轨道偏移由视图层直写内联样式持有，逻辑层清空 selectedFiles 时它不会自己归零，
+    // 下一批卡片就按旧偏移画在框外 → 看上去是「一大块空白」。
+    _resetFileListTrack() {
+      this._fileListResetRev = (this._fileListResetRev || 0) + 1
+      this._pushScrollConfig()
     },
 
     // WXS 分桶回调（每 100px 一次），供回顶按钮等阈值类 UI 使用；本页暂不消费
@@ -3949,6 +3962,9 @@ Component({
           this._fileListPx = 0
           this._animateFileListHeight(0, 300)
           this._scheduleMeasure(400)   // 列表整块消失 → 重算滚动范围（否则底部留一大块空白）
+          // 列表收起时把内层轨道偏移也归零：否则上一单滚过的 translateY 会留在视图层，
+          // 下一单的第一张卡片直接画到框外（现场「有角标、框很高、里面空白」）。
+          this._resetFileListTrack()
           // 隐藏 tab 栏发丝线，让成功弹窗与 tab 栏融为一体
           try {
             const tabBar = this.getTabBar && this.getTabBar()
@@ -4333,6 +4349,8 @@ Component({
           remarkBoxHeight: 120,
         })
         this._contentEst = 0
+        // 清空列表的同时复位内层轨道（理由同 _resetFileListTrack 注释）
+        this._resetFileListTrack()
         // 恢复 tab 栏发丝线
         try {
           const tabBar = this.getTabBar && this.getTabBar()

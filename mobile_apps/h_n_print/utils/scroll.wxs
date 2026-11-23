@@ -60,6 +60,7 @@ function ensureState(state) {
     // 内层滚动框（订单详情的文件列表 / 打印页的文件列表）：由本文件直驱 translateY
     state.nbSel = '';          // 逻辑层下发：内层滚动框选择器（'' = 本页没有内层列表）
     state.nbTrackSel = '';     // 逻辑层下发：内层内容 track 选择器
+    state.nestedReset = 0;     // 逻辑层下发：轨道复位版本号（变了才把 translateY 归零）
     state.nb = null;           // 本次手势命中的内层框 { idx, box, track, y, maxY, v, active, lastT }
     state.nbRun = false;       // 内层惯性循环在跑
     state.touching = false;
@@ -551,6 +552,21 @@ function nbApply(state, owner) {
   nb.track.setStyle({ transform: 'translateY(' + (-nb.y) + 'px)' });
 }
 
+// 内层轨道复位：把当前页所有内层 track 的 transform 归零，并丢掉进行中的内层状态。
+// 纯 setStyle、不依赖布局测量 —— 调用点在 onConfig（change:prop 观察器），那里 rect 可能是旧帧；
+// 我们只处理「逻辑层明确说列表已清空/换单」这一确定性场景（提交成功、关成功弹窗）。
+function resetNestedTracks(state, owner) {
+  state.nb = null;
+  state.nbRun = false;
+  if (!state.nbTrackSel || !owner || typeof owner.selectAllComponents !== 'function') return;
+  var tracks = owner.selectAllComponents(state.nbTrackSel);
+  if (!tracks || !tracks.length) return;
+  for (var i = 0; i < tracks.length; i++) {
+    var t = tracks[i];
+    if (t && typeof t.setStyle === 'function') t.setStyle({ transform: 'translateY(0px)' });
+  }
+}
+
 // 内层吃掉 need（>0 内容下移，<0 内容上移），返回实际吃掉的量
 function nbEat(nb, need) {
   var room = need > 0 ? nb.maxY - nb.y : nb.y;
@@ -630,6 +646,13 @@ module.exports = {
     // 内层已经到底，视图层还拿到旧的「可滚」，于是这一帧谁都不动（用户说的「滑到底页面不跟着走」）。
     if (newValue.nestedSel !== undefined) state.nbSel = newValue.nestedSel || '';
     if (newValue.nestedTrackSel !== undefined) state.nbTrackSel = newValue.nestedTrackSel || '';
+    // 内层轨道复位：逻辑层清空文件列表（提交/关弹窗）时推一个变化的版本号，
+    // 把视图层残留的 translateY 归零 —— 否则下一批卡片按旧偏移画在框外，表现为一大块空白。
+    // 这里只做确定性写样式，**不**量 rect（change:prop 观察器里布局值可能是旧帧）。
+    if (newValue.nestedReset !== undefined && newValue.nestedReset !== state.nestedReset) {
+      state.nestedReset = newValue.nestedReset;
+      resetNestedTracks(state, ownerInstance);
+    }
     state.closePicker = !!newValue.closePicker;
     // 底部留白（px）：逻辑层显式下发（_bottomPad + _tabOverlayPx）；老页面配置里没有这个
     // 字段时，从这一次的 maxY 反推一次（maxY = contentH - scrollerH + pad）并记住 ——

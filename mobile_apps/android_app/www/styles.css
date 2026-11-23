@@ -5320,6 +5320,12 @@ picker-view-column {
   font-weight: 700;
   font-family: var(--font-mono);
 }
+/* 页数未回齐：金额是临时价，不显示金额，只写「待定」 */
+.detail-price-pending {
+  font-size: 3.12cqw;
+  font-weight: 600;
+  color: var(--text-tertiary, #8e8e93);
+}
 /* 合计价格跟随订单状态色（复用 status-* 主题色），去掉状态类的底色 */
 .detail-price-value.status-queued,
 .detail-price-value.status-printing,

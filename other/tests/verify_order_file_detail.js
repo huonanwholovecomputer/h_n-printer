@@ -77,7 +77,9 @@ check('source 文件名缺失也不炸（兜底 未知文件）',
 
 console.log('\n--- 3) 多页切片口径 ---');
 const s3 = CARD.shots('https://api.test', 't', '9', 30, 0, []);
-check('12 页上限（不能把 30 页 PDF 一次拉满）', s3.shots.length === 12);
+check('30 页文档不再被截成 12 页（旧上限已取消，按真实页数切）', s3.shots.length === 30);
+const sCap = CARD.shots('https://api.test', 't', '9', 300, 0, []);
+check('安全上限 200 页（超长文档不能一次建几千个节点）', sCap.shots.length === 200);
 check('只让当前页 ±1 页真的发请求', s3.shots.filter(s => s.ready).length === 2 &&
   s3.shots[0].ready && s3.shots[1].ready && !s3.shots[2].ready);
 const sKeep = CARD.shots('https://api.test', 't', '9', 3, 2, s3.shots.map(s => ({ ...s, loaded: s.page === 1 })));
@@ -100,8 +102,8 @@ check('模板：本地单走 local_only 分支（有提示 + 参数行），其�
 console.log('\n--- 5) 管理入口 pages/user-orders 复用同一份模板 ---');
 check('user-orders 引入 me.wxml 的模板（<import> 只取 template，不带页面结构）',
   /<import src="\.\.\/me\/me\.wxml" \/>/.test(UO_WXML));
-check('文件行可点开详情（bindtap + data-id/oid/findex）',
-  /class="detail-file-row"[\s\S]{0,240}?bindtap="onOpenOrderFileDetail"/.test(UO_WXML) &&
+check('文件行可点开详情（catchtap 防冒泡收卡 + data-id/oid/findex）',
+  /class="detail-file-row"[\s\S]{0,240}?catchtap="onOpenOrderFileDetail"/.test(UO_WXML) &&
   /data-id="\{\{f\.file_id\}\}"/.test(UO_WXML) && /data-oid="\{\{item\.id\}\}"/.test(UO_WXML) &&
   /data-findex="\{\{index\}\}"/.test(UO_WXML));
 check('弹窗在 page-root 之外（.scroll-content 是变换层，fixed 会被裁）',

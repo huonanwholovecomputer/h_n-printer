@@ -23,9 +23,10 @@ const avatarCrop = require('../../utils/avatar_crop')
 function pvCore() {
   return require('../../utils/preview_viewer')
 }
-// 「我的文件」预览图最多展示前多少页（与后端 app.py 的 PREVIEW_MAX_PAGES 对齐：
-// 后端预热也只生成这么多页，再往后的页没有缓存，点开会现生成、明显慢）
-const PREVIEW_MAX_PAGES = 12
+// 预览图最多可翻到第几页（安全上限）。**不要**和后端预热页数（app.py 的
+// PREVIEW_MAX_PAGES=12）对齐：那只决定上传时预生成几页，更靠后的页可按需生成。
+// 页面只给当前页 ±1 发请求，节点数才是这里的唯一成本。
+const PREVIEW_MAX_PAGES = 200
 
 function _initIsDark() {
   try {
@@ -81,7 +82,10 @@ function _orderTotalsText(o) {
    轮询那条分支必须也过这一遍：它在结构变化时整片替换 orders，派生字段（statPages 等）不重算
    就会全丢，卡片上三个数字变成空白。 */
 function _normalizeOrderRow(order) {
-  order.totalPriceDisplay = (order.total_price || 0).toFixed(2)
+  // 2026-11-23（用户口径）：页数没回齐的单，后端 total_price 只是「按 1 页兜底」的临时价，
+  // 一律不展示金额、不允许复制 —— 只显示「待定」。回齐后后端 price_pending 变 false。
+  order.pricePending = !!order.price_pending
+  order.totalPriceDisplay = order.pricePending ? '' : (order.total_price || 0).toFixed(2)
   if (order.files) {
     order.files.forEach(f => {
       f.sizeDisplay = f.size ? (f.size / 1024).toFixed(1) + ' KB' : ''
@@ -3696,7 +3700,10 @@ Component({
         return by + '在' + at + '被标记为' + label
       }
       const reason = String(o.status_reason || '').trim()
-      return reason || REASON_FALLBACK_TEXT
+      // 2026-11-23：用户取消的单后端没写 reject_reason，别显示「未提供具体原因」。
+      if (reason) return reason
+      if (String(o.status || '') === 'canceled') return '用户取消了该订单'
+      return REASON_FALLBACK_TEXT
     },
 
     // 点击异常状态文字 → 在状态处弹原因气泡（再点一次收起）。
@@ -3782,6 +3789,12 @@ Component({
     // 也不会被订单卡片的 overflow:hidden / max-height 裁剪。
     onPriceTap(e) {
       const id = e.currentTarget.dataset.id
+      const o = this._findOrderById(id)
+      // 页数未回齐：金额是临时价，禁止弹复制气泡
+      if (o && o.pricePending) {
+        wx.showToast({ title: '页数计算中，价格待定', icon: 'none' })
+        return
+      }
       if (this.data.showPricePop && String(this.data.pricePopOrderId) === String(id)) {
         this.setData({ showPricePop: false })
         return
@@ -3838,6 +3851,10 @@ Component({
       const o = this._findOrderById(e.currentTarget.dataset.id)
       this.setData({ showPricePop: false })
       if (!o) return
+      if (o.pricePending) {
+        wx.showToast({ title: '页数计算中，价格待定', icon: 'none' })
+        return
+      }
       this._copyText(this._priceLine(o), '已复制价格')
     },
 
@@ -3846,6 +3863,10 @@ Component({
       const o = this._findOrderById(e.currentTarget.dataset.id)
       this.setData({ showPricePop: false })
       if (!o) return
+      if (o.pricePending) {
+        wx.showToast({ title: '页数计算中，价格待定', icon: 'none' })
+        return
+      }
       this._withPriceRules((rules) => {
         this._copyText(this._priceDetailLines(o, rules).join(String.fromCharCode(10)), '已复制详细价格')
       })

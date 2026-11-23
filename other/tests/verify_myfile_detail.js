@@ -194,7 +194,7 @@ const pvRequire = (dep) => {
 };
 const mpApi = new Function('wx', 'CONFIG', 'PREVIEW_MAX_PAGES', 'request', 'require',
   mpBody + '\nreturn { ' + mpFnNames.map((n) => n + ': ' + n).join(', ') + ' };')(
-  wxStub, CONFIG_STUB, 12, requestStub, pvRequire);
+  wxStub, CONFIG_STUB, 200, requestStub, pvRequire);
 
 /* Page 实例：_decorateMyFile 里用 this._fmtFileSize / this._myFileTypeIcon，
    所以这两个必须先挂上去（真实页面里它们是同一个 Page 对象上的方法） */
@@ -336,8 +336,8 @@ check('WXSS：骨架横扫动画 + 真图淡入 + 多页 420rpx 高度',
   /background-size:\s*400%/.test(MP_WXSS) &&
   /\.myfile-preview-loaded\s*\{[^}]*opacity:\s*1/.test(MP_WXSS) &&
   /\.myfile-preview-swiper\s*\{[^}]*height:\s*420rpx/.test(MP_WXSS));
-check('订单卡「文件列表」行可点开详情（bindtap + data-id=f.file_id + 单号/下标）',
-  /class="detail-file-row"[\s\S]{0,240}?bindtap="onOpenOrderFileDetail"[\s\S]{0,240}?data-id="\{\{f\.file_id\}\}"/.test(MP_WXML));
+check('订单卡「文件列表」行可点开详情（catchtap 防冒泡收卡 + data-id=f.file_id + 单号/下标）',
+  /class="detail-file-row"[\s\S]{0,240}?catchtap="onOpenOrderFileDetail"[\s\S]{0,240}?data-id="\{\{f\.file_id\}\}"/.test(MP_WXML));
 check('文件详情弹窗独立存在（filedetail-sheet + /api/file_detail/）',
   /class="modal-sheet filedetail-sheet"/.test(MP_WXML) && /\/api\/file_detail\//.test(MP_JS));
 check('弹窗关闭走 200ms 动画后再卸载（fileDetailClosing）',
@@ -360,8 +360,11 @@ const shots = shotPatch ? shotPatch.previewShots : [];
 check('展开时按 preview_pages 切片，只有前 2 页 ready（不一次拉 9 张）',
   shots.length === 9 && shots[0].ready === true && shots[1].ready === true &&
   shots[2].ready === false, shots.map((s) => (s.ready ? 'R' : '-')).join(''));
-check('切片上限 12 页（与后端 PREVIEW_MAX_PAGES 对齐）',
-  mpApi._myFilePreviewShots.call(mpCtx, '21', 99, 0, []).length === 12);
+check('切片上限 200 页（安全上限；不再与后端预热页数 12 混为一谈）',
+  mpApi._myFilePreviewShots.call(mpCtx, '21', 99, 0, []).length === 99
+  && mpApi._myFilePreviewShots.call(mpCtx, '21', 999, 0, []).length === 200,
+  [mpApi._myFilePreviewShots.call(mpCtx, '21', 99, 0, []).length,
+    mpApi._myFilePreviewShots.call(mpCtx, '21', 999, 0, []).length].join('/'));
 
 const unknown = mpApi._decorateMyFile.call(mpCtx, {
   file_id: '22', original_name: 'x.docx', size: 1000, page_count: 0,

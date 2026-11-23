@@ -11,7 +11,11 @@
 // 单独执行，不能挪走）；「管理 → 某人的任务」页（pages/user-orders）用这一份。
 // 两边字段名必须一致，改模板先来改这里。
 
-const PREVIEW_MAX_PAGES = 12
+// 预览最多可翻到第几页（安全上限，防止 1000 页文档把 swiper 撑爆）。
+// 注意：后端 app.py 的 PREVIEW_MAX_PAGES=12 只是**上传时预热几页**，不是能看几页 ——
+// 更靠后的页在用户翻到时按需生成（见 /api/file_preview/<id>?page=N）。旧实现把两者
+// 当成同一个数，导致 41 页的文档预览只显示 12/12，白丢一半内容。
+const PREVIEW_MAX_PAGES = 200
 
 // order_files.status 的词表：sent 才是"已完成"（success 只在旧数据里出现）
 const STATUS_TEXT = {

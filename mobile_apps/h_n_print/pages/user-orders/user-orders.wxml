@@ -220,7 +220,7 @@
             <view class="detail-files-scroll">
               <view class="detail-files-track">
             <view wx:for="{{item.files}}" wx:for-item="f" wx:key="id" class="detail-file-row"
-                  bindtap="onOpenOrderFileDetail"
+                  catchtap="onOpenOrderFileDetail"
                   data-id="{{f.file_id}}" data-oid="{{item.id}}" data-findex="{{index}}">
               <view class="detail-file-info">
                 <text class="detail-file-name">{{f.original_name || f.file_name}}</text>
@@ -273,7 +273,10 @@
           <view class="detail-section">
             <view class="detail-row detail-price-row">
               <text class="detail-label">合计价格</text>
-              <view class="detail-price-tap" id="price-tap-{{item.id}}" data-id="{{item.id}}"
+              <view wx:if="{{item.pricePending}}" class="detail-price-tap" catchtap="noop">
+                <text class="detail-price-pending">待定</text>
+              </view>
+              <view wx:else class="detail-price-tap" id="price-tap-{{item.id}}" data-id="{{item.id}}"
                     catchtap="onPriceTap" hover-class="price-tap-hover" hover-stay-time="80">
                 <text class="detail-price-value status-{{item.status}}{{item.is_admin_print && item.status === 'sent' ? ' is-self-sent' : ''}}">¥{{item.totalPriceDisplay}}</text>
                 <text class="price-copy-icon">📋</text>
