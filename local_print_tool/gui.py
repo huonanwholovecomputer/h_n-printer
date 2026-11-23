@@ -13795,6 +13795,84 @@ class MainWindow(QMainWindow):
             cost_item.setToolTip(cost_text)
         self._update_total_cost()
 
+    def _blank_rate_stat(self, jobs):
+        """按当前列表估「空白页率」（不读盘：只用页数 + 页码范围 + 单双面参数）。
+
+        与 worker 里的真判定同一口径（`blank_split.summarize`），只是不探测尾部空白页、
+        不读 PDF 实际页数 —— 列表里的「页数」列就是它用的那个数，两边一致。
+        页数还不知道的文件跳过（它还没参与打印，先算进去只会得出假比例）。
+        """
+        entries = []
+        for job in jobs or []:
+            n_pages = int(getattr(job, "page_count", 0) or 0)
+            if n_pages <= 0:
+                continue
+            try:
+                sel = [i + 1 for i in pdf_printer._parse_page_range(
+                    str(job.page_range or ""), n_pages)]
+            except Exception:
+                sel = list(range(1, n_pages + 1))
+            if not sel:
+                continue
+            dup = (str(job.duplex or "off") == "on") and len(sel) > 1
+            sx = []
+            if dup:
+                try:
+                    sx = sorted(set(job_simplex_pages(job)) & set(sel))
+                except Exception:
+                    sx = []
+                if sx and set(sel) <= set(sx):
+                    dup = False  # 整份都设成单面页 ⇒ 一张背面都不打
+            entries.append(blank_split.FileEntry(
+                label=job.display_name or os.path.basename(str(job.file_path or "")),
+                pages=tuple(sel),
+                duplex=dup,
+                simplex_pages=tuple(sx) if dup else (),
+                copies=max(1, int(getattr(job, "copies", 1) or 1)),
+            ))
+        if not entries:
+            return None
+        try:
+            return blank_split.summarize(entries)
+        except Exception:
+            logger.debug("空白页率估算失败", exc_info=True)
+            return None
+
+    def _update_blank_rate(self, jobs=None):
+        """刷新底部「空白页率 N%（X 张里 Y 张背面空）」常显（没有空白面就整块隐藏）。"""
+        label = getattr(self, "_blank_rate_label", None)
+        if label is None:
+            return
+        try:
+            if jobs is None:
+                jobs = self._get_current_jobs()
+            stat = self._blank_rate_stat(jobs)
+        except Exception:
+            stat = None
+        if stat is None or stat.sheets <= 0 or stat.blanks <= 0:
+            label.setText("")
+            label.setVisible(False)
+            return
+        try:
+            auto = bool(getattr(self._printer_profile(), "auto_duplex", False))
+            th = float(self._config.blank_split_threshold(auto))
+        except Exception:
+            auto, th = False, blank_split.THRESHOLD_MANUAL
+        pct = float(stat.percent)
+        suggest = bool(stat.splittable) and pct >= th * 100.0
+        text = "空白页率 %.0f%%（%d 张里 %d 张背面空）" % (pct, stat.sheets, stat.blanks)
+        if suggest:
+            text = "⚠ " + text + " · 建议拆单"
+        label.setText(text)
+        label.setToolTip(
+            "按当前列表估算：一共要出 %d 张纸，其中 %d 张只有一面有内容（背面空白）。\n"
+            "拆单阈值：%s ≥%.0f%%（「选项 → 空白页率拆单…」可改）。\n"
+            "%s"
+            % (stat.sheets, stat.blanks, "自动双面机型" if auto else "人工翻纸机型", th * 100.0,
+               "达到阈值：点「开始打印」会先问要不要拆成两次打。"
+               if suggest else "没到阈值：默认一次打完；不想拆可以在那个选项里把阈值调高。"))
+        label.setVisible(True)
+
     def _update_total_cost(self):
         """更新合计费用标签（含附加服务）。"""
         jobs = self._get_current_jobs()
@@ -13823,6 +13901,8 @@ class MainWindow(QMainWindow):
                 self._copy_total_btn.setEnabled(True)
             if self._copy_detail_btn:
                 self._copy_detail_btn.setEnabled(True)
+        # 底部「空白页率」常显跟着同一批 jobs 走（加删文件 / 改单双面 / 切标签页都会重算）
+        self._update_blank_rate(jobs)
 
     def _reveal_in_explorer(self, path: str) -> bool:
         """在资源管理器里打开所在文件夹，**并把这个文件选中**（右键菜单「打开文件位置」）。
@@ -16081,6 +16161,21 @@ class MainWindow(QMainWindow):
         self._btn_clear = QPushButton("✖ 清空列表")
         self._btn_clear.clicked.connect(self._on_clear_list)
         layout.addWidget(self._btn_clear)
+
+        # ── 「空白页率」常显（2026-11-23 用户需求）──
+        # 一单里单面文件多时，背面空着的纸占比会很高（25 页单面 + 9 页双面 = 74%）。
+        # 以前只有点了「开始打印」、且达到阈值，才在确认框里看到这个数；现在列表下方
+        # 就把"多少张里多少张背面空、要不要拆"直接写着，加删文件时即时更新。
+        # 纯提示：不拦截打印、不改变任何闸门（真正的判定仍在 blank_split.py + PrintWorker）。
+        layout.addSpacing(10)
+        self._blank_rate_label = QLabel("")
+        self._blank_rate_label.setObjectName("blankRateLabel")
+        self._blank_rate_label.setVisible(False)
+        self._blank_rate_label.setToolTip(
+            "按当前列表估算：一共要出多少张纸，其中多少张只有一面有内容（背面空白）。\n"
+            "超过阈值（人工翻纸 40%、自动双面机型 60%，可在「选项 → 空白页率拆单…」改）时，\n"
+            "点「开始打印」会先问要不要拆成两次打。")
+        layout.addWidget(self._blank_rate_label)
 
         # 撤回定时器：清空后 5 秒内可撤回（每个标签页独立备份）
         self._clear_undo_timer = QTimer(self)

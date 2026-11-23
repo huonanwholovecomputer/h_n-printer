@@ -544,6 +544,94 @@ for _d in (_d1, _d2, _d3, _d4_auto, _d4_man):
     _d.deleteLater()
 
 # ============================================================
+# 4c) 底部「空白页率」常显（2026-11-23 用户要求：不点开始打印也能看见）
+# ============================================================
+print("\n=== 4c) 底部「空白页率」常显 ===")
+
+
+class _RateWin:
+    """只借 `_blank_rate_stat` / `_update_blank_rate` 两个真方法，不建整个主窗口。
+
+    这两个方法只碰 `_config` / `_printer_profile()` / `_get_current_jobs()` / 那个 QLabel，
+    所以拿一个带这四样的假宿主就能跑真实现（与 verify_print_queue 的 Host 同一手法）。
+    """
+
+    _blank_rate_stat = gui.MainWindow._blank_rate_stat
+    _update_blank_rate = gui.MainWindow._update_blank_rate
+
+    def __init__(self, jobs, profile=None):
+        self._jobs_list = list(jobs)
+        self._profile = profile or gui.PrinterProfile()
+        self._config = gui.PrinterConfig()
+        self._blank_rate_label = gui.QLabel("")
+
+    def _get_current_jobs(self):
+        return list(self._jobs_list)
+
+    def _printer_profile(self):
+        return self._profile
+
+
+def _job(pages, duplex="off", copies=1, name=""):
+    return gui.PrintJob(file_path=(name or f"f{pages}{duplex}.pdf"), page_count=pages,
+                        duplex=duplex, copies=copies, display_name=name or "")
+
+
+# 截图 m01286 那一单的两行：25 页单面 + 9 页双面
+# 摊纸：25 张（每张背面空）+ 5 张（末张背面空）= 30 张 / 26 张背面空 = 86.7%
+_w1 = _RateWin([_job(25, "off", name="方块消消乐课程设计报告.docx"),
+                _job(9, "on", name="37-拓奕乐-组合数据类型-字符串.docx")])
+_w1._update_blank_rate()
+_t1 = _w1._blank_rate_label.text()
+_s1 = _w1._blank_rate_stat(_w1._get_current_jobs())
+check("★ 25 页单面 + 9 页双面 ⇒ 30 张 / 26 张背面空", _s1.sheets == 30 and _s1.blanks == 26,
+      str(_s1))
+check("★ 常显文案里的比例与两张数一致（87% / 30 / 26）",
+      "87%" in _t1 and "30" in _t1 and "26" in _t1, _t1)
+check("★ 标签显示出来（不是 isHidden）", not _w1._blank_rate_label.isHidden(), _t1)
+
+# 阈值调高到 95% ⇒ 仍然显示这个数，但「建议拆」标记会消失（文案必须真的变）
+_w1._config.blank_split_threshold_manual = 0.95
+_w1._update_blank_rate()
+_t2 = _w1._blank_rate_label.text()
+check("★ 阈值调高后文案变了、比例还在（只去掉建议，不改数）",
+      _t2 != _t1 and "87%" in _t2, _t2)
+check("调高阈值不影响摊纸本身", _s1.sheets == 30 and _s1.blanks == 26, str(_s1))
+
+# 全是单面文件：背面全空，但拆单没意义（没有双面组）⇒ 显示 100% 但不建议拆
+_w2 = _RateWin([_job(10, "off")])
+_w2._update_blank_rate()
+_s2 = _w2._blank_rate_stat(_w2._get_current_jobs())
+_t3 = _w2._blank_rate_label.text()
+check("全单面 ⇒ 10 张里 10 张背面空（100%）", _s2.sheets == 10 and _s2.blanks == 10
+      and "100%" in _t3, _t3)
+check("全单面不可拆（只一侧有文件）", _s2.splittable is False, str(_s2))
+
+# 全是双面文件：只有末张背面空 ⇒ 占比很低，照实显示
+_w3 = _RateWin([_job(9, "on")])
+_w3._update_blank_rate()
+_s3 = _w3._blank_rate_stat(_w3._get_current_jobs())
+_t4 = _w3._blank_rate_label.text()
+check("全双面 9 页 ⇒ 5 张里 1 张背面空（20%）", _s3.sheets == 5 and _s3.blanks == 1
+      and "20%" in _t4, _t4)
+
+# 页数未知（还没解析完）⇒ 不参与估算，没有数就整块隐藏
+_w4 = _RateWin([_job(0, "on")])
+_w4._update_blank_rate()
+check("页数未知时不瞎算：标签隐藏且无文案", _w4._blank_rate_label.isHidden()
+      and _w4._blank_rate_label.text() == "", _w4._blank_rate_label.text())
+
+# 份数 ×2 也要算进去（7 页单面 × 2 份 = 14 张全背面空）
+_w5 = _RateWin([_job(7, "off", copies=2)])
+_w5._update_blank_rate()
+_s5 = _w5._blank_rate_stat(_w5._get_current_jobs())
+check("份数 ×2 计入张数（14 张 / 14 张背面空）", _s5.sheets == 14 and _s5.blanks == 14,
+      str(_s5))
+
+for _w in (_w1, _w2, _w3, _w4, _w5):
+    _w._blank_rate_label.deleteLater()
+
+# ============================================================
 # 5) 静态检查
 # ============================================================
 print("\n=== 5) 静态检查（接线齐全 / 只有一处口径）===")

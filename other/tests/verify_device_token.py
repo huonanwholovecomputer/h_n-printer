@@ -316,6 +316,11 @@ _srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _MockBackend)
 threading.Thread(target=_srv.serve_forever, daemon=True).start()
 _API = "http://127.0.0.1:%d" % _srv.server_address[1]
 
+# 本脚本用**本机假后端**验自签/重签，所以要显式关掉验收套件的签发闸门
+# （other/tests/run_all.py 会给所有子进程注入 HN_NO_DEVICE_TOKEN_ROTATE=1）；
+# H 段再把闸门打开，验它本身确实拦得住。
+os.environ.pop("HN_NO_DEVICE_TOKEN_ROTATE", None)
+
 import cloud_client as cc  # noqa: E402
 import printer_config as pc  # noqa: E402
 
@@ -437,6 +442,163 @@ finally:
         pass
     _ws_srv.shutdown()
 H.chk("★ 与客户端相同的构造方式（session 默认头 + websocket 头）能真实建连", _ws_ok)
+
+# ============================================================
+# G. 握手 403 自愈（2026-11-23 现场事故）
+# ============================================================
+print("\n=== G. 握手被 403 拒绝 → 清死 token → 重签 → 立刻重连 ===")
+_p_cc = open(os.path.join(LOCAL_TOOL, "cloud_client.py"), encoding="utf-8").read()
+H.chk("★ 客户端有握手 403 自愈入口（_recover_dead_device_token + 只救一次的闸门）",
+      "def _recover_dead_device_token(" in _p_cc
+      and "self._token_heal_done" in _p_cc
+      and "if _try == 1 and self._recover_dead_device_token(e)" in _p_cc)
+H.chk("★ HTTP 拉单 401/403 也走同一次自愈（不是只记一行 debug）",
+      "_recover_dead_device_token(status_code=resp.status_code)" in _p_cc)
+H.chk("自愈只在 401/403 上触发（网络抖动不换 token、不拖慢重连）",
+      "looks_like_auth_reject" in _p_cc and "status code 403" in _p_cc)
+
+_g_records = []
+
+
+class _HealBackend(http.server.BaseHTTPRequestHandler):
+    """只服务 /api/printer/token/create 的假后端（返回新 token，并记账）。"""
+
+    def _handle(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            try:
+                self.rfile.read(length)
+            except Exception:
+                pass
+        _g_records.append({"path": self.path,
+                           "headers": {k.lower(): v for k, v in self.headers.items()}})
+        if "/api/printer/token/create" in self.path:
+            body = {"success": True, "token": "fresh-tok", "scopes": ["print", "admin"]}
+        else:
+            body = {"success": True, "orders": [], "count": 0, "take_orders": True}
+        payload = json.dumps(body).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self):
+        self._handle()
+
+    def do_POST(self):
+        self._handle()
+
+    def log_message(self, *args):
+        pass
+
+
+_g_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _HealBackend)
+threading.Thread(target=_g_srv.serve_forever, daemon=True).start()
+_g_api = "http://127.0.0.1:%d" % _g_srv.server_address[1]
+
+_g_app = Flask("hn_devtok_heal_ws")
+_g_sio = _FSIO(_g_app, async_mode="threading", cors_allowed_origins="*")
+_g_seen = []
+
+
+@_g_sio.on("connect")
+def _g_connect():
+    _g_seen.append(_flask_request.headers.get("X-Printer-Token") or "")
+    return True
+
+
+_g_inner2 = _g_app.wsgi_app
+
+
+def _g_gate(environ, start_response):
+    """与生产 `_sio_handshake_gate` 同口径：新 token（fresh-tok）才放行。"""
+    if environ.get("PATH_INFO", "").startswith("/socket.io/"):
+        params = dict(urllib.parse.parse_qsl(environ.get("QUERY_STRING") or "",
+                                            keep_blank_values=True))
+        if "sid" not in params:
+            tok = environ.get("HTTP_X_PRINTER_TOKEN") or params.get("token")
+            if tok != "fresh-tok":
+                body = b"Forbidden"
+                start_response("403 Forbidden", [("Content-Type", "text/plain"),
+                                                 ("Content-Length", str(len(body)))])
+                return [body]
+    return _g_inner2(environ, start_response)
+
+
+_g_app.wsgi_app = _g_gate
+_g_ws = make_server("127.0.0.1", 0, _g_app, threaded=True)
+threading.Thread(target=_g_ws.serve_forever, daemon=True).start()
+_g_ws_url = "http://127.0.0.1:%d" % _g_ws.server_port
+
+_heal = cc.CloudClient(api_url=_g_api, ws_url=_g_ws_url, token="global-tok",
+                       device_token="dead-tok", client_id="dev-heal")
+_heal_issued, _heal_invalid, _heal_msgs = [], [], []
+_heal.token_issued.connect(lambda t, s: _heal_issued.append((t, s)))
+_heal.token_invalid.connect(lambda: _heal_invalid.append(1))
+_heal.status_message.connect(lambda m: _heal_msgs.append(m))
+# 真机里这些 Qt 信号是「工作线程 emit → 主线程槽」的排队投递，没有事件循环就不会送达；
+# 用一个裸 QCoreApplication 把主线程的排队投递泵起来（与 GUI 里真实路径同语义）。
+from PySide6.QtCore import QCoreApplication  # noqa: E402
+_qapp = QCoreApplication.instance() or QCoreApplication([])
+_heal.start()
+_heal_ok = False
+for _ in range(150):
+    _qapp.processEvents()
+    if _heal.is_connected():
+        _heal_ok = True
+        break
+    time.sleep(0.1)
+_heal.stop()
+for _ in range(20):     # 收尾：把停止前后的排队信号也泵干净
+    _qapp.processEvents()
+    time.sleep(0.02)
+
+_creates = [r for r in _g_records if "/api/printer/token/create" in r["path"]]
+H.chk("★ 死 token 被 403 拒绝后能自己连上（不再无限重连）", _heal_ok,
+      "msgs=%r" % (_heal_msgs[-4:],))
+H.chk("★ 重签只做一次，且新明文回给 GUI 落盘（token_issued）",
+      _heal_issued == [("fresh-tok", ["print", "admin"])], _heal_issued)
+H.chk("★ 清死 token 时发了 token_invalid（GUI 立刻把配置里的死 token 删掉）",
+      len(_heal_invalid) == 1, _heal_invalid)
+H.chk("★ 用全局 token 去重签（不能拿死掉的本机 token 自签）",
+      len(_creates) == 1 and _creates[0]["headers"].get("x-printer-token") == "global-tok",
+      _creates)
+H.chk("★ 重连用的是新 token（服务端放行的那次握手带的是 fresh-tok）",
+      _g_seen == ["fresh-tok"], _g_seen)
+
+# ============================================================
+# H. 验收闸门：测试模式禁止签发/轮换本机 token
+# ============================================================
+print("\n=== H. 验收闸门（HN_NO_DEVICE_TOKEN_ROTATE）：测试进程不许动生产凭据 ===")
+H.chk("cloud_client 里有闸门常量与判定函数",
+      "TOKEN_ROTATE_ENV = \"HN_NO_DEVICE_TOKEN_ROTATE\"" in _p_cc
+      and "def token_rotation_blocked(" in _p_cc)
+_n0 = len([r for r in _g_records if "/api/printer/token/create" in r["path"]])
+os.environ["HN_NO_DEVICE_TOKEN_ROTATE"] = "1"
+try:
+    _blocked = cc.CloudClient(api_url=_g_api, token="global-tok", client_id="dev-blocked")
+    _raised = False
+    try:
+        _blocked.request_device_token(scopes=("print", "admin"))
+    except cc.DeviceTokenError as e:
+        _raised = (e.status_code == 403)
+    _blocked._ensure_device_token()
+finally:
+    os.environ.pop("HN_NO_DEVICE_TOKEN_ROTATE", None)
+_n1 = len([r for r in _g_records if "/api/printer/token/create" in r["path"]])
+H.chk("★ 闸门挡住时 request_device_token 直接拒绝，一次网络请求都不发",
+      _raised and _n1 == _n0, (_n0, _n1))
+H.chk("被闸门挡住 → 走「4xx 被拒」分支：不抛异常、不切换 token、功能照常",
+      _blocked.device_token == "" and _blocked._self_sign_forbidden is True)
+
+_run_all_src = open(os.path.join(REPO, "other", "tests", "run_all.py"),
+                    encoding="utf-8").read()
+H.chk("★ run_all 给所有子进程注入闸门（默认拒绝，不只是本脚本自觉）",
+      'env.setdefault("HN_NO_DEVICE_TOKEN_ROTATE", "1")' in _run_all_src)
+
+_g_srv.shutdown()
+_g_ws.shutdown()
 
 # ============================================================
 # F. 客户端变异自证：auth_headers 变空 dict

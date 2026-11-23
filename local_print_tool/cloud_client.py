@@ -93,6 +93,31 @@ def auth_headers(token: str, client_id: str = "") -> dict:
     return h
 
 
+# ── 验收套件闸门（2026-11-23 现场事故后加的硬闸门）──────────────────────────
+# 事故：本机 device token 被轮换两次（17:45:08 / 17:45:48），正在跑的客户端手里还是旧
+# token ⇒ WS 握手一直 403「连接失败: Unexpected status code 403」，店主的机器整段掉线。
+# 「签发本机 token」是**有副作用的写操作**（服务端立刻作废该设备的旧 token），任何测试都
+# 不该在生产上做。所以：`other/tests/run_all.py` 给所有子进程注入
+# HN_NO_DEVICE_TOKEN_ROTATE=1，`request_device_token()` 一见这个变量就直接拒绝（不联网）。
+TOKEN_ROTATE_ENV = "HN_NO_DEVICE_TOKEN_ROTATE"
+
+
+def token_rotation_blocked() -> bool:
+    """当前进程是否被禁止签发/轮换本机 token（验收套件用）。"""
+    return str(os.environ.get(TOKEN_ROTATE_ENV, "")).strip() not in ("", "0", "false", "False")
+
+
+# 握手/请求被拒的判据：engineio 把「HTTP 非 2xx」包成 ConnectionError，文本形如
+# `Unexpected status code 403 in server response`；requests 侧则是 HTTPError/状态码。
+_AUTH_REJECT_HINTS = ("status code 401", "status code 403", "401 Unauthorized", "403 Forbidden")
+
+
+def looks_like_auth_reject(exc) -> bool:
+    """这个异常像不像「token 被拒」（401/403），而不是网络问题？"""
+    text = str(exc or "")
+    return any(h in text for h in _AUTH_REJECT_HINTS)
+
+
 class DeviceTokenError(RuntimeError):
     """自签本机 token 失败（status_code=0 表示网络/其它异常，允许稍后重试）。"""
 
@@ -554,6 +579,8 @@ class CloudClient(QObject):
         self._heartbeat_timer: threading.Timer | None = None
         self._reconnect_count = 0
         self._auth_fail_count = 0          # auth_fail 已发生次数（退避重连用）
+        # 2026-11-23：握手 403 时「清死 token → 重签」只做一次；连上成功后清零，长期运行也能自愈
+        self._token_heal_done = False
         self._auth_fail_stop = False       # auth_fail 达到最大重试次数后停止自动重连
         self._stability_timer: threading.Timer | None = None  # 连接稳定 N 秒后清零退避计数
         self._last_replay_attempt = 0.0    # status_queue 重放退避时间戳（60s 间隔）
@@ -613,6 +640,11 @@ class CloudClient(QObject):
             raise DeviceTokenError("云端未配置 API 地址")
         if not tok:
             raise DeviceTokenError("云端未配置 token")
+        if token_rotation_blocked():
+            # 403 走「被拒」分支（_self_sign_forbidden=True），功能零退化：继续用现有 token。
+            raise DeviceTokenError(
+                f"测试模式禁止签发/轮换本机 token（{TOKEN_ROTATE_ENV}=1）；"
+                "真机请在客户端里操作", status_code=403)
         payload = {"client_id": self.client_id, "label": (label or self.device_name)[:64]}
         if scopes:
             payload["scopes"] = list(scopes)
@@ -672,6 +704,42 @@ class CloudClient(QObject):
         except Exception:
             pass
 
+    def _recover_dead_device_token(self, exc=None, status_code: int = 0) -> bool:
+        """握手被 403 拒时救一次：清掉死掉的本机 token → 重签 → 立刻落盘 → 允许马上重连。
+
+        2026-11-23 现场事故根因：本机专用 token 被别的进程轮换掉之后，WS 握手直接
+        403（服务端 `_sio_handshake_gate` 拒绝，body 就 9 字节 `Forbidden`），而
+        `token_invalid` 只在服务端推送 `auth_fail` 时才发 —— 握手门拒绝根本不走那条路，
+        于是客户端拿着死 token 无限退避重连（现场 18:02–18:13 全是 403）。
+
+        这里把「死 token → 重签一次 → 用新 token 再连」接上：
+          · 只认 401/403（网络抖动/超时不算，别把重连节奏拖垮）；
+          · 每次「断线事件」只救一次（`_token_heal_done`，连上成功后清零）；
+          · 手里没有本机 token（纯全局 token）时不做无用功，直接提示去设置里换 token；
+          · 重签成功时 `_ensure_device_token` 会 emit `token_issued`，GUI 立刻写盘。
+        """
+        if not (int(status_code or 0) in (401, 403) or looks_like_auth_reject(exc)):
+            return False
+        if self._token_heal_done:
+            return False
+        self._token_heal_done = True
+        if not self.device_token:
+            logger.error(f"云端认证被拒（{exc}）—— 本机没有专用 token，全局 token 也无效")
+            self.status_message.emit(
+                "☁ 云端认证被拒：全局 token 无效，请在「云端」设置里更新认证 Token")
+            return False
+        logger.warning(f"本机专用 token 已失效（{exc}），清掉后重签一次")
+        self.status_message.emit("🔑 本机专用 token 已失效，正在重新签发…")
+        self.device_token = ""
+        self._self_sign_done = False
+        self._self_sign_forbidden = False
+        try:
+            self.token_invalid.emit()   # GUI 立刻清掉配置里的死 token（重启也不会再拿它）
+        except Exception:
+            pass
+        self._ensure_device_token()
+        return bool(self.device_token)
+
     # ── 公共 API ──
 
     def fetch_download_code(self) -> dict:
@@ -707,6 +775,7 @@ class CloudClient(QObject):
         # （用户可能在设置里改好了 token / 服务端升到了支持 scope 的版本）
         self._self_sign_done = bool(self.device_token)
         self._self_sign_forbidden = False
+        self._token_heal_done = False    # 每次 start 都允许救一次（现场轮换可能发生在任何时刻）
         # P1: 启动时清理 %TEMP% 下超过 24h 的残留下载临时文件（崩溃遗留兜底）
         self._cleanup_old_temp_files()
         # S1-03：启动扫描本地 PDF 缓存（保留期夹紧 1..168 h）。旧实现只在"写新缓存"后
@@ -1344,6 +1413,13 @@ class CloudClient(QObject):
                             # 自动开始下载
                             self.accept_task(task.task_id)
                 return True
+            if resp.status_code in (401, 403):
+                # 2026-11-23：HTTP 侧同样会被 403（body `{"message":"token 无效"}`）——
+                # 与 WS 握手共用同一次「清死 token → 重签」，不再静默退化成 debug 一行。
+                if self._recover_dead_device_token(status_code=resp.status_code):
+                    return False    # 下一次拉取就带新 token
+                logger.error(f"HTTP 拉单被拒（HTTP {resp.status_code}）：token 无效")
+                return False
             logger.debug(f"HTTP 兜底拉单返回非 2xx: {resp.status_code}")
             return False
         except Exception as e:
@@ -1624,6 +1700,7 @@ class CloudClient(QObject):
             if self._sio is not sio:
                 return  # 旧连接的迟到回调，忽略（否则会把新连接的状态改坏）
             self._connected = True
+            self._token_heal_done = False   # 连上了 ⇒ 下一次被 403 还能再救一次
             self.connection_changed.emit(True)
             self.status_message.emit("☁ 已连接到云端服务器")
             self._start_heartbeat()
@@ -1904,13 +1981,30 @@ class CloudClient(QObject):
         connect_url = (f"{self.ws_url}?client_id={self.client_id}"
                        f"&device_name={quote(self.device_name)}")
         self.status_message.emit(f"☁ 正在连接 {self.ws_url} ...")
-        try:
-            sio.connect(connect_url, wait_timeout=CONNECT_WAIT_TIMEOUT)
-        except Exception as e:
-            self.status_message.emit(f"☁ 连接失败: {e}")
-            # 失败时 engineio 可能已建立 transport（如 namespace 握手超时）→ 断开再重试
-            self._release_sio()
-            return
+        _try = 0
+        while True:
+            _try += 1
+            try:
+                sio.connect(connect_url, wait_timeout=CONNECT_WAIT_TIMEOUT)
+                break
+            except Exception as e:
+                # 403：本机 token 可能被轮换/吊销 —— 救一次（清死 token → 重签 → 立刻再试）
+                if _try == 1 and self._recover_dead_device_token(e):
+                    # 新 token 必须真正进到下一次握手：session 默认头是建连前拍的快照，
+                    # 不刷新就会拿旧 token 再 403 一次（现场就是这么无限循环的）。
+                    try:
+                        _sess = self._make_sio_session()
+                        _eio = getattr(sio, "eio", None)
+                        if _sess is not None and _eio is not None:
+                            _eio.http = _sess
+                            _eio.websocket_extra_options = {"header": self._auth_headers()}
+                    except Exception as _e:  # noqa: BLE001
+                        logger.warning(f"重签后刷新 Socket.IO 会话失败: {_e}")
+                    continue
+                self.status_message.emit(f"☁ 连接失败: {e}")
+                # 失败时 engineio 可能已建立 transport（如 namespace 握手超时）→ 断开再重试
+                self._release_sio()
+                return
 
         # 阻塞等待断开
         while self._connected and not self._stop_event.is_set():

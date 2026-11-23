@@ -220,6 +220,11 @@ def run_one(path: Path, node: str | None, timeout: int) -> tuple[str, str, float
     # 并 Quit，把用户正在编辑的 Word 关掉。验收套件里强制关闭 Office 引擎探测
     # （探测本身也不再碰 COM，这是第二道闸门）；需要真引擎的脚本自行覆盖该变量。
     env.setdefault("HN_NO_ENGINE_PROBE", "1")
+    # 2026-11-23 现场事故：某个进程在本机把店主的云端 device token 轮换了两次，正在跑的
+    # 客户端手里还是旧 token ⇒ WS 握手连续 403、整机掉线（见 cloud_client._recover_dead_device_token）。
+    # 「签发/轮换本机 token」是有副作用的写操作（服务端立刻作废旧 token），验收套件一律禁止：
+    # 任何脚本（含将来新写的）都不可能在跑测试时动到生产上的设备凭据。
+    env.setdefault("HN_NO_DEVICE_TOKEN_ROTATE", "1")
 
     t0 = time.time()
     try:
