@@ -1,8 +1,8 @@
 {
-  "version": "1.1.71",
-  "versionCode": 72,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.71.apk",
-  "md5": "8b77939b917563e38655e72c184c90a8",
-  "notes": "v1.1.71：订单列表的预览图改成分层尺寸 + WebP 协商 —— 同一张首页图小 17 倍左右，弱网下列表滚动明显跟手；打印页新增「打印缩放」与 Ctrl+Z 撤销，并补上末页空白页、封面页守卫与字体缺字提示。",
+  "version": "1.1.72",
+  "versionCode": 73,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.72.apk",
+  "md5": "a5ae8f93f17f03c958885bd3d1963dcd",
+  "notes": "v1.1.72：页数还没回报的订单不再显示按 1 页兜底的临时价，价格位显示「待定」也不能复制，设备回报页数后自动变成真实金额；用户自己取消的订单，原因显示「用户取消了该订单」；「我的文件」预览从 12 页上限放宽到 200 页（按需加载，不再一次拉满）；订单卡里点文件预览不再顺手把卡片收起。",
   "force": false
 }
