@@ -138,13 +138,58 @@ function decorate(file, opt) {
 }
 
 // 本地打单（order_files.file_id 为空）/ 云端副本已被清理：没有图，但打印参数还在这单上
-function localDetail(rowFile, reason) {
+// 2026-11-23：本地单的缩略图也能看了 —— 店主那台电脑打印收尾时会把「打印稿」渲成
+// 640px 前 6 页回传云端（键 = 订单号 + 文件名，api/local_order_thumb）。所以这里
+// 先问一句 /info 有几页，再铺 swiper；问不到就照旧只摊参数（老订单从没传过）。
+function localThumbUrl(baseUrl, orderNumber, name, page, token) {
+  const p = Number(page) > 0 ? Math.floor(Number(page)) : 1
+  return String(baseUrl) + '/api/local_order_thumb' +
+    '?order_number=' + encodeURIComponent(String(orderNumber || '')) +
+    '&name=' + encodeURIComponent(String(name || '')) +
+    '&page=' + p +
+    '&token=' + encodeURIComponent(String(token || ''))
+}
+
+function localInfoUrl(baseUrl, orderNumber, name, token) {
+  return String(baseUrl) + '/api/local_order_thumb/info' +
+    '?order_number=' + encodeURIComponent(String(orderNumber || '')) +
+    '&name=' + encodeURIComponent(String(name || '')) +
+    '&token=' + encodeURIComponent(String(token || ''))
+}
+
+// 与云端 shots 同形（page/url/ready/loaded/failed），模板不必分叉。
+// ready 一律 true：本地单只回传前几页（≤6 张、单页 60 KB 上下），而且 /info 已经确认
+// 有图 —— 再逐页"按需请求"只会让第一次进详情卡多等几轮，没有收益。
+function localShots(baseUrl, orderNumber, name, total, token) {
+  const n = Math.max(1, Math.min(6, Number(total) || 0))
+  const out = []
+  for (let p = 1; p <= n; p++) {
+    out.push({
+      page: p,
+      url: localThumbUrl(baseUrl, orderNumber, name, p, token),
+      ready: true,
+      loaded: false,
+      failed: false,
+    })
+  }
+  return out
+}
+
+function localDetail(rowFile, reason, opt) {
   const f = rowFile || {}
+  const o = opt || {}
   const name = f.original_name || f.file_name || '未知文件'
   const copies = Number(f.copies) || 1
   const pages = Number(f.page_count) || 0
   const eff = Number(f.effective_pages) || pages
   const sheets = Number(f.total_sheets) || 0
+  const orderNumber = o.orderNumber || f.order_number || ''
+  // 回传时用的键是 order_files.file_name（本地工具按 display_name/文件名上传），
+  // 显示名可能是 original_name —— 拼地址必须用 file_name，否则 md5 对不上取不到图
+  const thumbName = f.file_name || name
+  const shots = (reason === 'local' && Number(o.pages) > 0 && orderNumber)
+    ? localShots(o.baseUrl, orderNumber, thumbName, o.pages, o.token)
+    : []
   const rows = [{ k: '份数 / 页数', v: f.pagesLine || (copies + ' 份 × ' + eff + ' 页') }]
   if (sheets > 0) rows.push({ k: '合计张数', v: sheets + ' 张' })
   rows.push({ k: '单双面', v: f.duplex === 'on' ? '双面' : '单面' })
@@ -157,14 +202,23 @@ function localDetail(rowFile, reason) {
   if (f.total_price != null && Number(f.total_price) > 0) {
     rows.push({ k: '这一行金额', v: '¥' + Number(f.total_price).toFixed(2) })
   }
+  let note
+  if (reason === 'cleaned') {
+    note = '云端副本已被清理（保留期到了或手动删除过），预览图取不回来了；这单的打印参数还在，一起放在下面。'
+  } else if (shots.length) {
+    note = '这单是本地打单 —— 预览图是店主电脑在打印时渲染的（最多前几页），源文件仍在店主电脑上。'
+  } else {
+    note = '这单是本地打单 —— 源文件只保存在店主的电脑上，云端没有副本，所以没有预览图。'
+  }
   return {
     local_only: true,
     original_name: name,
     typeIcon: typeIcon(name),
-    localNote: reason === 'cleaned'
-      ? '云端副本已被清理（保留期到了或手动删除过），预览图取不回来了；这单的打印参数还在，一起放在下面。'
-      : '这单是本地打单 —— 源文件只保存在店主的电脑上，云端没有副本，所以没有预览图。',
+    localNote: note,
     localRows: rows,
+    localShots: shots,
+    localPreviewFmt: 'webp',
+    localPreviewIndex: 0,
   }
 }
 
@@ -176,4 +230,7 @@ module.exports = {
   shots: shots,
   decorate: decorate,
   localDetail: localDetail,
+  localThumbUrl: localThumbUrl,
+  localInfoUrl: localInfoUrl,
+  localShots: localShots,
 }

@@ -8857,6 +8857,270 @@ def local_file_thumb():
                     "fmt": actual_fmt, "bytes": len(data)})
 
 
+# ── 本地单（openid='local'）的文件缩略图（2026-11-23 用户需求）─────────────────────
+# 为什么另开一套：云端预览体系全部以 `files.id` 为键（上传=files 行、缓存=file_id 前缀、
+# 清理=按 file_id 前缀），而本地单的文件**从来没有上传**，`order_files.file_id` 就是空的
+# （生产库 2000+ 行）。所以上面两个端点对本地单必然 404，小程序「我」页文件详情只能写
+# 「源文件只保存在店主的电脑上，云端没有副本，所以没有预览图」。
+#
+# 这套新端点以 **(订单号, 文件名)** 为键，与 order_files 行的身份一致：
+#   · `order_files.id` 不能用 —— `/api/local_orders` 每次上报都是
+#     `DELETE FROM order_files` + 重插，行 id 会变；文件名在同一单里稳定且能重复匹配。
+#   · 上传：本地打印工具在渲染完本机缩略图（order_thumbs，结算页那一套）后顺手回传
+#     640px WebP，键为 (订单号, 文件名, 页号)；只存一档 —— 移动端详情卡要的就是 p 档，
+#     服务端不再下采样，省一层缓存与档位索引。
+#   · 读取：用户 token 走 query（<image> 带不了 Authorization），鉴权/可见性口径
+#     与 `/api/orders` 的默认分支**逐条对齐**（自己的单 / 管理员 / 绑定了成员的本地单）。
+#   · 保留期：本地单不会被删（orders 只在极少数路径上 DELETE），所以靠上传时顺手
+#     清 45 天前的订单目录 + 总量上限，别让 2000+ 单的缩略图把磁盘吃满。
+LOCAL_THUMB_DIR = os.path.join(UPLOAD_DIR, "local_thumbs")
+_LOCAL_THUMB_KEEP_DAYS = 45
+_LOCAL_THUMB_MAX_ORDERS = 900
+_LOCAL_THUMB_SAFE_RE = re.compile(r"[^0-9A-Za-z._-]")
+_local_thumb_prune_lock = threading.Lock()
+_local_thumb_prune_ts = 0.0
+
+
+def _local_thumb_order_dir(order_number: str, create: bool = False) -> str:
+    """订单号 → 存储目录。订单号只留安全字符（与 order_thumbs._SAFE_ORDER_RE 同思路）。"""
+    safe = _LOCAL_THUMB_SAFE_RE.sub("_", str(order_number or ""))[:64]
+    if not safe:
+        return ""
+    d = os.path.join(LOCAL_THUMB_DIR, safe)
+    if create:
+        os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _local_thumb_name_key(name: str) -> str:
+    """文件名 → 稳定短键。同名不同单互不影响（目录已经按订单号分了）。"""
+    return hashlib.md5(str(name or "").strip().lower().encode("utf-8")).hexdigest()[:16]
+
+
+def _local_thumb_path(order_number: str, name: str, page_no: int, fmt: str,
+                      create: bool = False) -> str:
+    d = _local_thumb_order_dir(order_number, create=create)
+    if not d:
+        return ""
+    key = _local_thumb_name_key(name)
+    if not key:
+        return ""
+    ext = "webp" if fmt == _PREVIEW_FMT_WEBP else "jpg"
+    return os.path.join(d, f"{key}_p{int(page_no)}.{ext}")
+
+
+def _local_thumb_find(order_number: str, name: str, page_no: int) -> str:
+    """这一页已经存下来的图（格式不定，优先 WebP）。返回空串 = 没有。"""
+    for fmt in (_PREVIEW_FMT_WEBP, _PREVIEW_FMT_JPEG):
+        p = _local_thumb_path(order_number, name, page_no, fmt)
+        if p and os.path.isfile(p):
+            return p
+    return ""
+
+
+def _local_thumb_pages(order_number: str, name: str) -> int:
+    """已上传到第几页（取最大页号）。0 = 一页都没有。"""
+    d = _local_thumb_order_dir(order_number)
+    key = _local_thumb_name_key(name)
+    if not d or not key or not os.path.isdir(d):
+        return 0
+    best = 0
+    try:
+        for fn in os.listdir(d):
+            if not fn.startswith(key + "_p"):
+                continue
+            m = re.match(r"^[0-9a-f]{16}_p(\d{1,3})\.(?:webp|jpg)$", fn)
+            if m:
+                best = max(best, int(m.group(1)))
+    except OSError:
+        return 0
+    return best
+
+
+def _prune_local_thumbs() -> int:
+    """删过期订单目录 + 总量封顶。最多一小时跑一次；失败只打日志。
+
+    本地单是一年 2000+ 张的流水，「订单永远不会被删」意味着缩略图目录只增不减。
+    这里按目录 mtime 删 45 天前的，再按 mtime 从旧到新删到只剩 _LOCAL_THUMB_MAX_ORDERS 个。
+    """
+    global _local_thumb_prune_ts
+    now = time.time()
+    with _local_thumb_prune_lock:
+        if now - _local_thumb_prune_ts < 3600:
+            return 0
+        _local_thumb_prune_ts = now
+    removed = 0
+    try:
+        if not os.path.isdir(LOCAL_THUMB_DIR):
+            return 0
+        dirs = []
+        for fn in os.listdir(LOCAL_THUMB_DIR):
+            p = os.path.join(LOCAL_THUMB_DIR, fn)
+            if not os.path.isdir(p):
+                continue
+            try:
+                mt = os.path.getmtime(p)
+            except OSError:
+                continue
+            dirs.append((mt, p))
+        dirs.sort()                              # 最旧的排前面
+        cutoff = now - _LOCAL_THUMB_KEEP_DAYS * 86400
+        drop = [p for mt, p in dirs if mt < cutoff]
+        keep = [p for mt, p in dirs if mt >= cutoff]
+        overflow = max(0, len(keep) - _LOCAL_THUMB_MAX_ORDERS)
+        drop += keep[:overflow]
+        for p in drop:
+            try:
+                shutil.rmtree(p, ignore_errors=True)
+                removed += 1
+            except OSError:
+                pass
+        if removed:
+            print(f"  [LOCAL-THUMB] 清理了 {removed} 个过期订单缩略图目录")
+    except Exception as e:  # noqa: BLE001  清理失败不影响回传
+        print(f"  [LOCAL-THUMB] 清理失败: {e}")
+    return removed
+
+
+def _local_order_row(order_number: str):
+    conn = get_db()
+    try:
+        return conn.execute(
+            "SELECT id, order_number, openid, source, owner_name FROM orders WHERE order_number = ?",
+            (order_number,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def _local_order_visible(row, openid: str) -> bool:
+    """本地单的可见性：与 /api/orders 默认分支同口径（自己的 / 管理员 / 绑定成员名下的）。"""
+    if row is None:
+        return False
+    if is_admin(openid):
+        return True
+    if str(row["openid"] or "") == str(openid or ""):
+        return True
+    try:
+        bound = _get_bound_owner_name(openid)
+    except Exception:  # noqa: BLE001  绑定表异常别把预览也弄挂
+        bound = ""
+    if bound and str(row["source"] or "") in ("", "local") \
+            and str(row["owner_name"] or "") == bound:
+        return True
+    return False
+
+
+@app.route("/api/local/order_thumb", methods=["POST"])
+@require_printer_scope("admin")
+def local_order_thumb_upload():
+    """本地打印工具回传**本地单**文件的缩略图（2026-11-23）。
+
+    请求体 JSON：`{order_number, name, page:1..999, data:<base64>, fmt?}`
+    - 键是 (订单号, 文件名, 页号)：order_files.id 每次上报都重插会变，文件名稳
+    - 只收 640px 左右的一档（移动端详情卡就用 p 档），格式按真实字节判定
+    - 幂等：同一 (订单号, 文件名, 页) 重复上传就是覆盖
+    - 订单不存在 ⇒ 404：宁可丢一张图，也不要在服务端留一堆没有主的目录
+    """
+    payload = request.get_json(silent=True) or {}
+    order_number = str(payload.get("order_number") or "").strip()[:64]
+    name = str(payload.get("name") or "").strip()[:200]
+    if not order_number or not name:
+        return jsonify({"success": False, "message": "缺少 order_number 或 name"}), 400
+    try:
+        page_no = int(payload.get("page") or 1)
+    except (TypeError, ValueError):
+        page_no = 1
+    page_no = max(1, min(999, page_no))
+    try:
+        data = base64.b64decode(str(payload.get("data") or ""), validate=True)
+    except Exception:  # noqa: BLE001
+        return jsonify({"success": False, "message": "图片数据不是合法 base64"}), 400
+    if not data:
+        return jsonify({"success": False, "message": "图片数据为空"}), 400
+    if len(data) > _PREVIEW_UPLOAD_MAX_BYTES:
+        return jsonify({"success": False,
+                        "message": f"图片过大（{len(data)} > {_PREVIEW_UPLOAD_MAX_BYTES} 字节）"}), 400
+    actual_fmt = _sniff_image_fmt(data)
+    if not actual_fmt:
+        return jsonify({"success": False, "message": "只接受 JPEG / WebP"}), 400
+    if actual_fmt == _PREVIEW_FMT_WEBP and not _preview_webp_ready():
+        return jsonify({"success": False, "message": "服务端不支持 WebP，请改传 JPEG"}), 415
+
+    if _local_order_row(order_number) is None:
+        return jsonify({"success": False, "message": "订单不存在"}), 404
+
+    dst = _local_thumb_path(order_number, name, page_no, actual_fmt, create=True)
+    if not dst:
+        return jsonify({"success": False, "message": "订单号/文件名不合法"}), 400
+    try:
+        tmp = dst + ".part"
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        os.replace(tmp, dst)                  # 原子替换：读的一侧永不看到半张图
+    except OSError as e:
+        try:
+            os.remove(dst + ".part")
+        except OSError:
+            pass
+        print(f"  [LOCAL-THUMB] 保存失败 {order_number}/{name} p{page_no}: {e}")
+        return jsonify({"success": False, "message": "保存失败"}), 500
+    _prune_local_thumbs()
+    return jsonify({"success": True, "page": page_no, "fmt": actual_fmt,
+                    "bytes": len(data), "pages": _local_thumb_pages(order_number, name)})
+
+
+@app.route("/api/local_order_thumb/info", methods=["GET"])
+def local_order_thumb_info():
+    """本地单缩略图有几页（移动端详情卡先问这一句，再决定 swiper 铺几张）。"""
+    openid = _openid_for_media()
+    if not openid:
+        return jsonify({"success": False, "message": "未登录，请先授权"}), 401
+    order_number = (request.args.get("order_number") or "").strip()[:64]
+    name = (request.args.get("name") or "").strip()[:200]
+    if not order_number or not name:
+        return jsonify({"success": False, "message": "缺少 order_number 或 name"}), 400
+    row = _local_order_row(order_number)
+    if not _local_order_visible(row, openid):
+        return jsonify({"success": False, "message": "无权查看该订单"}), 403
+    pages = _local_thumb_pages(order_number, name)
+    return jsonify({"success": True, "pages": pages, "name": name,
+                    "order_number": order_number,
+                    "preview_url": (f"/api/local_order_thumb?order_number={order_number}"
+                                    if pages else "")})
+
+
+@app.route("/api/local_order_thumb", methods=["GET"])
+def local_order_thumb_get():
+    """发一张本地单文件的缩略图（<image> 直接引，token 走 query）。
+
+    404 是常态：老订单从没上传过、或只传了前几页 —— 前端把这一页当骨架/图标即可。
+    """
+    openid = _openid_for_media()
+    if not openid:
+        return jsonify({"success": False, "message": "未登录，请先授权"}), 401
+    order_number = (request.args.get("order_number") or "").strip()[:64]
+    name = (request.args.get("name") or "").strip()[:200]
+    if not order_number or not name:
+        return jsonify({"success": False, "message": "缺少 order_number 或 name"}), 400
+    try:
+        page_no = int(request.args.get("page", 1))
+    except (TypeError, ValueError):
+        page_no = 1
+    page_no = max(1, min(999, page_no))
+    row = _local_order_row(order_number)
+    if not _local_order_visible(row, openid):
+        return jsonify({"success": False, "message": "无权查看该订单"}), 403
+    path = _local_thumb_find(order_number, name, page_no)
+    if not path:
+        return jsonify({"success": False, "message": "该页没有缩略图"}), 404
+    mime = _PREVIEW_MIME["webp"] if path.lower().endswith(".webp") else _PREVIEW_MIME["jpeg"]
+    resp = send_file(path, mimetype=mime, max_age=86400, conditional=True)
+    resp.headers["X-Preview-Page"] = str(int(page_no))
+    resp.headers["X-Preview-Pages"] = str(_local_thumb_pages(order_number, name))
+    return resp
+
+
 @app.route("/api/file_preview/<file_id>/info", methods=["GET"])
 def file_preview_info(file_id):
     """预览元信息（总页数）：先把前 N 页预热出来，再回 `{success, pages, rendered}`。

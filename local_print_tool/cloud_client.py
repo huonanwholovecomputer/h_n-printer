@@ -2827,6 +2827,50 @@ class CloudClient(QObject):
             logger.info(f"缩略图已回传 {label}: {ok}/{len(pages)} 页")
         return ok
 
+    def upload_order_thumb_pages(self, order_number: str, name: str, pages,
+                                 label: str = "") -> int:
+        """把**本地单**文件的缩略图回传到服务端，让移动端详情卡也能看到（2026-11-23）。
+
+        与 `upload_thumb_pages` 的区别只有键：云端单按 `file_id`，本地单按
+        (订单号, 文件名) —— 本地单的 order_files.file_id 永远是空的，而 order_files.id
+        每次上报都会重插，只有文件名是稳定的。返回成功页数。
+        """
+        import base64
+
+        if os.environ.get("HN_CLOUD_THUMB", "1").strip().lower() in ("0", "false", "no", "off"):
+            return 0
+        pages = list(pages or [])
+        num = str(order_number or "").strip()
+        if not num or not name or not pages:
+            return 0
+        url = (self.api_url or "").rstrip("/") + "/api/local/order_thumb"
+        ok = 0
+        for page_no, data, fmt in pages:
+            try:
+                headers = dict(self._auth_headers())
+                headers["Content-Type"] = "application/json"
+                resp = http_requests.post(url, headers=headers, timeout=30, json={
+                    "order_number": num,
+                    "name": str(name),
+                    "page": int(page_no),
+                    "fmt": fmt,
+                    "data": base64.b64encode(data).decode("ascii"),
+                })
+                good = False
+                try:
+                    good = resp.status_code == 200 and bool((resp.json() or {}).get("success"))
+                except Exception:  # noqa: BLE001  非 JSON 响应（网关错误页）
+                    good = False
+                if good:
+                    ok += 1
+                else:
+                    logger.info(f"本地单缩略图回传未成功 {label} p{page_no}: HTTP {resp.status_code}")
+            except Exception as e:  # noqa: BLE001  网络问题不影响主流程
+                logger.info(f"本地单缩略图回传失败 {label} p{page_no}: {e}")
+        if ok:
+            logger.info(f"本地单缩略图已回传 {label}: {ok}/{len(pages)} 页")
+        return ok
+
     def _report_page_count(self, file_id: str, file_name: str, page_count: int, orientation: str):
         """回报页数分析结果到后端。"""
         self.status_message.emit(f"☁ ✓ 页数分析完成: {file_name} → {page_count} 页 ({orientation})")

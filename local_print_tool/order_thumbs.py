@@ -118,6 +118,58 @@ def page_count(order_number: str, name: str = "") -> int:
     return best
 
 
+def load_pages(order_number: str, name: str = "", limit: int = 6,
+               edge: int = 640) -> list:
+    """读出已落盘的缩略图，按需缩小后给**云端回传**用（2026-11-23）。
+
+    为什么单独一条：本机存的是 1024px（结算页放大那一档），云端要给移动端看，
+    单页 60 KB × 20 页 = 1.2 MB/文件，900 个订单就能吃掉几个 G。这里只取前
+    `limit` 页并缩到 `edge`（默认 640，与移动端详情卡 p 档同宽）—— 用 PIL 就地
+    缩，不重新渲 PDF（重渲一页要 1~3 秒）。
+    返回 `[(page_no, bytes, fmt)]`，任何异常都当"没有"处理（缩略图绝不打扰主流程）。
+    """
+    out = []
+    try:
+        n = min(int(limit or 0) or 0, page_count(order_number, name))
+    except (TypeError, ValueError):
+        return []
+    if n <= 0:
+        return []
+    try:
+        from PIL import Image
+        import io as _io
+    except Exception:  # noqa: BLE001  没有 PIL 就原样回传（不至于整条链路断）
+        Image = None
+        _io = None
+    for page_no in range(1, n + 1):
+        path = find(order_number, name, page_no)
+        if not path:
+            continue
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        fmt = "webp" if path.lower().endswith(".webp") else "jpeg"
+        if Image is not None and edge and edge > 0:
+            try:
+                img = Image.open(_io.BytesIO(data))
+                if max(img.size) > int(edge):
+                    img.thumbnail((int(edge), int(edge)), Image.LANCZOS)
+                    buf = _io.BytesIO()
+                    try:
+                        img.save(buf, "WEBP", quality=78, method=4)
+                        data, fmt = buf.getvalue(), "webp"
+                    except Exception:  # noqa: BLE001  编不出 WebP 就回落 JPEG
+                        buf = _io.BytesIO()
+                        img.convert("RGB").save(buf, "JPEG", quality=82, optimize=True)
+                        data, fmt = buf.getvalue(), "jpeg"
+            except Exception:  # noqa: BLE001  缩不了就把原图传上去
+                pass
+        out.append((page_no, data, fmt))
+    return out
+
+
 def _drop_key(d: str, key: str) -> None:
     """同一文件重渲前先清掉旧版本（页数变少时不留残页）。"""
     try:

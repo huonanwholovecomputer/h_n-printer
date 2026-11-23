@@ -221,7 +221,7 @@
               <view class="detail-files-track">
             <view wx:for="{{item.files}}" wx:for-item="f" wx:key="id" class="detail-file-row"
                   catchtap="onOpenOrderFileDetail"
-                  data-id="{{f.file_id}}" data-oid="{{item.id}}" data-findex="{{index}}">
+                  data-id="{{f.file_id}}" data-oid="{{item.id}}" data-onum="{{item.order_number}}" data-findex="{{index}}">
               <view class="detail-file-info">
                 <text class="detail-file-name">{{f.original_name || f.file_name}}</text>
                 <view class="detail-file-tags">

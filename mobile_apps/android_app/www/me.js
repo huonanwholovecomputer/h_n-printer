@@ -380,8 +380,9 @@ function setupMeButtons() {
       e.stopPropagation();
       const fid = fileTap.dataset.orderFile || '';
       const rowFile = findOrderFile(fileTap.dataset.orderOid, fileTap.dataset.orderFindex);
-      if (fid) openOrderFileDetail(fid, rowFile);
-      else if (rowFile) openLocalOrderFile(rowFile, 'local');
+      const onum = findOrderNumber(fileTap.dataset.orderOid);
+      if (fid) openOrderFileDetail(fid, rowFile, onum);
+      else if (rowFile) openLocalOrderFile(rowFile, 'local', onum);
       else showToast('这行没有可查看的文件');
       return;
     }
@@ -499,8 +500,9 @@ function setupMeButtons() {
       e.stopPropagation();
       const fid = fileTap.dataset.orderFile || '';
       const rowFile = findOrderFile(fileTap.dataset.orderOid, fileTap.dataset.orderFindex);
-      if (fid) openOrderFileDetail(fid, rowFile);
-      else if (rowFile) openLocalOrderFile(rowFile, 'local');
+      const onum = findOrderNumber(fileTap.dataset.orderOid);
+      if (fid) openOrderFileDetail(fid, rowFile, onum);
+      else if (rowFile) openLocalOrderFile(rowFile, 'local', onum);
       else showToast('这行没有可查看的文件');
       return;
     }
@@ -3730,6 +3732,19 @@ function findOrderFile(orderId, findex) {
   return null;
 }
 
+/* 订单号（HN2026…）：本地单缩略图的键之一。模板里的 data-order-oid 是订单 DB id，不是单号 */
+function findOrderNumber(orderId) {
+  const oid = String(orderId == null ? '' : orderId);
+  const pools = [meState.orders || [], (meState.userOrdersView && meState.userOrdersView.orders) || []];
+  for (let p = 0; p < pools.length; p += 1) {
+    const pool = pools[p];
+    for (let i = 0; i < pool.length; i += 1) {
+      if (String(pool[i].id) === oid) return String(pool[i].order_number || '');
+    }
+  }
+  return '';
+}
+
 /* order_files.status 的词表：ORDER_STATUS_MAP 是"订单级"的，这里补上文件级常见的
    pending / success（旧数据）与 canceled 两种拼法，避免面板里直接印英文状态码 */
 const LOCAL_FILE_STATUS_TEXT = {
@@ -3740,13 +3755,26 @@ const LOCAL_FILE_STATUS_TEXT = {
 };
 
 /* 本地打单 / 云端副本已清理：没有图，但这一单的打印参数还在 —— 直接摊开给人看 */
-function localFilePanelHTML(rowFile, reason) {
+/* 2026-11-23：本地单的打印稿缩略图（店主电脑打印时渲好回传，键 = 订单号 + 文件名）。
+   有图就在参数上面铺一条横向滑动的图带；老订单没传过 ⇒ 照旧只有那句说明。 */
+function localThumbURL(orderNumber, name, page, token) {
+  return CONFIG.BASE_URL + '/api/local_order_thumb' +
+    '?order_number=' + encodeURIComponent(String(orderNumber || '')) +
+    '&name=' + encodeURIComponent(String(name || '')) +
+    '&page=' + (Number(page) > 0 ? Math.floor(Number(page)) : 1) +
+    '&token=' + encodeURIComponent(String(token || ''));
+}
+
+function localFilePanelHTML(rowFile, reason, opt) {
   const f = rowFile || {};
+  const o = opt || {};
   const name = f.original_name || f.file_name || '未知文件';
   const copies = Number(f.copies) || 1;
   const pages = Number(f.page_count) || 0;
   const eff = Number(f.effective_pages) || pages;
   const sheets = Number(f.total_sheets) || 0;
+  const orderNumber = String(o.orderNumber || f.order_number || '');
+  const thumbPages = Math.max(0, Math.min(6, Number(o.pages) || 0));
   let rows = myfileKv('份数 / 页数', f.pagesLine || (copies + ' 份 × ' + eff + ' 页'));
   if (sheets > 0) rows += myfileKv('合计张数', sheets + ' 张');
   rows += myfileKv('单双面', f.duplex === 'on' ? '双面' : '单面');
@@ -3759,28 +3787,70 @@ function localFilePanelHTML(rowFile, reason) {
   if (f.total_price != null && Number(f.total_price) > 0) {
     rows += myfileKv('这一行金额', '¥' + Number(f.total_price).toFixed(2));
   }
-  const note = (reason === 'cleaned')
-    ? '云端副本已被清理（保留期到了或手动删除过），预览图取不回来了；这单的打印参数还在，一起放在下面。'
-    : '这单是本地打单 —— 源文件只保存在店主的电脑上，云端没有副本，所以没有预览图。';
+  let thumbs = '';
+  if (reason === 'local' && thumbPages > 0 && orderNumber) {
+    const token = localStorage.getItem('hn_token') || '';
+    // 回传键是 order_files.file_name（显示名可能是 original_name）—— 拼地址必须用 file_name
+    const thumbName = f.file_name || name;
+    let band = '';
+    for (let p = 1; p <= thumbPages; p += 1) {
+      band += '<img class="myfile-local-thumb" src="' +
+        escHtml(localThumbURL(orderNumber, thumbName, p, token)) + '" alt="" ' +
+        'data-local-thumb="' + p + '">';
+    }
+    thumbs = '<view class="myfile-local-thumbs">' + band + '</view>';
+  }
+  let note;
+  if (reason === 'cleaned') {
+    note = '云端副本已被清理（保留期到了或手动删除过），预览图取不回来了；这单的打印参数还在，一起放在下面。';
+  } else if (thumbs) {
+    note = '这单是本地打单 —— 预览图是店主电脑在打印时渲染的（最多前几页），源文件仍在店主电脑上。';
+  } else {
+    note = '这单是本地打单 —— 源文件只保存在店主的电脑上，云端没有副本，所以没有预览图。';
+  }
   return '<view class="myfile-detail-card">' +
     '<text class="myfile-detail-title">' + escHtml(name) + '</text>' +
-    '<text class="myfile-local-tip">' + escHtml(note) + '</text>' + rows + '</view>';
+    '<text class="myfile-local-tip">' + escHtml(note) + '</text>' + thumbs + rows + '</view>';
 }
 
-function openLocalOrderFile(rowFile, reason) {
+/* 问云端「这单这个文件传了几页缩略图」，有就带图重画面板；没有就保持原样 */
+function localThumbPages(orderNumber, name) {
+  const num = String(orderNumber || '');
+  const key = String(name || '');
+  if (!num || !key) return Promise.resolve(0);
+  return api('/api/local_order_thumb/info?order_number=' + encodeURIComponent(num) +
+    '&name=' + encodeURIComponent(key))
+    .then((r) => {
+      const d = (r && r.data) || {};
+      return Number(d && d.pages) || 0;
+    })
+    .catch(() => 0);
+}
+
+function openLocalOrderFile(rowFile, reason, orderNumber) {
   meState.fileDetailId = '';
   meState.fileDetailFile = null;
   meState.fileDetailLoading = false;
+  const num = String(orderNumber || (rowFile && rowFile.order_number) || '');
+  const name = (rowFile && (rowFile.file_name || rowFile.original_name)) || '';
   const body = document.getElementById('myFileDetailBody');
   if (body) body.innerHTML = localFilePanelHTML(rowFile, reason);
   openModal('myFileDetailModal');
+  if (reason !== 'local' || !num || !name) return;
+  const seq = (myFileDetailSeq += 1);
+  localThumbPages(num, name).then((pages) => {
+    if (!pages || seq !== myFileDetailSeq) return;      // 没图 / 已经换了别的文件
+    const host = document.getElementById('myFileDetailBody');
+    if (!host || !host.querySelector('.myfile-local-tip')) return;
+    host.innerHTML = localFilePanelHTML(rowFile, reason, { orderNumber: num, pages: pages });
+  });
 }
 
-function openOrderFileDetail(fileId, rowFile) {
+function openOrderFileDetail(fileId, rowFile, orderNumber) {
   const id = String(fileId == null ? '' : fileId);
   // 没有 file_id（本地打单）：不请求接口，直接摊开这行的参数
   if (!id) {
-    if (rowFile) { openLocalOrderFile(rowFile, 'local'); return; }
+    if (rowFile) { openLocalOrderFile(rowFile, 'local', orderNumber); return; }
     showToast('这行没有可查看的文件');
     return;
   }
@@ -3800,7 +3870,7 @@ function openOrderFileDetail(fileId, rowFile) {
       meState.fileDetailFile = null;
       // 403/404：文件过了保留期或被删。这单的参数还查得到 —— 退到本地面板并说明原因，
       // 而不是只给一句「文件已清理或不存在」（用户 2026-11-13 报的就是这个观感）。
-      if (rowFile) { openLocalOrderFile(rowFile, 'cleaned'); return; }
+      if (rowFile) { openLocalOrderFile(rowFile, 'cleaned', orderNumber); return; }
       const b = document.getElementById('myFileDetailBody');
       if (b) {
         b.innerHTML = '<text class="myfile-detail-tip">' +
@@ -3819,7 +3889,7 @@ function openOrderFileDetail(fileId, rowFile) {
   }).catch(() => {
     if (seq !== myFileDetailSeq) return;
     meState.fileDetailLoading = false;
-    if (rowFile) { openLocalOrderFile(rowFile, 'cleaned'); return; }
+    if (rowFile) { openLocalOrderFile(rowFile, 'cleaned', orderNumber); return; }
     const b3 = document.getElementById('myFileDetailBody');
     if (b3) b3.innerHTML = '<text class="myfile-detail-tip">网络异常，请稍后重试</text>';
     showToast('网络异常，请重试');

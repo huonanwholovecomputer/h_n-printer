@@ -287,7 +287,7 @@
               <view class="detail-files-track">
             <view wx:for="{{item.files}}" wx:for-item="f" wx:key="id" class="detail-file-row"
                   catchtap="onOpenOrderFileDetail"
-                  data-id="{{f.file_id}}" data-oid="{{item.id}}" data-findex="{{index}}">
+                  data-id="{{f.file_id}}" data-oid="{{item.id}}" data-onum="{{item.order_number}}" data-findex="{{index}}">
               <view class="detail-file-info">
                 <text class="detail-file-name">{{f.original_name || f.file_name}}</text>
                 <view class="detail-file-tags">
@@ -899,6 +899,21 @@
          历史单都没有可取的云端文件 —— 以前直接弹「该文件已清理」，等于把已知的打印参数也藏了。
          这一段只读 f.localRows，不请求任何接口。 -->
     <block wx:if="{{f.local_only}}">
+      <!-- 2026-11-23（用户：「本地订单的略缩图还没有在移动端生效」）：店主那台电脑打印收尾
+           会把「打印稿」渲成最多 6 页回传（键 = 订单号 + 文件名）。有图就在这里铺一列
+           swiper；老订单从没上传过 ⇒ f.localShots 为空，这一块整段不渲染，只留下面那句说明。 -->
+      <view wx:if="{{f.localShots.length}}" class="myfile-preview-wrap">
+        <swiper class="myfile-preview-swiper" bindchange="onLocalThumbChange" data-scope="{{scope}}">
+          <swiper-item wx:for="{{f.localShots}}" wx:for-item="shot" wx:key="page">
+            <image class="myfile-preview myfile-preview-loaded"
+                   src="{{shot.url}}" mode="aspectFit"
+                   webp="{{f.localPreviewFmt !== 'jpeg'}}"
+                   binderror="onLocalThumbError"
+                   data-page="{{shot.page}}" data-scope="{{scope}}" />
+          </swiper-item>
+        </swiper>
+        <view wx:if="{{f.localShots.length > 1}}" class="myfile-preview-pager">{{f.localPreviewIndex + 1}} / {{f.localShots.length}}</view>
+      </view>
       <view class="myfile-local-tip">{{f.localNote}}</view>
       <view wx:for="{{f.localRows}}" wx:for-item="row" wx:key="k" class="myfile-kv">
         <text class="myfile-k">{{row.k}}</text>

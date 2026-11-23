@@ -7656,6 +7656,34 @@ body.theme-dark .crop-panel,
 
 .myfile-preview-slide.is-loaded > img { opacity: 1; }
 
+/* ---------- 本地单的打印稿缩略图（2026-11-23）----------
+   店主电脑打印收尾时把前几页回传云端，这里横向排一条可滑动的图带。
+   与上面的多页轨道分开：那是「云端文件」的翻页轨道，这块是本地单的静态图列，
+   不参与 previewShots 状态机，也不需要淡入/骨架屏（图片本来就小、直接给）。 */
+.myfile-local-thumbs {
+  display: flex;
+  gap: 1.6cqw;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 1.6cqw;
+  margin: 1.6cqw 0;
+  border-radius: 1.44cqw;
+  background: rgba(120, 120, 128, 0.10);
+}
+
+.myfile-local-thumb {
+  flex: 0 0 auto;
+  width: 26cqw;
+  height: 36cqw;
+  object-fit: contain;
+  border-radius: 1cqw;
+  background: rgba(255, 255, 255, 0.55);
+  -webkit-user-drag: none;
+}
+
+.theme-dark .myfile-local-thumb { background: rgba(255, 255, 255, 0.08); }
+
 /* 骨架屏：灰色渐变横扫 + 一行小字，图片解码完成（.is-loaded）后整块淡出 */
 .myfile-preview-skeleton {
   position: absolute;

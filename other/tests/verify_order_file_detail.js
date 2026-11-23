@@ -89,9 +89,9 @@ check('翻页时已加载的页保持 loaded（不重新拉图）', sKeep.shots[
 console.log('\n--- 4) 「我」页：无 file_id 不再弹「已清理」 ---');
 const orderHandler = (ME_JS.match(/onOpenOrderFileDetail\(e\) \{[\s\S]{0,2600}?\n    \},/) || [''])[0];
 check('抠到 onOpenOrderFileDetail', orderHandler.length > 200, orderHandler.length + ' 字符');
-check('没有 file_id 时先试本地面板（_uoShowLocal/_localFileDetail 路径）',
-  /if \(!fileId\) \{[\s\S]{0,200}?_orderFileAt[\s\S]{0,200}?local/.test(orderHandler) ||
-  /if \(!fileId\) \{[\s\S]{0,240}?showLocal\('local'\)/.test(orderHandler));
+check('没有 file_id 时先摊本地面板，再问本地缩略图有几页（2026-11-23）',
+  /if \(!fileId\) \{[\s\S]{0,400}?showLocal\('local'\)/.test(orderHandler) &&
+  /showLocal\('local'\)[\s\S]{0,240}?_loadLocalThumbs\(ds\.onum/.test(orderHandler));
 check('接口 403/404 后退到「副本已清理」面板，而不是只弹 toast',
   /cleaned/.test(orderHandler));
 check('模板：本地单走 local_only 分支（有提示 + 参数行），其余才走预览图',
@@ -145,19 +145,70 @@ check('文件行带单号/下标（本地单也要能定位到那行参数）',
   /\(o\.files \|\| \[\]\)\.forEach\(\(f, fi\)/.test(APP_JS));
 check('点击文件行：有 file_id 走详情弹窗，没有走本地面板（不再 toast「该文件已清理」）',
   /const rowFile = findOrderFile\(fileTap\.dataset\.orderOid, fileTap\.dataset\.orderFindex\)/.test(APP_JS) &&
-  /if \(fid\) openOrderFileDetail\(fid, rowFile\);/.test(APP_JS) &&
-  /else if \(rowFile\) openLocalOrderFile\(rowFile, 'local'\);/.test(APP_JS) &&
+  /const onum = findOrderNumber\(fileTap\.dataset\.orderOid\)/.test(APP_JS) &&
+  /if \(fid\) openOrderFileDetail\(fid, rowFile, onum\);/.test(APP_JS) &&
+  /else if \(rowFile\) openLocalOrderFile\(rowFile, 'local', onum\);/.test(APP_JS) &&
   !/else showToast\('该文件已清理'\)/.test(APP_JS));
-check('本地参数面板：本地面板 HTML + 打开入口',
-  /function localFilePanelHTML\(rowFile, reason\)/.test(APP_JS) &&
-  /function openLocalOrderFile\(rowFile, reason\)/.test(APP_JS) &&
+check('本地参数面板：本地面板 HTML + 打开入口（都带单号，本地单靠它找缩略图）',
+  /function localFilePanelHTML\(rowFile, reason, opt\)/.test(APP_JS) &&
+  /function openLocalOrderFile\(rowFile, reason, orderNumber\)/.test(APP_JS) &&
   /myfile-local-tip/.test(APP_JS) && /myfile-detail-title/.test(APP_JS));
 check('403/404 与网络异常都退到「副本已清理」面板（有该行参数时）',
-  /if \(rowFile\) \{ openLocalOrderFile\(rowFile, 'cleaned'\); return; \}/.test(APP_JS));
+  /if \(rowFile\) \{ openLocalOrderFile\(rowFile, 'cleaned', orderNumber\); return; \}/.test(APP_JS));
 check('管理子视图（user-orders）的文件行同样可点',
   /document\.getElementById\('userOrdersList'\)\.addEventListener\('click', \(e\) => \{[\s\S]{0,900}?data-order-file/.test(APP_JS));
 check('样式：.myfile-local-tip / .myfile-detail-title 有定义',
   /\.myfile-local-tip \{/.test(APP_CSS) && /\.myfile-detail-title \{/.test(APP_CSS));
+
+console.log('\n--- 7) 本地单的打印稿缩略图（2026-11-23 用户：略缩图还没在移动端生效） ---');
+// 口径：本地单的源文件从来不上云（order_files.file_id 恒空），所以既不能走
+// /api/file_preview/<id>，也不能拿 order_files.id 当键（/api/local_orders 每次上报都
+// DELETE + 重插，行 id 会变）。键只能是 (订单号, 文件名)：店主那台电脑打印收尾时渲好
+// 前几页回传，移动端按订单号 + 文件名取图。
+const LRO = { file_name: 'a.docx', original_name: 'A 显示名.docx', copies: 1, page_count: 9, total_sheets: 5, duplex: 'on', status: 'sent', total_price: 1.9 };
+const lWith = CARD.localDetail(LRO, 'local', {
+  baseUrl: 'https://api.test', token: 't+1/2', orderNumber: 'HN20261123-0009', pages: 9,
+});
+check('有缩略图时铺 swiper：最多 6 页（详情卡不铺整单）', lWith.localShots.length === 6, lWith.localShots.length);
+check('图片地址的键是 (order_number, name, page) + token 查询串，不带 file_id',
+  lWith.localShots[0].url === 'https://api.test/api/local_order_thumb?order_number=HN20261123-0009&name=a.docx&page=1&token=t%2B1%2F2',
+  lWith.localShots[0].url);
+check('拼地址一律用 file_name，不是 original_name（回传时用的就是它，md5 才对得上）',
+  lWith.localShots[0].url.indexOf('name=a.docx') > 0 && lWith.localShots[0].url.indexOf('A%20') < 0);
+check('有图时文案改成「预览图是店主电脑在打印时渲染的」',
+  lWith.localNote.indexOf('预览图') > 0 && lWith.localNote.indexOf('没有预览图') < 0, lWith.localNote);
+check('infoUrl 指向 /api/local_order_thumb/info（先问几页再铺图）',
+  CARD.localInfoUrl('https://api.test', 'HN20261123-0009', 'a.docx', 't') ===
+  'https://api.test/api/local_order_thumb/info?order_number=HN20261123-0009&name=a.docx&token=t');
+check('「副本已被清理」那一路永远不铺图（图在云端才谈得上清理）',
+  CARD.localDetail(LRO, 'cleaned', { orderNumber: 'HN20261123-0009', pages: 9 }).localShots.length === 0);
+check('没问过页数（opt.pages 缺省）⇒ 照旧只摊参数，绝不去猜',
+  CARD.localDetail(LRO, 'local', { orderNumber: 'HN20261123-0009' }).localShots.length === 0);
+check('模板新增本地图块：swiper + 翻页角标 + 单页失败摘掉', 
+  /wx:if="\{\{f\.localShots\.length\}\}"[\s\S]{0,700}?bindchange="onLocalThumbChange"/.test(ME_WXML) &&
+  /f\.localShots\.length > 1[\s\S]{0,80}?f\.localPreviewIndex \+ 1/.test(ME_WXML) &&
+  /binderror="onLocalThumbError"/.test(ME_WXML));
+check('「我」页处理器齐全（取页数 / 翻页 / 单页失败）',
+  ['_localThumbShots', '_loadLocalThumbs', 'onLocalThumbChange', 'onLocalThumbError']
+    .every(n => new RegExp('\\n    ' + n + '\\(').test(ME_JS)));
+check('「我」页文件行把单号带下来（data-onum），否则本地单找不到图',
+  /data-onum="\{\{item\.order_number\}\}"/.test(ME_WXML) && /_loadLocalThumbs\(ds\.onum/.test(ME_JS));
+check('管理页（user-orders）同一套：单号 + 取页数 + 两个图处理器',
+  /data-onum="\{\{item\.order_number\}\}"/.test(UO_WXML) &&
+  /_uoLoadLocalThumbs\(ds\.onum/.test(UO_JS) &&
+  ['_uoLoadLocalThumbs', 'onLocalThumbChange', 'onLocalThumbError'].every(n => new RegExp('\\n    ' + n + '\\(').test(UO_JS)));
+check('管理页调 localDetail 时把 baseUrl/token 传进去（默认值不跨页面复用）',
+  /fileDetailCard\.localDetail\(rowFile, reason, o\)/.test(UO_JS));
+check('APP 端同款：localThumbURL / localThumbPages / 面板里有图带',
+  /function localThumbURL\(orderNumber, name, page, token\)/.test(APP_JS) &&
+  /function localThumbPages\(orderNumber, name\)/.test(APP_JS) &&
+  /myfile-local-thumbs/.test(APP_JS) &&
+  /localThumbPages\(num, name\)\.then\(\(pages\)/.test(APP_JS));
+check('APP 端只有真的拿到页数才重刷面板（没图保持"只摊参数"）',
+  /if \(!pages \|\| seq !== myFileDetailSeq\) return;/.test(APP_JS));
+check('APP 样式：图带横向可滑、单图固定比例（不新增裸选择器覆盖既有断言）',
+  /\.myfile-local-thumbs \{[\s\S]{0,200}?overflow-x: auto/.test(APP_CSS) &&
+  /\.myfile-local-thumb \{[\s\S]{0,200}?object-fit: contain/.test(APP_CSS));
 
 console.log('\n结果：通过 ' + pass + ' 条，失败 ' + fail + ' 条');
 if (fail > 0) {

@@ -749,13 +749,57 @@ Component({
       return null
     },
 
-    // 没有云端副本时：用这单的打印参数拼一张只读面板（不请求任何接口）
-    _uoShowLocal(rowFile, reason) {
+    // 没有云端副本时：用这单的打印参数拼一张只读面板（本身不请求接口）
+    _uoShowLocal(rowFile, reason, opt) {
+      const o = Object.assign({
+        baseUrl: CONFIG.BASE_URL,
+        token: wx.getStorageSync('token'),
+      }, opt || {})
       this.setData({
         fileDetailVisible: true,
         fileDetailClosing: false,
         fileDetailLoading: false,
-        fileDetail: fileDetailCard.localDetail(rowFile, reason),
+        fileDetail: fileDetailCard.localDetail(rowFile, reason, o),
+      })
+    },
+
+    // 2026-11-23：本地单的打印稿缩略图（店主电脑渲好回传）—— 先问有几页，有图再重铺面板
+    _uoLoadLocalThumbs(orderNumber, rawName, rowFile) {
+      const num = String(orderNumber || '')
+      const name = String(rawName || '')
+      const token = wx.getStorageSync('token')
+      if (!num || !name || !token) return
+      request({
+        url: fileDetailCard.localInfoUrl(CONFIG.BASE_URL, num, name, token),
+        method: 'GET',
+        success: (res) => {
+          const d = (res && res.data) || {}
+          const pages = Number(d && d.pages) || 0
+          if (!pages) return                        // 老订单没传过：保持「只摊参数」
+          if (!this.data.fileDetailVisible) return  // 已经关窗
+          this._uoShowLocal(rowFile, 'local', { orderNumber: num, pages })
+        },
+        fail: () => {},
+      })
+    },
+
+    onLocalThumbChange(e) {
+      const idx = Number(e && e.detail && e.detail.current) || 0
+      const f = this.data.fileDetail
+      if (!f || !f.local_only) return
+      this.setData({ 'fileDetail.localPreviewIndex': idx })
+    },
+
+    onLocalThumbError(e) {
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const page = Number(ds.page) || 0
+      const f = this.data.fileDetail
+      if (!f || !Array.isArray(f.localShots) || !page) return
+      const rest = f.localShots.filter(s => Number(s.page) !== page)
+      const idx = Math.max(0, Math.min(rest.length - 1, Number(f.localPreviewIndex) || 0))
+      this.setData({
+        'fileDetail.localShots': rest,
+        'fileDetail.localPreviewIndex': idx,
       })
     },
 
@@ -765,8 +809,9 @@ Component({
       const rowFile = this._uoFileAt(ds.oid, ds.findex)
       // 本地打单（order_files.file_id 为空）：云端没有这份文件，但参数有 —— 不再弹「该文件已清理」
       if (!fileId) {
-        if (rowFile) { this._uoShowLocal(rowFile, 'local'); return }
-        wx.showToast({ title: '这行没有可查看的文件', icon: 'none' })
+        if (!rowFile) { wx.showToast({ title: '这行没有可查看的文件', icon: 'none' }); return }
+        this._uoShowLocal(rowFile, 'local')
+        this._uoLoadLocalThumbs(ds.onum, rowFile.file_name || rowFile.original_name, rowFile)
         return
       }
       const token = wx.getStorageSync('token')

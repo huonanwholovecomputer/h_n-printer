@@ -12250,6 +12250,21 @@ class MainWindow(QMainWindow):
                     done = order_thumbs.render_pages(num, name, path, pdf)
                     if done:
                         note = f"🖼 本地缩略图已生成：{num} / {name}（{done} 页）"
+                        # 2026-11-23（用户：「本地订单的略缩图还没有在移动端生效」）：
+                        # 本机结算页早就看得到，移动端看不到 —— 因为本地单的文件从不上传。
+                        # 这里顺手把**缩到 640 / 最多 6 页**的那一版回传云端（按 订单号+文件名
+                        # 存，见后端 /api/local/order_thumb），手机上就能翻页预览了。
+                        # 离线时直接跳过：不值得为几张缩略图在后台等 6 次 30 秒超时。
+                        client = getattr(self, "_cloud_client", None)
+                        if client and num and getattr(client, "_connected", False):
+                            try:
+                                up = client.upload_order_thumb_pages(
+                                    num, name, order_thumbs.load_pages(num, name),
+                                    label=f"{num}/{name}")
+                                if up:
+                                    note += f"，已回传云端 {up} 页"
+                            except Exception:  # noqa: BLE001  回传失败不影响本机
+                                pass
             except Exception:  # noqa: BLE001
                 note = ""
             pending = getattr(self, "_thumb_pending", None)

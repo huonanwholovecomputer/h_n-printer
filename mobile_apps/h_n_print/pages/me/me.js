@@ -1909,17 +1909,47 @@ Component({
       return f || null
     },
 
+    /* 本地单缩略图的图片地址（2026-11-23）：键 = 订单号 + 文件名，token 只能拼查询串
+       （<image> 带不了 Authorization 头，与云端 previewUrl 同一套约定）。 */
+    _localThumbShots(orderNumber, name, total) {
+      const token = (wx.getStorageSync('token') || '')
+      const base = String(CONFIG.BASE_URL || '')
+      const n = Math.max(1, Math.min(6, Number(total) || 0))
+      const out = []
+      for (let p = 1; p <= n; p++) {
+        out.push({
+          page: p,
+          url: base + '/api/local_order_thumb' +
+            '?order_number=' + encodeURIComponent(String(orderNumber || '')) +
+            '&name=' + encodeURIComponent(String(name || '')) +
+            '&page=' + p +
+            '&token=' + encodeURIComponent(token),
+          ready: true,
+          loaded: false,
+          failed: false,
+        })
+      }
+      return out
+    },
+
     /* 本地打单 / 云端副本已被清理：没有预览图，但这一行的打印参数还在这张单上。
        2026-11-13 晚用户报「我的打印任务里点任意文件都提示该文件已清理」——
        根因是本地打单的 order_files.file_id 本来就是空的（生产库 2000+ 行），
-       以前这里一律弹「已清理」，等于把已知信息也藏了。 */
-    _localFileDetail(f, reason) {
+       以前这里一律弹「已清理」，等于把已知信息也藏了。
+       2026-11-23：本地单现在也有缩略图（店主电脑打印时渲好回传），opt.pages > 0 时铺 swiper。 */
+    _localFileDetail(f, reason, opt) {
       const file = f || {}
+      const o = opt || {}
       const name = file.original_name || file.file_name || '未知文件'
+      const orderNumber = o.orderNumber || file.order_number || ''
       const copies = Number(file.copies) || 1
       const pages = Number(file.page_count) || 0
       const eff = Number(file.effective_pages) || pages
       const sheets = Number(file.total_sheets) || 0
+      const thumbPages = Number(o.pages) || 0
+      const shots = (reason === 'local' && thumbPages > 0 && orderNumber)
+        ? this._localThumbShots(orderNumber, file.file_name || name, thumbPages)
+        : []
       // order_files.status 的词表跟订单一样：sent 才是"已完成"（success 只在旧数据里出现）
       const statusMap = {
         pending: '待打印', queued: '排队中', printing: '打印中',
@@ -1938,15 +1968,71 @@ Component({
       if (file.blank_tail_exclude && Number(file.page_count) > 1) rows.push({ k: '末尾空白页', v: '已排除' })
       if (file.status) rows.push({ k: '打印状态', v: statusMap[file.status] || file.status })
       if (file.reject_reason) rows.push({ k: '退回原因', v: file.reject_reason })
+      let note
+      if (reason === 'cleaned') {
+        note = '云端副本已被清理（保留期到了或手动删除过），预览图取不回来了；这单的打印参数还在，一起放在下面。'
+      } else if (shots.length) {
+        note = '这单是本地打单 —— 预览图是店主电脑在打印时渲染的（最多前几页），源文件仍在店主电脑上。'
+      } else {
+        note = '这单是本地打单 —— 源文件只保存在店主的电脑上，云端没有副本，所以没有预览图。'
+      }
       return {
         local_only: true,
         original_name: name,
         typeIcon: this._myFileTypeIcon(name),
-        localNote: reason === 'cleaned'
-          ? '云端副本已被清理（保留期到了或手动删除过），预览图取不回来了；这单的打印参数还在，一起放在下面。'
-          : '这单是本地打单 —— 源文件只保存在店主的电脑上，云端没有副本，所以没有预览图。',
+        localNote: note,
         localRows: rows,
+        localShots: shots,
+        localPreviewFmt: 'webp',
+        localPreviewIndex: 0,
       }
+    },
+
+    /* 本地单缩略图有几页（老订单没传过 ⇒ 0，保持「只摊参数」的原样） */
+    _loadLocalThumbs(orderNumber, rawName, rowFile) {
+      const num = String(orderNumber || '')
+      const name = String(rawName || '')
+      if (!num || !name) return
+      const token = (wx.getStorageSync('token') || '')
+      request({
+        url: CONFIG.BASE_URL + '/api/local_order_thumb/info' +
+          '?order_number=' + encodeURIComponent(num) +
+          '&name=' + encodeURIComponent(name) +
+          '&token=' + encodeURIComponent(token),
+        method: 'GET',
+        success: (res) => {
+          const d = (res && res.data) || {}
+          const pages = Number(d && d.pages) || 0
+          if (!pages) return                        // 没上传过：什么都不改
+          if (!this.data.fileDetailVisible) return  // 已经关窗
+          this.setData({
+            fileDetail: this._localFileDetail(rowFile, 'local', { orderNumber: num, pages }),
+          })
+        },
+        fail: () => {},
+      })
+    },
+
+    /* 本地单缩略图翻页（只改页码角标，不重建 shots） */
+    onLocalThumbChange(e) {
+      const idx = Number(e && e.detail && e.detail.current) || 0
+      const f = this.data.fileDetail
+      if (!f || !f.local_only) return
+      this.setData({ 'fileDetail.localPreviewIndex': idx })
+    },
+
+    /* 某一页没取到（上传失败/已过期）：把它摘掉，别留一块空白在 swiper 里 */
+    onLocalThumbError(e) {
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const page = Number(ds.page) || 0
+      const f = this.data.fileDetail
+      if (!f || !Array.isArray(f.localShots) || !page) return
+      const rest = f.localShots.filter(s => Number(s.page) !== page)
+      const idx = Math.max(0, Math.min(rest.length - 1, Number(f.localPreviewIndex) || 0))
+      this.setData({
+        'fileDetail.localShots': rest,
+        'fileDetail.localPreviewIndex': idx,
+      })
     },
 
     onOpenOrderFileDetail(e) {
@@ -1961,8 +2047,11 @@ Component({
       })
       if (!fileId) {
         // 本地打单：没有云端文件，但打印参数还在这单上，别再说「已清理」
-        if (rowFile) showLocal('local')
-        else wx.showToast({ title: '这行没有可查看的文件', icon: 'none' })
+        if (!rowFile) { wx.showToast({ title: '这行没有可查看的文件', icon: 'none' }); return }
+        // 先把参数摊开（老订单没有缩略图，这一步就已经是终态），再问云端有没有打印稿缩略图；
+        // 有图会把面板重建成带 swiper 的版本（2026-11-23 用户需求）
+        showLocal('local')
+        this._loadLocalThumbs(ds.onum, rowFile.file_name || rowFile.original_name, rowFile)
         return
       }
       this.setData({
