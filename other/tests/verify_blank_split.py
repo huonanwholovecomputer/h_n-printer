@@ -174,6 +174,49 @@ check("threshold_for：人工 40% / 自动 60%",
 check("空输入不炸", blank_split.summarize([]).sheets == 0)
 
 
+# ── 1b) 文案分机型（2026-11-23 用户要求：自动双面机型不该看到「翻纸 / 白走一趟」）──
+print("\n=== 1b) 文案：人工翻纸 vs 自动双面 ===")
+check("★ describe 写明「空白页率」（不再只是裸百分比）",
+      "空白页率 71%" in blank_split.describe(stat, 0.40),
+      blank_split.describe(stat, 0.40))
+check("机型短句：人工翻纸 / 自动双面",
+      (blank_split.mode_label(True), blank_split.mode_label(False)) == ("人工翻纸", "自动双面"))
+_how_man, _good_man, _cost_man = blank_split.split_copy(True)
+_how_auto, _good_auto, _cost_auto = blank_split.split_copy(False)
+_all_man = _how_man + _good_man + _cost_man
+_all_auto = _how_auto + _good_auto + _cost_auto
+check("人工翻纸：三段都在，且点明「白走第 2 趟」「还要翻一次纸」",
+      "先打只需单面的那几个文件" in _how_man and "取走" in _how_man
+      and "白走第 2 趟" in _good_man and "翻一次纸" in _cost_man, _all_man)
+check("★ 自动双面：不提翻纸、不提「白走第 2 趟」，并明说不用翻纸",
+      "不用翻纸" in _how_auto
+      and "翻纸" not in _all_auto.replace("不用翻纸", "")
+      and "白走" not in _all_auto, _all_auto)
+check("★ 两种机型都不许说「省纸」（纸一张不多、一张不少）",
+      all(("省纸" not in t and "省一整趟纸" not in t
+           and "省一趟" not in t)
+          for t in (_how_man, _good_man, _cost_man, _how_auto, _good_auto, _cost_auto)))
+check("自动双面：代价里写清「纸一张不多、一张不少」", "一张不多" in _cost_auto, _cost_auto)
+check("取纸提示分机型：人工翻纸说「翻一次纸」、自动双面说「不用翻纸」，都要点「已取走」",
+      "翻一次纸" in blank_split.pickup_copy(True)
+      and "不用翻纸" in blank_split.pickup_copy(False)
+      and "已取走" in blank_split.pickup_copy(True)
+      and "已取走" in blank_split.pickup_copy(False),
+      blank_split.pickup_copy(False))
+
+# 确认框第一行：百分比只许出现一次（2026-11-23 现场截图里 87% 重复了两次）
+_hint = blank_split.describe(stat, 0.40)
+_head = blank_split.ask_head(_hint, stat.percent, stat.sheets, stat.blanks)
+check("★ 确认框第一行只出现一次百分比（现场截图里 87% 出现了两遍）",
+      _head.count("71%") == 1 and _head.startswith("这一单共 38 张纸"), _head)
+check("hint 为空时兜底拼一句（老调用方 / 测试桩）",
+      blank_split.ask_head("", 87.0, 30, 26)
+      == "这一单共 30 张纸，其中 26 张有一面是空白（空白页率 87%）。",
+      blank_split.ask_head("", 87.0, 30, 26))
+check("已经带「这一单」的 hint 不再重复加头",
+      blank_split.ask_head("这一单共 1 张纸。", 0.0, 1, 0) == "这一单共 1 张纸。")
+
+
 # ============================================================
 # 2) 配置往返
 # ============================================================
@@ -288,6 +331,13 @@ check("询问 payload 带齐现场数字（38 张 / 71% / 1 单面 / 3 双面）
       _out.get("ask") is not None
       and (_out["ask"]["sheets"], _out["ask"]["singles"], _out["ask"]["duplex"]) == (38, 1, 3)
       and int(round(_out["ask"]["percent"])) == 71, str(_out.get("ask")))
+check("★ 询问 payload 带「本机要不要人翻纸」（手动档案 ⇒ True，确认框据此选文案）",
+      _out.get("ask") is not None and _out["ask"].get("manual_duplex") is True,
+      str(_out.get("ask")))
+_out_auto = _decide_inline(make_worker(interactive=True, profile=AUTO), reply="split")
+check("★ 自动双面档案 ⇒ payload manual_duplex=False（文案不许提翻纸）",
+      _out_auto.get("ask") is not None
+      and _out_auto["ask"].get("manual_duplex") is False, str(_out_auto.get("ask")))
 
 _out2 = _decide_inline(make_worker(interactive=True), reply="whole")
 check("★ 询问后选「仍一次打完」⇒ 不拆（完全退回旧行为）",
@@ -322,7 +372,9 @@ w_pick.split_pickup.connect(lambda p: (_clicks.append(p), w_pick.confirm_split_p
 _ok_pick = w_pick._wait_split_pickup(stat, 25, 1)
 check("★ 取纸框回执「已取走」⇒ 放行且出纸槽台账扣掉这一叠",
       _ok_pick is True and w_pick._tray_sheets == 0 and _clicks
-      and _clicks[0]["sheets"] == 25, f"tray={w_pick._tray_sheets} {_clicks}")
+      and _clicks[0]["sheets"] == 25
+      and _clicks[0].get("manual_duplex") is True,
+      f"tray={w_pick._tray_sheets} {_clicks}")
 
 w_keep = make_worker(interactive=True)
 w_keep._tray_sheets = 25
@@ -333,6 +385,46 @@ check("「还没取走」⇒ 照打，但台账不扣（后面翻纸文案会多
 w_headless = make_worker(interactive=False)
 check("无界面交互 ⇒ 不等取纸（日志说明一句就继续）",
       w_headless._wait_split_pickup(stat, 25, 1) is True)
+
+# 出纸闸门：单面那叠**真的落进出纸槽**之前不弹「已打完」，否则操作员过去只剩三四张。
+_orig_pending = gui.count_pending_print_jobs
+_orig_wait = gui.wait_for_output
+try:
+    gui.count_pending_print_jobs = lambda *a, **k: -1
+    _t0 = time.time()
+    _skip = make_worker(interactive=True)._wait_split_output(25)
+    _dt = time.time() - _t0
+    check("★ 探测不了队列（-1）⇒ 不等，立刻返回（不凭空耗两分钟）",
+          _skip.get("skipped") is True and _dt < 1.0, f"{_dt:.2f}s {_skip}")
+
+    _calls = []
+    gui.count_pending_print_jobs = lambda *a, **k: 2
+    gui.wait_for_output = lambda *a, **k: (_calls.append(k), {"drained": True})[1]
+    _waited = make_worker(interactive=True)._wait_split_output(25)
+    check("★ 队列里还有活 ⇒ 走 wait_for_output 等排空（超时与手动双面同一个闸门）",
+          _waited.get("drained") is True and len(_calls) == 1
+          and _calls[0].get("timeout") == gui.QUEUE_GATE_TIMEOUT_SEC
+          and _calls[0].get("pages") == 25, str(_calls))
+    check("★ 等纸期间可被「取消」打断（cancel_check 必须递给 wait_for_output）",
+          callable(_calls[0].get("cancel_check")), str(_calls))
+
+    gui.count_pending_print_jobs = lambda *a, **k: 0
+    _calls.clear()
+    make_worker(interactive=True)._wait_split_output(25)
+    check("队列已空 ⇒ 也走一遍 wait_for_output（等出纸余量，纸可能还在往外吐）",
+          len(_calls) == 1, str(_calls))
+finally:
+    gui.count_pending_print_jobs = _orig_pending
+    gui.wait_for_output = _orig_wait
+
+# wait_for_output 的 cancel_check 本身（真函数，不桩）：取消时立刻返回、不睡余量
+_t0 = time.time()
+_res_cancel = pdf_printer.wait_for_output("Fake Print", pages=25, timeout=90.0,
+                                          cancel_check=lambda: True)
+_dt_cancel = time.time() - _t0
+check("★ wait_for_output(取消) ⇒ 立刻返回、不睡出纸余量、不耗 timeout",
+      _res_cancel.get("interrupted") is True and _res_cancel.get("margin_seconds") == 0.0
+      and _dt_cancel < 2.0, f"{_dt_cancel:.2f}s {_res_cancel}")
 
 
 # ============================================================
@@ -649,6 +741,9 @@ for _name, _needle in [
     ("回执 confirm_split_pickup", "def confirm_split_pickup("),
     ("判定 _blank_split_decision", "def _blank_split_decision("),
     ("等取纸 _wait_split_pickup", "def _wait_split_pickup("),
+    ("等出纸 _wait_split_output", "def _wait_split_output("),
+    ("机型判据 _manual_flip_machine", "def _manual_flip_machine("),
+    ("取纸前先等队列排空", "self._wait_split_output(sheets)"),
     ("分组打印 _print_grouped", "def _print_grouped("),
     ("主线程 _on_blank_split_ask", "def _on_blank_split_ask("),
     ("主线程 _on_split_pickup", "def _on_split_pickup("),
@@ -674,6 +769,52 @@ check("blank_split.py 不 import 打印栈（纯逻辑，可单测）",
 check("空白页率只在 blank_split.py 算（GUI 里没有第二套除法）",
       "blank_slots_first + plan.blank_slots_second" not in gui_src)
 check("对话框阈值用百分数输入（1~100）", "setRange(1, 100)" in gui_src)
+# 2026-11-23 用户当场指出：拆单不省纸（空白背面拆不拆都在）。GUI 与 blank_split 都不许
+# 再把"省纸/省一整趟纸"写进用户能看到的文案。
+def _claims_saving(text: str) -> bool:
+    """文案里有没有"拆单能省"的错口径（「不省纸」「纸不省」这种否定说法不算）。"""
+    for _neg in ("不省纸", "不省一趟", "不省一整趟纸", "纸不省"):
+        text = text.replace(_neg, "")
+    return any(_bad in text for _bad in ("省一整趟纸", "省纸", "省一趟"))
+
+
+def _user_facing_literals(source: str, names) -> list:
+    """扫 gui.py 里**用户能看到**的字符串字面量（跳过 docstring / 注释）。
+
+    只扫空白页率这三处：确认框 `_on_blank_split_ask`、取纸框 `_on_split_pickup`、
+    设置框 `BlankSplitDialog`。整份文件里别处的"省纸"（比如"内容顶齐更省纸"、
+    压空白槽位的注释）与拆单无关，不能一起判死 —— 这也是静态锚点只用 ASCII 标识符的
+    同一条理由：拿中文文案当契约会让无关改动变成假失败。
+    """
+    import ast as _ast
+    tree = _ast.parse(source)
+    docs = set()
+    for _n in _ast.walk(tree):
+        if isinstance(_n, (_ast.Module, _ast.ClassDef, _ast.FunctionDef,
+                           _ast.AsyncFunctionDef)) and _n.body:
+            if isinstance(_n.body[0], _ast.Expr) and isinstance(_n.body[0].value, _ast.Constant) \
+                    and isinstance(_n.body[0].value.value, str):
+                docs.add(id(_n.body[0].value))
+    out = []
+
+    def _walk(node, inside):
+        if isinstance(node, (_ast.ClassDef, _ast.FunctionDef, _ast.AsyncFunctionDef)):
+            inside = inside or node.name in names
+        if isinstance(node, _ast.Constant) and isinstance(node.value, str) \
+                and inside and id(node) not in docs:
+            out.append(node.value)
+        for _ch in _ast.iter_child_nodes(node):
+            _walk(_ch, inside)
+
+    _walk(tree, False)
+    return out
+
+
+_SPLIT_LITS = _user_facing_literals(
+    gui_src, ("_on_blank_split_ask", "_on_split_pickup", "BlankSplitDialog"))
+check("★ 拆单三处界面文案里没有「省纸 / 省一趟」的错口径",
+      len(_SPLIT_LITS) >= 8 and not any(_claims_saving(t) for t in _SPLIT_LITS),
+      [t[:40] for t in _SPLIT_LITS if _claims_saving(t)])
 
 
 print()

@@ -131,7 +131,7 @@ import agent_ops  # 控制接口的 op 实现（建页/加文件/改参数/打�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.7.1"
+APP_VERSION = "4.7.2"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -3789,15 +3789,18 @@ class BlankSplitDialog(QDialog):
     """选项 → 空白页率拆单…：空白页率多高时把一单拆成两次打（2026-11-23 用户需求）。
 
     为什么要有它：一单里混着「整份只需要单面」和「需要双面」的文件时，单面文件每页各占
-    一张纸、背面全空；若再和双面文件一起走两趟手动双面，那些空背面就是白费的纸和一趟
-    拆纸。空白页率 = 「有一面是空白的纸张数 / 这一单总张数」（口径见 blank_split.py）。
-    达到阈值就把这单拆成：先打只需单面的文件 → 操作员把这一叠取走 → 再打需要双面的文件。
+    一张纸、背面全空。空白页率 = 「有一面是空白的纸张数 / 这一单总张数」（口径见
+    blank_split.py）。达到阈值就把这单拆成：先打只需单面的文件 → 操作员把这一叠取走 →
+    再打需要双面的文件。
 
-    两个阈值分开设，因为代价不同：
-      · 人工翻纸（不支持自动双面的机型）：拆单能省一整趟纸，代价是要多到机器前取一次纸
-        ⇒ 默认 40%；
-      · 自动双面机型：驱动会自己跳过空白背面，拆单省不到「白走的纸」，只省「纸叠混在
-        一起、取纸要数」⇒ 默认更高，60%。
+    **两种机型都支持**，收益不同（确认框文案也按机型分开，见 `blank_split.split_copy`）：
+      · 人工翻纸（不支持自动双面）：单面那几份在「一次打完」里要陪着双面那叠走第 2 趟
+        （那些槽位打的是空白占位页）⇒ 拆开就不白走这一趟，代价是取一次纸 + 翻一次纸，
+        所以阈值低一些（默认 40%）；
+      · 自动双面：双面由驱动/硬件一次成型、不用翻纸，也没有"白走第 2 趟"这回事 ⇒ 拆开
+        只买「两叠分开、单面那叠先出来」，收益小一些，所以阈值高一些（默认 60%）。
+    ⚠ 两种机型都**不省纸**：空白背面在拆与不拆时都存在（纸一张不多、一张不少）。
+      别把文案写成"能省纸"（2026-11-23 用户当场指出口径）。
     """
 
     def __init__(self, parent=None, ask: bool = True, threshold_manual: float = 0.40,
@@ -3831,7 +3834,8 @@ class BlankSplitDialog(QDialog):
         self._th_manual.setSuffix(" %")
         self._th_manual.setValue(int(round(float(threshold_manual) * 100)))
         self._th_manual.setToolTip("不支持自动双面（需要手动翻纸）的机型：达到这个空白页率就拆。"
-                                   "拆一次能省一整趟纸，所以阈值低一些")
+                                   "拆开后单面那叠不必白走第 2 趟（纸不省，省的是这一趟），"
+                                   "所以阈值低一些")
         _hide_spin_buttons(self._th_manual)
         f.addRow("人工翻纸机型 ≥", self._th_manual)
 
@@ -3840,8 +3844,9 @@ class BlankSplitDialog(QDialog):
         self._th_auto.setSingleStep(5)
         self._th_auto.setSuffix(" %")
         self._th_auto.setValue(int(round(float(threshold_auto) * 100)))
-        self._th_auto.setToolTip("支持自动双面的机型：驱动本来就跳过空白背面，拆单只省「纸叠混在"
-                                 "一起」的麻烦，所以阈值高一些")
+        self._th_auto.setToolTip("支持自动双面的机型：双面一次成型、不用翻纸，拆开只买「两叠"
+                                 "分开、单面那叠先出来」（纸同样一张不多、一张不少），"
+                                 "所以阈值高一些")
         _hide_spin_buttons(self._th_auto)
         f.addRow("自动双面机型 ≥", self._th_auto)
 
@@ -3852,7 +3857,9 @@ class BlankSplitDialog(QDialog):
         lay.addWidget(g)
 
         hint = QLabel("例：25 页单面 + 三个各 7~9 页的双面文件 ⇒ 38 张纸里有 27 张的背面是空的"
-                      "（71%），人工翻纸机型会拆成「先打那 25 张单面 → 取走 → 再打双面文件」。"
+                      "（71%）。人工翻纸机型会拆成「先打那 25 张单面 → 取走 → 再打双面文件"
+                      "（打完翻一次纸）」；自动双面机型同样拆，只是让单面那一叠先出来、"
+                      "不用翻纸。两种机型纸都是一张不多、一张不少。"
                       "攒批整叠不适用这一项（整叠本来就要落机对账）。")
         hint.setWordWrap(True)
         hint.setStyleSheet("font-size: 11px; color: #7f8c8d;")
@@ -4372,11 +4379,14 @@ class PrintWorker(QThread):
     # 只有"后面还排着别的单"时才会发——那时 worker 不阻塞等出纸（见 stack_more_pending）。
     stack_entry_drained = Signal(int, int, float)
     # ── 空白页率拆单（2026-11-23 用户需求，口径见 blank_split.py）──
-    # payload = dict：{hint, stat, threshold, sheets, blanks, percent, singles, duplex}
-    # 主线程弹确认框 → worker.confirm_blank_split("split"/"whole", remember=…)。
+    # payload = dict：{hint, stat, threshold, sheets, blanks, percent, singles, duplex,
+    #                  manual_duplex} —— manual_duplex=True 表示本机双面要人翻纸；
+    # 确认框的「怎么做/好处/代价」按它选文案（自动双面机型没有翻纸这回事，见
+    # blank_split.split_copy）。主线程弹确认框 →
+    # worker.confirm_blank_split("split"/"whole", remember=…)；
     # worker 在此期间阻塞等待（与 flip_required 同一套回执范式）。
     blank_split_ask = Signal(object)
-    # payload = dict：{hint, sheets, singles, blanks} —— 单面那一叠已打完，请操作员取走；
+    # payload = dict：{hint, sheets, files, manual_duplex} —— 单面那一叠已打完，请操作员取走；
     # 主线程回执 worker.confirm_split_pickup(taken=True/False)；taken=False 照打不误。
     split_pickup = Signal(object)
 
@@ -4668,6 +4678,18 @@ class PrintWorker(QThread):
             return not self._simplex_covers_all(job)
         return bool(job.duplex == "on" and p is not None
                     and p.auto_duplex is False and p.manual_duplex)
+
+    def _manual_flip_machine(self) -> bool:
+        """本机双面是不是靠**人翻纸** —— 决定拆单文案说「要不要翻纸」。
+
+        只看机型、不看这一单怎么打：拆单确认框讲的"接下来会发生什么"是机器行为，
+        不是这一单的页序细节。档案明确 `auto_duplex=False` 且 `manual_duplex=True` 才算
+        人工翻纸；档案缺失（能力未确认）按"驱动双面"处理 —— 与 `_uses_manual_duplex`
+        的兜底一致（宁可说"不用翻纸"，也不要在自动双面机上教操作员翻纸，
+        2026-11-23 用户现场指出）。
+        """
+        p = self._manual_profile
+        return bool(p is not None and p.auto_duplex is False and p.manual_duplex)
 
     def _estimate_first_pass(self, sheets: int) -> float:
         """第 1 趟预估秒数（档案里实测样本 → a + b·n；没样本就是保守默认值）。
@@ -6232,7 +6254,11 @@ class PrintWorker(QThread):
             copies=max(1, int(copies or 1))), dup
 
     def _ask_blank_split(self, stat, hint: str) -> tuple[str, bool]:
-        """worker → 主线程弹确认框（阻塞等回执）；被取消 ⇒ ("", False)。"""
+        """worker → 主线程弹确认框（阻塞等回执）；被取消 ⇒ ("", False)。
+
+        `manual_duplex` 一起发过去：确认框的「怎么做 / 好处 / 代价」按机型选文案
+        （自动双面机型没有翻纸这回事，见 `blank_split.split_copy`）。
+        """
         self._split_ask_reply = ""
         self._split_ask_remember = False
         self._split_ask_event.clear()
@@ -6244,6 +6270,7 @@ class PrintWorker(QThread):
             "percent": float(stat.percent),
             "singles": len(stat.simplex_labels),
             "duplex": len(stat.duplex_labels),
+            "manual_duplex": self._manual_flip_machine(),
         })
         while True:
             if self._split_ask_event.wait(0.2):
@@ -6290,8 +6317,10 @@ class PrintWorker(QThread):
         if not blank_split.should_split(stat, self._blank_threshold):
             return None
         hint = blank_split.describe(stat, self._blank_threshold)
+        manual = self._manual_flip_machine()
         self.log_message.emit(
-            f"  ℹ 空白页率检查：{hint} 达到阈值 ⇒ 建议拆成两次打印")
+            f"  ℹ 空白页率检查：{hint} 达到阈值 ⇒ 建议拆成两次打印"
+            f"（{blank_split.mode_label(manual)}机型）")
         if not self._blank_split_interactive:
             # 没有界面 = 机器前没有人等着取纸。拆单的全部目的就是「先打单面 → 操作员
             # 把这叠取走 → 再打双面」；无人值守时拆了只会把一单变成两段没人接手的打印，
@@ -6312,8 +6341,34 @@ class PrintWorker(QThread):
         self.log_message.emit(
             f"  ⇄ 拆成两次打印：先打 {len(singles)} 个只需单面的文件"
             f"（{stat.simplex_sheets} 张）→ 取走 → 再打 {len(stat.duplex_labels)} 个"
-            f"需要双面的文件（{stat.duplex_sheets} 张）")
+            f"需要双面的文件（{stat.duplex_sheets} 张）"
+            + ("；双面那叠打完要翻一次纸" if manual else "；自动双面，不用翻纸"))
         return singles, rest_ids, stat
+
+    def _wait_split_output(self, sheets: int) -> dict:
+        """单面组**真的出纸**之后再请操作员取纸（队列排空 + 一小段出纸余量）。
+
+        为什么要等：`print_pdf` 只等到"驱动把作业收下"，主机型打印机（LaserJet 1020 一类）
+        的 spooler 作业在数据写进端口后就消失，纸还在以 14ppm 往外吐。这时弹「已经打完
+        （约 25 张），正落在出纸槽里」，操作员跑过去只会抽到三四张，剩下的被他一并带走 ——
+        后面双面那叠就乱了。判据与手动双面的翻纸提示同一条（`pdf_printer.wait_for_output`）。
+
+        探测不了队列（`count_pending_print_jobs` 返回 <0：没有 win32print / 假打印机 /
+        非 Windows）就**不等**：宁可弹一句「请取走」，也不要为一个不知道的打印机干等两分钟。
+        """
+        try:
+            pending = int(count_pending_print_jobs(self._printer_name))
+        except Exception:
+            pending = -1
+        if pending < 0:
+            return {"drained": False, "queue_seconds": 0.0, "margin_seconds": 0.0,
+                    "skipped": True}
+        # pages 只用来估算"出纸余量"（每张 1s、上限 4s），不是硬等；
+        # cancel_check 让操作员点「取消」时不必等到 timeout 才响应。
+        return wait_for_output(self._printer_name, pages=int(sheets),
+                               timeout=QUEUE_GATE_TIMEOUT_SEC,
+                               margin_per_page=1.0, margin_max=4.0, settle=1.5,
+                               cancel_check=lambda: bool(self._cancelled))
 
     def _wait_split_pickup(self, stat, sheets: int, files: int) -> bool:
         """单面组打完 → 等操作员把那一叠取走（画面点击即放行）。False = 被取消。"""
@@ -6321,12 +6376,18 @@ class PrintWorker(QThread):
             self.log_message.emit(
                 "  ℹ 单面那几份文件已打完，接着打双面文件（无界面交互，不等取纸）")
             return True
+        # 先等这一叠真的落到出纸槽（否则弹框写着"已打完"，人过去只剩三四张）
+        self._wait_split_output(sheets)
+        if self._cancelled:
+            return False
+        manual = self._manual_flip_machine()
         self._pickup_taken = True
         self._pickup_event.clear()
         self.split_pickup.emit({
             "hint": blank_split.describe(stat, self._blank_threshold),
             "sheets": int(sheets),
             "files": int(files),
+            "manual_duplex": manual,
         })
         while True:
             if self._pickup_event.wait(0.2):
@@ -20185,9 +20246,10 @@ class MainWindow(QMainWindow):
     # 回执走 worker.confirm_blank_split / worker.confirm_split_pickup（与翻纸窗同一范式：
     # worker 发信号 → 主线程模态框 → 点按钮回执 → worker 解除阻塞）。
     def _on_blank_split_ask(self, payload=None):
-        """Worker 问：这一单空白页率偏高，要不要拆成两次打？"""
+        """Worker 问：这一单空白页率偏高，要不要拆成两次打？（文案按机型分开）"""
         p = payload if isinstance(payload, dict) else {}
         hint = str(p.get("hint") or "")
+        manual = bool(p.get("manual_duplex", True))
         try:
             percent = float(p.get("percent") or 0.0)
         except (TypeError, ValueError):
@@ -20197,12 +20259,15 @@ class MainWindow(QMainWindow):
         box = QMessageBox(self)
         box.setWindowTitle("空白页率偏高")
         box.setIcon(QMessageBox.Question)
-        box.setText("这一单的空白页率约 %.0f%%（%s）\n只需单面的文件 %d 个，需要双面的文件 %d 个。"
-                    % (percent, hint, singles, duplex))
-        box.setInformativeText(
-            "拆成两次打：先打只需单面的那几个文件 → 你把这一叠取走 → 再打需要双面的文件。\n"
-            "好处：单面文件不必陪着双面文件白走一趟，两叠也不会混在一起。\n"
-            "代价：这一单会变成两个打印作业，需要你到机器前取一次纸。")
+        # `hint` 里已经写着「空白页率 X%（阈值 Y%）」，这里只补「这一单」这个头 ——
+        # 别再把百分比拼一遍（2026-11-23 现场截图里 87% 出现了两次，就是这么来的）。
+        box.setText("%s\n只需单面的文件 %d 个，需要双面的文件 %d 个。"
+                    % (blank_split.ask_head(hint, percent,
+                                            int(p.get("sheets") or 0),
+                                            int(p.get("blanks") or 0)),
+                       singles, duplex))
+        how, good, cost = blank_split.split_copy(manual)
+        box.setInformativeText("%s\n%s\n%s" % (how, good, cost))
         btn_split = box.addButton("拆成两次（推荐）", QMessageBox.AcceptRole)
         btn_whole = box.addButton("仍一次打完", QMessageBox.RejectRole)
         cb = ThemedCheckBox("以后不再问：空白页率达到阈值直接拆",
@@ -20231,6 +20296,7 @@ class MainWindow(QMainWindow):
     def _on_split_pickup(self, payload=None):
         """单面组打完：请操作员把那一叠取走，再打双面组（不取也照打，只是台账不抹）。"""
         p = payload if isinstance(payload, dict) else {}
+        manual = bool(p.get("manual_duplex", True))
         try:
             sheets = int(p.get("sheets") or 0)
             files = int(p.get("files") or 0)
@@ -20242,7 +20308,7 @@ class MainWindow(QMainWindow):
         box.setText("只需单面的 %d 个文件已经打完（约 %d 张），正落在出纸槽里。"
                     % (files, sheets))
         box.setInformativeText(
-            "请把这一叠取走，再点「已取走」—— 接下来打的是需要双面的文件。\n"
+            blank_split.pickup_copy(manual) + "\n"
             "不取也能继续打，只是双面那几份会压在上面，取纸时容易混。")
         btn_taken = box.addButton("已取走，继续打双面文件", QMessageBox.AcceptRole)
         btn_later = box.addButton("还没取走，照打", QMessageBox.RejectRole)

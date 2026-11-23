@@ -1305,7 +1305,8 @@ def estimate_manual_duplex_sides(page_count: int, copies: int, page_range: str =
 
 def wait_for_output(printer_name: str = "", pages: int = 0, timeout: float = 120.0,
                     margin_per_page: float = 1.5, margin_floor: float = 1.0,
-                    margin_max: float = 6.0, settle: float = 2.0) -> dict:
+                    margin_max: float = 6.0, settle: float = 2.0,
+                    cancel_check=None) -> dict:
     """等这一趟的纸出完（队列排空 + 一小段出纸余量）。手动双面"翻纸"提示前调用。
 
     为什么要等：GDI 的 EndDoc 只表示"提交完"；像 LaserJet 1020 这种主机型打印机，spooler
@@ -1320,14 +1321,21 @@ def wait_for_output(printer_name: str = "", pages: int = 0, timeout: float = 120
       真丢纸的 —— 操作员照"从出纸槽中取出纸叠"整叠搬进纸盘 2，多出来那张就出不来了。
 
     Returns: 仅用于日志的诊断 dict（本函数不抛异常，探测失败也照样睡余量）。
+
+    `cancel_check`：可选的 `() -> bool`，每 0.4 秒问一次；一旦为真立刻返回
+    （`interrupted=True`，余量也不睡）—— 否则操作员在等纸期间点了「取消」，界面要
+    一直卡到 timeout 才响应（空白页率拆单的取纸闸门就踩这个）。
     """
     out = {"drained": False, "queue_seconds": 0.0, "margin_seconds": 0.0,
-           "peak_jobs": 0, "detail": ""}
+           "peak_jobs": 0, "detail": "", "interrupted": False}
     t0 = time.time()
     try:
         import win32print
         printer = printer_name or win32print.GetDefaultPrinter()
         while time.time() - t0 < timeout:
+            if cancel_check is not None and cancel_check():
+                out["interrupted"] = True
+                break
             handle = win32print.OpenPrinter(printer)
             try:
                 try:
@@ -1344,6 +1352,10 @@ def wait_for_output(printer_name: str = "", pages: int = 0, timeout: float = 120
     except Exception as e:
         out["detail"] = f"{type(e).__name__}: {e}"
     out["queue_seconds"] = round(time.time() - t0, 1)
+    if cancel_check is not None and cancel_check():
+        out["interrupted"] = True
+    if out["interrupted"]:
+        return out
     margin = (min(margin_max, max(margin_floor, pages * margin_per_page)) + settle) if pages > 0 \
         else settle
     out["margin_seconds"] = round(margin, 1)
