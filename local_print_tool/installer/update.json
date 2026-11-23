@@ -1,9 +1,9 @@
 {
-  "version": "4.7.0",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.0.exe",
-  "md5": "bbfced11ba8c49ef3c4b6c2e712c81d8",
-  "sha256": "d7cf3d1c62c90b5fed01aafa6ed004e7a4a2870dde1f57b974e53e469fe3aa9d",
-  "notes": "v4.7.0：这次是功能版。① 升级通道变了：默认从 GitHub Release 下载，国内慢的时候可以用「下载码」走云端加速；帮助菜单里能看到当前内部下载码。② 打印前的字体检查改成和文件列表同一判据——本机已经装了的字体不再弹「缺少字体」，同一个字体也不会重复列两遍。③ 手动双面的第 2 趟还在出纸时，任何新任务都会在送纸前停下来确认，不会再插队搅乱上一单的背面；第 1 趟的等待时间按张数放宽，不会纸还在出就宣布打完。④ 云端无障碍多文件订单会等所有文件下载齐再一次性建页开打，不再边下边打。⑤ 缩略图改用实际打印的那份本地 PDF 渲染多页；结算页的文件预览支持缩放、平移和翻页。",
+  "version": "4.7.1",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.1.exe",
+  "md5": "106290d191d435929019b41ca4341e3d",
+  "sha256": "9061f7fed9b0d39d86b425fb76a1d2cb94daa27b6124d6ee9d47785129b3865a",
+  "notes": "v4.7.1：① 从 WinRAR / Bandizip / 7-Zip 直接把文件拖进窗口不再报「工作副本不可用」（拖放那一刻就搬进暂存副本）。② 新增「空白页率拆单」：单面与双面文件混打、背面空着的纸太多时（人工翻纸 ≥40%、自动双面 ≥60%，可在「选项 → 空白页率拆单…」改）先问一句，选拆就把只需单面的先打完、取走，再打双面的。③ 打印列表可排队：上一批在打时点「开始打印」不再被拒，而是排进「🖨 打印列表」，前面打完自动接上；支持上移 / 置顶 / 移出队列 / 继续队列，并会落盘，重启后点「继续队列」才开打。正在打的那条不能删不能移。④ 本地单也有预览图了：打印本地单时把前几页缩略图回传云端，小程序「我」页与「我的订单」的文件详情可翻看；老订单没有图时照旧显示说明文字。",
   "sig_algo": "ed25519",
-  "sig": "6nH4o4qDS8mNt5dyrtPhoHNi59F7nQcWl6eVOdq409rVTan4MfwlsU7A9uQ2zbZhlPfr4khV5zIBwbCr1oK1Dw=="
+  "sig": "dF+Xn4erZ0lf+chTFao86jAPwYI5KfrXmfzvaEISc7tR1SAixYqfbWdOKlIOc6nIzLpbtfdKbCVlcXHtZA0pBw=="
 }

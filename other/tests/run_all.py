@@ -153,17 +153,11 @@ NOT_A_TEST = {"_pick_js_rounding.py"}
 #   verify_apk_version_manifest.py / verify_apk_published.py 三件套全绿 ⇒ 按约定删除本条。
 #   （同批还删掉了云端 Word 引擎的「☁ LO / ☁ Word」设备开关 —— 小程序/APP 侧一并清理。）
 # 2026-11-23（本地单缩略图回传云端：移动端详情卡能翻页预览）：改了
-#   www/{me.js,styles.css}（本地单详情加缩略图块 + 样式）与小程序侧多处 ⇒ APK 内
-#   web 资源与 www/ 不再逐字节一致。当前口径是「先提交不发版」（用户 2026-11-23 明确要求），
-#   APK 未重打 ⇒ 登记过渡项。**解除条件**：走 mobile_apps/android_app/build-release-apk.ps1
-#   重打并发布 APK（日志须含「Copying web assets from www」），三件套
-#   （verify_apk_release / verify_apk_version_manifest / verify_apk_published）全绿后删除本条。
-EXPECTED_RED: dict[str, str] = {
-    "verify_apk_release.py": (
-        "www/{me.js,styles.css} 已改（本地单缩略图）、APK 未重打 ⇒ APK 内 web 资源与 www/ "
-        "不再逐字节一致。重打并发布 APK 后删除本条。"
-    ),
-}
+#   www/{me.js,styles.css} 与小程序侧多处。**已解除**：APK **1.1.73**（versionCode 74，
+#   md5 cbda30e806b9f3b80f4d0a9c3abaf5c7）已按 build-release-apk.ps1 重打并发布（日志含
+#   「Copying web assets from www」），verify_apk_release.py / verify_apk_version_manifest.py /
+#   verify_apk_published.py 三件套全绿 ⇒ 按约定删除本条。
+EXPECTED_RED: dict[str, str] = {}
 
 PY_EXTS = {".py"}
 JS_EXTS = {".js", ".mjs"}
