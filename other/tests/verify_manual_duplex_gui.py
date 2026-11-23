@@ -1208,6 +1208,27 @@ class _BusyWin:
         self._worker = worker
         self._print_starting = False
         self.logs = []
+        # 打印列表（2026-11-23 用户需求）：忙时**不再直接拒绝**，新单排进队列。
+        # 替身要给真实的 `_enqueue_print_batch` / `_save_print_queue` 提供队列容器与落盘钩子。
+        self._print_queue = []
+        self._print_queue_seq = 0
+        self._print_queue_draining = False
+        self._config = PrinterConfig()
+        self._config.tabs = {}
+
+    _print_busy_state = gui.MainWindow._print_busy_state
+    _queue_index_of_tab = gui.MainWindow._queue_index_of_tab
+    _enqueue_print_batch = gui.MainWindow._enqueue_print_batch
+    _save_print_queue = gui.MainWindow._save_print_queue
+
+    def _save_config(self, *a, **k):
+        pass
+
+    def _refresh_tab_display(self):
+        pass
+
+    def _sync_local_queue(self):
+        pass
 
     def _has_members(self):
         return True
@@ -1322,9 +1343,10 @@ try:
     check("★ 翻纸提示里明确警告「别插单」（第 2 趟要接着这叠纸打）",
           "不要让别的打印任务插进来" in (_rec.flip[0] if _rec.flip else ""), "")
     _fake = _BusyWin(_w)
-    check("★ 此时点「开始打印」被拒（_start_print_worker → False + 忙碌日志，不会真的开打）",
-          gui.MainWindow._start_print_worker(_fake, [make_job(PDF5)]) is False
-          and any("已有打印任务正在进行" in m for m in _fake.logs), f"{_fake.logs}")
+    check("★ 此时点「开始打印」：不真的开打，而是排进打印列表（2026-11-23 用户需求：忙也要能加）",
+          gui.MainWindow._start_print_worker(_fake, [make_job(PDF5)]) is True
+          and len(_fake._print_queue) == 1
+          and any("已加入打印列表" in m for m in _fake.logs), f"{_fake.logs}")
     _w.confirm_flip(True)
     _fin_deadline = time.time() + 60
     while _w.isRunning() and time.time() < _fin_deadline:
@@ -1863,9 +1885,10 @@ check("★ 第 2 趟放行只认操作员点击（早回报既不冻结计时、
       and "w = self._wait_pass1_output(n1, timeout=_p1_timeout)" in src
       and "_p1_timeout = max(120.0, float(_p1_est) * 1.2 + 30.0)" in src
       and "interrupted" in src)
-check("★ 半成品补救在跑时禁止新单启动（插单会与第 2 趟串页）",
-      "_remedy_worker is not None and self._remedy_worker.isRunning()" in
-      src.split("def _start_print_worker", 1)[1].split("    def ", 1)[0])
+check("★ 半成品补救在跑时禁止新单抢驱动（2026-11-23 起改为排进打印列表排队）",
+      '("_remedy_worker", "半成品补打")' in src
+      and "_busy = self._print_busy_state()" in src
+      and "return self._enqueue_print_batch(flat_jobs, tab_key, _busy)" in src)
 check("★ 补救失败时按『是否已送印』升级 stage（开打过背面 → 只能整单重打/作废）",
       "self._printed_any = True" in src
       and "_stage = duplex_remedy.STAGE_PASS2_PARTIAL" in src

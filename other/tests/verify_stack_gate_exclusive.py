@@ -155,7 +155,7 @@ gate2 = win2._stack_gate([make_job(202)], "1")
 check("闸门返回 entry（攒批仍可连续收多单）", gate2 == "entry", f"实为 {gate2!r}")
 check("没有误排队", len(win2._stack_wait) == 0, f"{len(win2._stack_wait)}")
 
-print("\n=== 3. 🔴-3② 第 2 趟在飞 ⇒ _start_print_worker 必须拒绝启动 ===")
+print("\n=== 3. 🔴-3② 第 2 趟在飞 ⇒ 新单绝不插进驱动（2026-11-23 起改为排进「打印列表」）===")
 win3 = new_win()
 win3._stack_flush_worker = _StubWorker(True)
 win3._worker = None
@@ -174,9 +174,17 @@ try:
     started = win3._start_print_worker([make_job(303)], tab_key="1")
 except RuntimeError:
     started = None
-check("返回 False（被拒）", started is False, f"实为 {started!r}")
-check("没有越过忙判断（改前：会一路走到 _sync_ui_to_config 并真的启动打印）",
+check("返回 True（已受理：排进打印列表，不再直接拒绝）", started is True, f"实为 {started!r}")
+check("这一批真的进了打印列表", len(getattr(win3, "_print_queue", []) or []) == 1,
+      f"{getattr(win3, '_print_queue', None)!r}")
+check("没有越过忙判断（绝不与整叠第 2 趟并发塞驱动 ⇒ 串页）",
       not reached, f"reached={len(reached)}")
+# 清场：入队会落盘（真实行为），别让后面的窗口从磁盘把这一项捡回来 ——
+# 否则 `_local_queue_rows` 多一行「排队中」，底部攒批入口的显隐断言会跟着变。
+win3._print_queue = []
+win3._config.print_queue = []
+win3._save_print_queue()
+check("清场：打印列表已清空并落盘", not win3._print_queue and not win3._config.print_queue)
 
 print("\n=== 4. 🔴-3③ 纸叠未完成 ⇒ 打印速度校准必须被拒（测速要打 11 张纸）===")
 win4 = new_win()

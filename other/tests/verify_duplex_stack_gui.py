@@ -1404,7 +1404,7 @@ check("worker：攒批第 1 趟有异常兜底（异常也必须报 entry_done�
       "self.stack_entry_done.emit(self._stack_seq, False, msg, 0)" in G)
 check("主窗口：闸门在「忙」判断之前（排队不算启动失败）",
       G.index("gate = self._stack_gate(flat_jobs, tab_key)") < G.index(
-          "已有打印任务正在进行，不能重复启动"))
+          "_busy = self._print_busy_state()"))
 # 2026-10-20（用户要求）：攒批不再复用「手动双面」窗 —— 第 1 趟不弹窗/不计时，
 # 第 2 趟与放弃整叠都从攒批列表发起（数纸确认 → 打整叠）。
 check("★ 双面窗里不许再出现攒批状态/信号（它只管单任务）",

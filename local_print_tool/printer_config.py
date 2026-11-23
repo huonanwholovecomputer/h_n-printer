@@ -737,6 +737,40 @@ def _scale_pair(data) -> tuple[str, int]:
     return normalize_scale(src.get("scale_mode"), src.get("scale_percent"))
 
 
+def _sanitize_print_queue(raw) -> list[dict]:
+    """把「打印队列」的落盘形态收敛成干净的 list[dict]（老配置/坏数据 ⇒ []）。
+
+    只留白名单键；`jobs` 必须是「非空的 list[dict]」—— 空批次排进队列只会在恢复后
+    卡住队首（它永远打不出纸，也不会自己消失）。`resume` 缺省按 True：从磁盘捡回来的
+    批次一律要求操作员点一次「▶ 继续队列」，不能让程序自己在开机时出纸。
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        jobs = [dict(j) for j in (it.get("jobs") or []) if isinstance(j, dict)]
+        if not jobs:
+            continue
+        try:
+            _id = int(it.get("id") or 0)
+        except (TypeError, ValueError):
+            _id = 0
+        try:
+            _created = float(it.get("created") or 0.0)
+        except (TypeError, ValueError):
+            _created = 0.0
+        out.append({
+            "id": _id,
+            "tab": str(it.get("tab") or ""),
+            "created": _created,
+            "resume": bool(it.get("resume", True)),
+            "jobs": jobs,
+        })
+    return out
+
+
 # ── 默认任务参数（2026-11 用户需求 #11b / #10；2026-11-13 收窄生效范围）──────
 # 「选项 → 默认任务参数…」里配的这一份是**表格与图片**的默认值（Word/PDF 不吃）：
 #   · `PrinterConfig.paper_size` 只在**表格 / 图片**出纸时交给打印管线
@@ -1631,6 +1665,15 @@ class PrinterConfig:
     blank_split_ask: bool = True
     blank_split_threshold_manual: float = 0.40
     blank_split_threshold_auto: float = 0.60
+    # ---- 打印队列（2026-11-23 用户需求）----
+    # 打印机正忙时点「开始打印」不再被拒绝，而是把这一批排进「🖨 打印列表」，等前面打完自动接上。
+    # 这里存的是**尚未开始**的本地手工批次（云端自动打印/补打/预约不进这里 —— 它们有各自的
+    # parking 与出纸槽对账语义），落盘形态：
+    #   [{"id": 序号, "tab": 标签页键, "created": 时间戳, "resume": bool,
+    #     "jobs": [PrintJob.to_dict(), ...]}]
+    # resume=True ⇒ 上次退出时没来得及打的批次：恢复后**必须**由操作员点「▶ 继续队列」才开打
+    # （开机就自己出纸，等于把一叠没人看着的纸打坏）。老配置没有这个键 ⇒ 空队列，零回归。
+    print_queue: list[dict] = field(default_factory=list)
 
     def blank_split_threshold(self, auto_duplex: bool) -> float:
         """按机型取空白页率阈值（已夹到 (0, 1]；坏值回落默认）。"""
@@ -1735,6 +1778,8 @@ class PrinterConfig:
             "blank_split_ask": bool(self.blank_split_ask),
             "blank_split_threshold_manual": self.blank_split_threshold(False),
             "blank_split_threshold_auto": self.blank_split_threshold(True),
+            # 打印队列（老配置没有这个键 ⇒ 空队列；jobs 已是 PrintJob.to_dict 的形态）
+            "print_queue": _sanitize_print_queue(self.print_queue),
         }
 
     @classmethod
@@ -1824,6 +1869,8 @@ class PrinterConfig:
                 data.get("blank_split_threshold_manual"), 0.40, float),
             blank_split_threshold_auto=_num_or_default(
                 data.get("blank_split_threshold_auto"), 0.60, float),
+            # 打印队列：坏数据/空批次一律丢弃（见 _sanitize_print_queue）
+            print_queue=_sanitize_print_queue(data.get("print_queue")),
         )
 
     def save(self, path: str) -> None:

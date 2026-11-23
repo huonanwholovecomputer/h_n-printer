@@ -2098,6 +2098,12 @@ class StackQueueDialog(QDialog):
     # 关闭（「关闭」按钮 / 窗口 ×）：本窗**不自己隐藏**，交给主窗口决定 ——
     # 左栏还有没打第 2 趟的纸时，主窗口会先弹确认（保留 / 放弃整叠 / 取消）。
     close_requested = Signal()
+    # 打印列表的行级操作（2026-11-23 用户需求）：(action, queue_id)
+    #   "up"   / "top"   —— 排队中的本机批次前移一位 / 置顶
+    #   "del"            —— 从队列里移出（不删文件）
+    #   "resume_all"     —— 「▶ 继续队列」：把上次退出遗留的批次放行（queue_id 恒为 0）
+    # 正在打印的那一行**没有 queue_id**，所以天然不可删/不可移（用户 2026-11-23 选定）。
+    queue_action_requested = Signal(str, int)
 
     LEFT_COLS = ["文件", "第 1 趟", "第 2 趟", "张数", "状态"]
     RIGHT_COLS = ["文件", "第 1 趟", "第 2 趟", "张数 · 页数"]
@@ -2219,6 +2225,36 @@ class StackQueueDialog(QDialog):
         _lq = QVBoxLayout(self._local_group)
         self._tree_local = self._make_tree(self.LOCAL_COLS, self.LOCAL_WIDTHS, stretch_col=2)
         _lq.addWidget(self._tree_local)
+        # ── 行级操作（2026-11-23 用户需求）──
+        # 只有「排队中」的本机批次带 queue_id；正在打印 / 预约 / 补打那几行没有 id
+        # ⇒ 这三个按钮自动变灰（用户定：正在打印的那一条不能删、不能移）。
+        self._btn_q_resume = QPushButton("▶ 继续队列")
+        self._btn_q_resume.setToolTip(
+            "上次退出时还没开打的批次排在队列里等着 —— 点这里按顺序开始打")
+        self._btn_q_resume.clicked.connect(
+            lambda *_: self.queue_action_requested.emit("resume_all", 0))
+        self._btn_q_up = QPushButton("⬆ 上移")
+        self._btn_q_up.setToolTip("把选中的排队批次往前挪一位（越靠前越先打）")
+        self._btn_q_up.clicked.connect(lambda *_: self._request_queue_action("up"))
+        self._btn_q_top = QPushButton("⇧ 置顶")
+        self._btn_q_top.setToolTip("把选中的排队批次排到下一个打")
+        self._btn_q_top.clicked.connect(lambda *_: self._request_queue_action("top"))
+        self._btn_q_del = QPushButton("🗑 移出队列")
+        self._btn_q_del.setToolTip(
+            "把选中的排队批次移出队列（文件仍留在原标签页里，不会删除）")
+        self._btn_q_del.clicked.connect(lambda *_: self._request_queue_action("del"))
+        _lqa = QHBoxLayout()
+        _lqa.setContentsMargins(0, 0, 0, 0)
+        for _b in (self._btn_q_resume, self._btn_q_up, self._btn_q_top, self._btn_q_del):
+            # 改顺序 / 移出队列都是「替操作员做决定」的动作：一律不是默认按钮（回车不算数）
+            _b.setAutoDefault(False)
+            _b.setDefault(False)
+            _lqa.addWidget(_b)
+        _lqa.addStretch(1)
+        _lq.addLayout(_lqa)
+        self._tree_local.itemSelectionChanged.connect(
+            lambda *_: self._update_queue_buttons())
+        self._update_queue_buttons()
         self._local_group.setVisible(False)
 
         # 攒批两块与「打印列表」之间**用鼠标拖动分配高度**（2026-11-01 用户要求：队列有时很短、
@@ -2309,7 +2345,8 @@ class StackQueueDialog(QDialog):
         rows = list(rows or [])
         sig = tuple(
             (str(r.get("state", "")), str(r.get("source", "")), str(r.get("content", "")),
-             str(r.get("sheets", "")), str(r.get("eta", "")), bool(r.get("active")))
+             str(r.get("sheets", "")), str(r.get("eta", "")), bool(r.get("active")),
+             int(r.get("queue_id") or 0), bool(r.get("resume")))
             for r in rows
         )
         if sig == self._local_sig:
@@ -2319,6 +2356,7 @@ class StackQueueDialog(QDialog):
         self._tree_local.clear()
         if not rows:
             # 显隐交给 `_update_frame()` 统一裁决（它同时要看攒批两栏有没有内容）
+            self._update_queue_buttons()
             self._update_frame()
             return
         n_active = sum(1 for r in rows if r.get("active"))
@@ -2334,12 +2372,52 @@ class StackQueueDialog(QDialog):
             it.setToolTip(0, str(r.get("state", "")))
             it.setToolTip(1, str(r.get("source", "")))
             it.setToolTip(2, str(r.get("content", "")))
+            if int(r.get("queue_id") or 0):
+                # 可管理的排队批次：记住 id，供上移/置顶/移出队列
+                it.setData(0, Qt.UserRole, int(r.get("queue_id") or 0))
+                it.setToolTip(0, "排队中的本机批次：选中后可上移 / 置顶 / 移出队列")
             self._tree_local.addTopLevelItem(it)
+        self._update_queue_buttons()
         self._update_frame()
 
     def local_queue_visible(self) -> bool:
         """本机队列区当前是否显示（测试与主窗口底栏读数共用；不用 isVisible，父窗没 show 时它恒为 False）。"""
         return not self._local_group.isHidden()
+
+    # ── 打印列表的行级操作（2026-11-23）──
+
+    def _selected_queue_id(self) -> int:
+        """选中行对应的队列项 id（0 = 这一行不是可管理的排队批次）。"""
+        try:
+            it = self._tree_local.currentItem()
+        except (AttributeError, RuntimeError):
+            return 0
+        if it is None:
+            return 0
+        try:
+            return int(it.data(0, Qt.UserRole) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _request_queue_action(self, action: str):
+        qid = self._selected_queue_id()
+        if qid <= 0:
+            return
+        self.queue_action_requested.emit(str(action), int(qid))
+
+    def _update_queue_buttons(self):
+        """按「当前选中行 + 是否有待确认批次」决定四个队列按钮的可用性。"""
+        qid = self._selected_queue_id()
+        for b in (getattr(self, "_btn_q_up", None), getattr(self, "_btn_q_top", None),
+                  getattr(self, "_btn_q_del", None)):
+            if b is not None:
+                b.setEnabled(qid > 0)
+        resume = getattr(self, "_btn_q_resume", None)
+        if resume is not None:
+            # `_local_rows` 只在第一次 `set_local_queue` 之后才存在 —— 构造时调到这里
+            # 必须能容忍（否则建窗就 AttributeError，攒批列表整个打不开）。
+            resume.setEnabled(any(bool(r.get("resume"))
+                                  for r in (getattr(self, "_local_rows", None) or [])))
 
     # ── 渲染（可反复调用：常驻窗随纸叠/排队实时刷新）──
 
@@ -8509,6 +8587,13 @@ class MainWindow(QMainWindow):
         self._config_save_fail_ts: float = 0.0
         self._configSaveFailed.connect(self._on_config_save_failed)
         self._worker: Optional[PrintWorker] = None
+        # ── 打印队列（2026-11-23 用户需求）──
+        # 打印机正忙时点「开始打印」不再被拒绝：这一批排进「🖨 打印列表」，前面打完自动接上。
+        # 队列项持有**同一批 PrintJob 对象**（不复制 —— 打印收尾要把 order_number/sent 写回
+        # 标签页的那几行）。落盘形态见 printer_config.PrinterConfig.print_queue。
+        self._print_queue: list[dict] = []
+        self._print_queue_seq = 0
+        self._print_queue_draining = False
         # 「添加文件」的后台批次（复制工作副本 / 解析文件属性，见 StageFilesWorker）：
         # 同一时刻只有一个在跑，其余按标签页排队 —— 主线程一段都不许再同步复制文件。
         self._staging_worker = None
@@ -8826,6 +8911,13 @@ class MainWindow(QMainWindow):
         else:
             self._log("ℹ 云端已启用但未配置令牌。请通过「文件 → 云端连接设置」填写服务器地址/令牌。")
         self._log("✅ HN 本地打印工具已启动")
+
+        # ── 启动恢复：上次退出时还没开打的打印队列（2026-11-23）──
+        # 必须早于下面的暂存副本清扫：队列项的副本要算进「仍被引用」。
+        try:
+            self._restore_print_queue()
+        except Exception as e:
+            logger.warning(f"恢复打印队列失败: {e}")
 
         # ── 启动清理：上次会话遗留的暂存副本（工作副本） ──
         # 正常退出时已按引用清空；此处兜底覆盖崩溃/强杀遗留（副本较新时留 10 分钟宽限，
@@ -11877,6 +11969,12 @@ class MainWindow(QMainWindow):
         所以界面只做「已排队」显示，不锁标签页（见 `_queue_stack_entry` 的重复点更新）。
         """
         key = tab_key or ""
+        # 打印列表（2026-11-23）：本页那一批已排进队列、等前面的批次打完
+        _qpos = self._queue_index_of_tab(key) if key else 0
+        if _qpos:
+            _left = _qpos - 1
+            return (f"打印列表第 {_qpos} 位" +
+                    (f"（前面还有 {_left} 个批次）" if _left else "（下一个就是它）"))
         for req in (getattr(self, "_stack_entry_wait", None) or []):
             if (req.get("tab_key") or "") == key:
                 return str(req.get("reason") or "等待上一单打完")
@@ -18381,6 +18479,12 @@ class MainWindow(QMainWindow):
         for job in (getattr(self, '_flat_jobs', None) or []):
             if getattr(job, 'file_path', ''):
                 refs.append(job.file_path)
+        # 打印队列里还没开打的批次（2026-11-23）：它们的副本必须活到真正开打那一刻，
+        # 否则清扫/保留期扫描会把「排在队里的活」的文件删掉。
+        for item in (getattr(self, '_print_queue', None) or []):
+            for job in (item.get("jobs") or []):
+                if getattr(job, 'file_path', ''):
+                    refs.append(job.file_path)
         worker = getattr(self, '_worker', None)
         for job in (getattr(worker, '_jobs', None) or []):
             if getattr(job, 'file_path', ''):
@@ -21115,6 +21219,8 @@ class MainWindow(QMainWindow):
             dlg.abandon_requested.connect(lambda *_: self._on_stack_abandon())
             dlg.refresh_requested.connect(self._refresh_stack_queue)
             dlg.close_requested.connect(self._on_stack_list_close_requested)
+            # 打印列表的行级操作（上移 / 置顶 / 移出队列 / 继续队列），2026-11-23
+            dlg.queue_action_requested.connect(self._on_queue_action)
             self._stack_queue_dialog = dlg
         return dlg
 
@@ -21339,7 +21445,8 @@ class MainWindow(QMainWindow):
             running_secs += _eta_of(_stack_present_sheet_count(stack) if entries else 0)
 
         def _add_waiting(state: str, jobs, sheets_text=None, source: str = "",
-                         content: str = "", eta_override: str = "") -> None:
+                         content: str = "", eta_override: str = "",
+                         queue_id: int = 0, resume: bool = False) -> None:
             nonlocal running_secs
             sheets, stext = self._local_queue_sheets(jobs)
             if sheets_text is not None:
@@ -21353,7 +21460,24 @@ class MainWindow(QMainWindow):
                 "sheets": stext,
                 "eta": eta_override or self._local_queue_eta_text(running_secs),
                 "active": False,
+                # 只有「本机手工批次」的排队行带 id（对话框据此决定哪几行能删/能前移）
+                "queue_id": int(queue_id or 0) or None,
+                "resume": bool(resume),
             })
+
+        # ── ③b 排队中：本机手工「开始打印」的批次（2026-11-23 用户需求）──
+        # 排在 ④ 其他等待之前 —— 它们是操作员亲手排的、马上就会开打的那几批。
+        for i, it in enumerate(list(getattr(self, "_print_queue", None) or [])):
+            _jobs = list(it.get("jobs") or [])
+            _resume = bool(it.get("resume"))
+            _add_waiting(
+                f"排队中（第 {i + 1} 位）" + ("· 待确认" if _resume else ""),
+                _jobs, source="本机点击",
+                content=(self._local_queue_content(_jobs)
+                         + ("（等操作员点「▶ 继续队列」）" if _resume else "")),
+                queue_id=int(it.get("id") or 0),
+                resume=_resume,
+            )
 
         for req in (getattr(self, "_stack_entry_wait", None) or []):
             _add_waiting("等待中", req.get("jobs"))
@@ -21967,6 +22091,9 @@ class MainWindow(QMainWindow):
                         f"相关打印任务已按失败上报（未标记完成）。")
         finally:
             self._drain_stack_wait_queue()
+            # 打印列表（2026-11-23）：整叠第 2 趟收尾（成功/失败/放弃）之后，队首的下一批开打。
+            if getattr(self, "_print_queue", None):
+                QTimer.singleShot(600, lambda: self._drain_print_queue("整叠第 2 趟收尾"))
 
     def _on_stack_abandon(self, interactive: bool = True):
         """放弃整叠：第 1 趟的纸已是半成品，撤销不了；按失败收尾并清掉清单。
@@ -22414,6 +22541,232 @@ class MainWindow(QMainWindow):
                 alive.add(wfp)
         return [name for fp, name in names if fp in alive]
 
+    # ──────── 打印队列：「打印机忙」不再丢活（2026-11-23 用户需求）────────
+
+    def _print_busy_state(self) -> str:
+        """打印机此刻被谁占着（"" = 空闲）。只用于日志/队列文案，不做闸门判定。
+
+        三个占用者缺一不可（旧实现在 `_start_print_worker` 里各写一段，判定口径是同一个）：
+          · `_worker`：在飞的批次（含手动双面两趟）；
+          · `_stack_flush_worker`：攒批第 2 趟打的是**整叠第 1 趟的输出**，与新单共用同一台
+            打印机 —— 只看 `_worker` 会让新单与整叠第 2 趟并发塞进驱动，页序全乱（🔴-3）；
+          · `_remedy_worker`：补救打的是纸盘里那叠半成品，中间插单必然串页。
+        队列项只会在三者都空闲时才被放行（`_drain_print_queue` 同一判据）。
+        """
+        for attr, label in (("_worker", "打印批次"),
+                            ("_stack_flush_worker", "整叠第 2 趟"),
+                            ("_remedy_worker", "半成品补打")):
+            w = getattr(self, attr, None)
+            try:
+                if w is not None and w.isRunning():
+                    return label
+            except (AttributeError, RuntimeError):
+                continue
+        return ""
+
+    def _queue_index_of_tab(self, tab_key: str) -> int:
+        """该标签页在打印队列里的位置（1-based，0 = 不在队列里）。"""
+        key = tab_key or ""
+        if not key:
+            return 0
+        for i, it in enumerate(getattr(self, "_print_queue", None) or []):
+            if (it.get("tab") or "") == key:
+                return i + 1
+        return 0
+
+    def _enqueue_print_batch(self, jobs: list, tab_key: str, busy: str = "") -> bool:
+        """打印机被占着时：把这一批排进打印队列（返回 True = 已受理）。
+
+        为什么不再直接拒绝：现场一次只打一单，操作员盯着这一单等它打完，中间那段时间
+        程序只会回一句「已有打印任务正在进行」，活只能等打完再点一次（2026-11-23
+        用户原话：「队列总是会因为打印正在进行就无法加入队列」）。
+        同一标签页重复点 = 按当前文件清单更新排队内容（文件可能刚改过）。
+        """
+        jobs = [j for j in (jobs or []) if j is not None]
+        if not jobs:
+            self._log("打印列表：这一批没有可打印的文件")
+            return False
+        key = tab_key or ""
+        pos = self._queue_index_of_tab(key)
+        if pos:
+            item = self._print_queue[pos - 1]
+            item["jobs"] = jobs
+            item["created"] = time.time()
+            item["resume"] = False
+            self._log(f"⏳ 已按当前文件清单更新排队内容（打印列表第 {pos} 位，"
+                      f"{len(jobs)} 个文件）")
+        else:
+            self._print_queue_seq += 1
+            self._print_queue.append({
+                "id": self._print_queue_seq, "tab": key, "created": time.time(),
+                "resume": False, "jobs": jobs,
+            })
+            self._log(f"⏳ 打印机正忙（{busy or '有任务在打'}）—— 这一批 {len(jobs)} 个文件"
+                      f"已加入打印列表（第 {len(self._print_queue)} 位，前面打完自动接上）")
+        self._save_print_queue()
+        try:
+            self._refresh_tab_display()     # 标签页徽标切到 ⏳「已排队」
+        except (AttributeError, RuntimeError):
+            pass
+        self._sync_local_queue()
+        return True
+
+    def _save_print_queue(self) -> None:
+        """把打印队列落到配置（关窗/重启后还在）。jobs 走 PrintJob.to_dict。"""
+        try:
+            self._config.print_queue = [
+                {"id": int(it.get("id") or 0),
+                 "tab": str(it.get("tab") or ""),
+                 "created": float(it.get("created") or 0.0),
+                 "resume": bool(it.get("resume")),
+                 "jobs": [j.to_dict() for j in (it.get("jobs") or []) if j is not None]}
+                for it in (getattr(self, "_print_queue", None) or [])
+            ]
+        except Exception as e:
+            logger.warning(f"整理打印队列失败: {type(e).__name__}: {e}")
+            return
+        try:
+            self._save_config(sync_ui=False)
+        except Exception as e:
+            logger.warning(f"保存打印队列失败: {type(e).__name__}: {e}")
+
+    def _restore_print_queue(self) -> int:
+        """启动时恢复上次没开打的队列，**一律标 resume**：要操作员点「▶ 继续队列」才开打。
+
+        开机就自己出纸是不行的：打印机可能没开、出纸槽里可能还压着上一批的纸。
+        """
+        items = list(getattr(self._config, "print_queue", None) or [])
+        restored = 0
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            try:
+                jobs = [PrintJob.from_dict(d) for d in (it.get("jobs") or [])
+                        if isinstance(d, dict)]
+            except Exception as e:
+                logger.warning(f"恢复打印队列项失败: {type(e).__name__}: {e}")
+                continue
+            jobs = [j for j in jobs if j is not None]
+            if not jobs:
+                continue
+            try:
+                qid = int(it.get("id") or 0)
+            except (TypeError, ValueError):
+                qid = 0
+            if qid <= 0 or any(q.get("id") == qid for q in self._print_queue):
+                self._print_queue_seq += 1
+                qid = self._print_queue_seq
+            self._print_queue_seq = max(self._print_queue_seq, qid)
+            self._print_queue.append({
+                "id": qid, "tab": str(it.get("tab") or ""),
+                "created": float(it.get("created") or 0.0),
+                "resume": True, "jobs": jobs,
+            })
+            restored += 1
+        if restored:
+            self._log(f"🕘 打印列表：已恢复上次退出时还没开打的 {restored} 个批次"
+                      f"（在「🖨 打印列表」里点「▶ 继续队列」才开始打）")
+            self._sync_local_queue()
+        return restored
+
+    def _drain_print_queue(self, reason: str = "", force: bool = False) -> bool:
+        """打印机空下来时把队首那一批接上（「前面打完自动接上」的唯一入口）。
+
+        force=False 时跳过 resume 项（上次退出遗留、还没得到操作员许可的批次）。
+        """
+        q = getattr(self, "_print_queue", None) or []
+        if not q:
+            return False
+        if self._print_queue_draining or self._print_starting or getattr(self, "_closing", False):
+            return False
+        if self._print_busy_state():
+            return False
+        # 所属标签页已被删除 ⇒ 这一批无处可打（文件行随标签页一起没了），别卡在队首
+        _dropped = False
+        while q and (q[0].get("tab") or "") and (q[0].get("tab") not in self._config.tabs):
+            gone = q.pop(0)
+            _dropped = True
+            self._log(f"🗑 打印列表：丢弃 1 个所属标签页已删除的批次"
+                      f"（{len(gone.get('jobs') or [])} 个文件）")
+        if _dropped:
+            self._save_print_queue()
+            self._sync_local_queue()
+        if not q:
+            return False
+        item = q[0]
+        if item.get("resume") and not force:
+            return False
+        self._print_queue_draining = True
+        try:
+            q.pop(0)
+            self._save_print_queue()
+            self._sync_local_queue()
+            _jobs = list(item.get("jobs") or [])
+            self._log(f"▶ 打印列表继续（{reason or '打印机空闲'}）：开始打队列里的这一批"
+                      f"（{len(_jobs)} 个文件，后面还剩 {len(q)} 个）")
+            ok = self._start_print_worker(_jobs, tab_key=item.get("tab") or None,
+                                          interactive=True)
+        finally:
+            self._print_queue_draining = False
+        if not ok:
+            # 没开起来（字体闸门取消/无成员/页数还没统计完…）⇒ 原样放回队首，别把活弄丢
+            q.insert(0, item)
+            self._save_print_queue()
+            self._sync_local_queue()
+            self._log("⚠ 打印列表里的这一批没能开始（已放回第 1 位，改好后再点「▶ 继续队列」）")
+        return ok
+
+    def _on_queue_action(self, action: str, qid: int = 0):
+        """打印列表的行级操作：上移 / 置顶 / 移出队列 / 继续队列（主线程槽）。"""
+        try:
+            action = str(action or "")
+            q = getattr(self, "_print_queue", None) or []
+            if action in ("start", "resume_all"):
+                if not q:
+                    return
+                for it in q:
+                    it["resume"] = False
+                self._save_print_queue()
+                self._sync_local_queue()
+                self._log(f"▶ 打印列表：按操作员要求开始打（{len(q)} 个批次在队列里）")
+                self._drain_print_queue("操作员点了「继续队列」", force=True)
+                return
+            idx = -1
+            for i, it in enumerate(q):
+                if int(it.get("id") or 0) == int(qid or 0):
+                    idx = i
+                    break
+            if idx < 0:
+                self._log("⚠ 打印列表：这一项已经不在列表里了（可能是刚开打，已自动刷新）")
+                self._sync_local_queue()
+                return
+            item = q[idx]
+            n_jobs = len(item.get("jobs") or [])
+            if action == "up":
+                if idx == 0:
+                    self._log("打印列表：这一项已经在最前面了")
+                    return
+                q[idx - 1], q[idx] = q[idx], q[idx - 1]
+                self._log(f"⬆ 打印列表：已前移一位（现在第 {idx} 位，{n_jobs} 个文件）")
+            elif action == "top":
+                if idx == 0:
+                    self._log("打印列表：这一项已经在最前面了")
+                    return
+                q.insert(0, q.pop(idx))
+                self._log(f"⇧ 打印列表：已置顶（第 1 位，{n_jobs} 个文件）")
+            elif action == "del":
+                q.pop(idx)
+                self._log(f"🗑 打印列表：已移出 1 个排队批次（原第 {idx + 1} 位，"
+                          f"{n_jobs} 个文件）—— 文件仍在原标签页里，没有删")
+                # 副本若已无任何引用，顺手回收（仍被标签页/批次引用的会被保留）
+                self._sweep_staged_files("队列项移出")
+            else:
+                return
+            self._save_print_queue()
+            self._sync_local_queue()
+        except Exception as e:
+            logger.warning(f"打印列表操作失败: {type(e).__name__}: {e}")
+
     def _start_print_worker(self, flat_jobs: list, tab_key: str | None = None,
                             stack_entry: tuple | None = None,
                             interactive: bool = True) -> bool:
@@ -22459,19 +22812,13 @@ class MainWindow(QMainWindow):
             if gate == "entry":
                 return self._start_stack_entry(flat_jobs, tab_key or self._current_tab)
 
-        if self._worker is not None and self._worker.isRunning():
-            self._log("⚠️ 已有打印任务正在进行，不能重复启动")
-            return False
-        if self._stack_flush_worker is not None and self._stack_flush_worker.isRunning():
-            # 攒批第 2 趟打的是**整叠第 1 趟的输出**，与新单共用同一台打印机；
-            # 旧实现只看 self._worker（第 2 趟用的是 _stack_flush_worker）⇒ 新单会与
-            # 整叠第 2 趟并发塞进打印机，页序全乱（🔴-3 旁路之二）。
-            self._log("⚠️ 整叠第 2 趟正在打印，不能启动新的打印任务")
-            return False
-        if self._remedy_worker is not None and self._remedy_worker.isRunning():
-            # 补救（补打第 2 趟 / 整单重打）打的是纸盘里那叠半成品，中间插单必然串页：
-            # 补救的第 2 趟要接着这叠纸打，插进来的新单会先占掉打印机。
-            self._log("⚠ 正在补打半成品（第 2 趟），不能启动新的打印任务")
+        _busy = self._print_busy_state()
+        if _busy:
+            if stack_entry is None:
+                # 忙 ≠ 丢活（2026-11-23 用户需求）：排进「🖨 打印列表」，前面打完自动接上。
+                # 攒批第 1 趟（stack_entry 非空）不走这里 —— 它有自己的 _stack_entry_wait。
+                return self._enqueue_print_batch(flat_jobs, tab_key, _busy)
+            self._log(f"⚠️ 正在{_busy}，不能启动新的打印任务")
             return False
         if self._print_starting:
             self._log("⏳ 正在获取订单号/上报订单，请稍候…")
@@ -23233,6 +23580,12 @@ class MainWindow(QMainWindow):
         # 再放行攒批期间被挡住的其它排队请求（纸叠已打完时才会真的开打）
         self._drain_stack_entry_queue()
         self._drain_stack_wait_queue()
+
+        # 打印列表（2026-11-23 用户需求）：这一批打完了 ⇒ 队首那一批顺次开打。
+        # 放进 singleShot：本方法还在收尾（信号、状态栏、按钮态刚改），直接递归启动会和
+        # 外层状态打架；600 ms 也留给操作员"看见这一批打完了"的时间。
+        if getattr(self, "_print_queue", None):
+            QTimer.singleShot(600, lambda: self._drain_print_queue("上一批打完"))
 
     # ──────── 无障碍自动打印重试队列（排空 / 自驱动抽水）────────
 
