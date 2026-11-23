@@ -72,6 +72,37 @@ check("副本内容与原件一致", _a == _b)
 check("原件路径被识别为非暂存", not staging.is_staged(SRC))
 check("副本再次 stage 不再复制（幂等复用）", staging.stage_file(work) == work)
 
+print("=== 1b. 拖出压缩包的临时文件：拖放事件返回前就搬走（snatch）===")
+# 解压软件的拖出临时目录只活到 IDropTarget::Drop 结束 —— 后台线程再去复制就晚了
+# （2026-11-23 现场：%TEMP%\7zE…\x.docx → 「工作副本不可用」）。snatch 用同卷 rename
+# 在入口同步完成，所以这里必须先能认出这类路径。
+_VOL_DIR = os.path.join(tempfile.gettempdir(), "7zE11223344")
+os.makedirs(_VOL_DIR, exist_ok=True)
+VOL = os.path.join(_VOL_DIR, "拖出的报告.docx")
+with open(VOL, "wb") as f:
+    f.write(b"PK\x03\x04" + b"dragged out of zip" * 50)
+
+# 对照组：普通目录里的文件（SRC 本身在 Rar$DIa0.123 下面，按设计就该被认成拖出临时文件）
+_NORMAL_DIR = os.path.join(_SANDBOX_APPDATA, "docs")
+os.makedirs(_NORMAL_DIR, exist_ok=True)
+NORMAL = os.path.join(_NORMAL_DIR, "普通文件.docx")
+with open(NORMAL, "wb") as f:
+    f.write(b"PK\x03\x04" + b"normal file" * 20)
+
+check("认得出 7-Zip 拖出临时目录", staging.is_volatile_source(VOL))
+check("普通文件不误判为拖出临时文件", not staging.is_volatile_source(NORMAL))
+_moved = staging.snatch(VOL)
+check("snatch 立刻搬进暂存目录并返回副本", bool(_moved) and staging.is_staged(_moved), _moved)
+check("源文件在 snatch 返回时已经不在（这就是赢下竞态的关键）", not os.path.isfile(VOL))
+check("副本内容与原文件一致",
+      open(_moved, "rb").read() == b"PK\x03\x04" + b"dragged out of zip" * 50)
+check("副本已被预占（挂到任务前不会被清扫捡走）",
+      staging._norm(_moved) in staging._reserved_snapshot())
+check("普通文件不会被 snatch 搬走", staging.snatch(NORMAL) == "")
+staging.unreserve(_moved)
+shutil.rmtree(os.path.dirname(_moved), ignore_errors=True)   # 模拟任务被移除后的回收
+shutil.rmtree(_VOL_DIR, ignore_errors=True)
+
 print("=== 2. 原件消失后仍可打印（核心场景）===")
 job = PrintJob(file_path=work, source_path=SRC, copies=1, duplex="on")
 shutil.rmtree(FAKE_TEMP)   # 解压软件退出/临时目录被系统清理

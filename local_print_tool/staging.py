@@ -24,6 +24,11 @@ staging.py — 添加文件的「工作副本」暂存管理（压缩包拖拽�
    由 sweep() 回收 —— 启动、添加、移除、清空撤回窗口结束、退出时各扫一次。
 3. 暂存目录刻意不放在 %TEMP% 下：系统清理 %TEMP% 正是本问题的一部分；放 %APPDATA%
    才能扛住重启与磁盘清理，崩溃重启后未完成的任务仍能继续打印。
+4. **拖出压缩包的临时文件必须在拖放事件返回前就搬走**（snatch()）：解压软件的临时目录
+   只活到 IDropTarget::Drop 结束，事件一返回就被删掉。2026-11-17 把复制改成后台线程后，
+   后台线程再 stage_file() 时源文件已经没了（2026-11-23 现场：
+   %TEMP%\\7zECB3F68EB\\方块消消乐课程设计报告.docx → 「工作副本不可用」）。
+   snatch() 用同卷 rename 完成，瞬时且与文件大小无关，不会把主线程又卡回去。
 
 目录结构用「每个源路径一个子目录 + 保留原文件名」，是为了让显示名/报表名/封面页/
 转换输出名（各处都直接取 basename）零改动沿用原文件名。
@@ -38,6 +43,7 @@ import logging
 import os
 import re
 import shutil
+import tempfile
 import threading
 import time
 from typing import Iterable
@@ -224,6 +230,84 @@ def stage_file(src: str) -> str:
         except OSError:
             pass
         return src
+
+
+# ── 解压软件「拖出」临时目录：拖放事件一返回就被清掉 ──
+
+# 目录名特征（不是「在 %TEMP% 下」—— 用户可以把 TEMP 指到别的盘，而 %TEMP% 里也有大量
+# 不该被搬走的正常文件；只认解压软件/资源管理器给自己临时目录起的那几种名字）：
+#   7-Zip / Bandizip   %TEMP%\7zECB3F68EB\…、%TEMP%\7zO0CF96CBA\…
+#   WinRAR             %TEMP%\Rar$DIa0.123\…
+#   资源管理器自带 zip  %TEMP%\Temp1_压缩包.zip\…
+_VOLATILE_DIR_RE = re.compile(r"^(?:7z[eo][0-9a-f]{8}|rar\$|temp\d*_|bnz|bandizip|winrar)",
+                              re.IGNORECASE)
+
+
+def is_volatile_source(path: str) -> bool:
+    """这条路径是不是「从压缩包里拖出来」的临时文件（它的目录马上会被解压软件删掉）？"""
+    if not path:
+        return False
+    try:
+        parent = os.path.basename(os.path.dirname(os.path.abspath(path)))
+    except (OSError, ValueError):
+        return False
+    if not _VOLATILE_DIR_RE.match(parent or ""):
+        return False
+    try:
+        temp_root = os.path.normcase(os.path.abspath(tempfile.gettempdir()))
+    except (OSError, ValueError):
+        return True                     # 判断不了临时目录就按特征认（搬走也不会丢文件）
+    try:
+        p = os.path.normcase(os.path.abspath(path))
+    except (OSError, ValueError):
+        return True
+    return p.startswith(temp_root + os.sep)
+
+
+def snatch(path: str) -> str:
+    """把随时会被清掉的拖出临时文件**立刻**搬进暂存目录，返回副本路径（失败返回 ""）。
+
+    必须跑在拖放事件的调用栈里：调用方（DropTableWidget 的 dropEvent 链）还没返回，
+    解压软件就动不了这个文件。搬家用 os.replace（同卷 rename，瞬时、与文件大小无关，
+    不会把 2026-11-17 修好的「拖放不再卡主线程」又改回去）；只有跨卷/被占用时才退回复制。
+
+    成功返回的副本**已经被 reserve()**（还没挂到任务上，不能被清扫捡走）；调用方在把
+    它挂成 PrintJob 之后必须 unreserve()，GUI 走 rec["staged"] 那套既有记账。
+    不满足条件（不在拖出临时目录、是暂存目录、文件不在了）时返回 ""，调用方照旧走
+    StageFilesWorker 的后台暂存。
+    """
+    if not path:
+        return ""
+    try:
+        src = os.path.abspath(path)
+    except (OSError, ValueError):
+        return ""
+    if is_staged(src) or not is_volatile_source(src) or not os.path.isfile(src):
+        return ""
+    dst = ""
+    try:
+        dst = staged_path_for(src)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        try:
+            os.replace(src, dst)        # 同卷：改个名字，不读不写
+        except OSError:
+            tmp = dst + _PART_SUFFIX
+            shutil.copy2(src, tmp)      # 跨卷/rename 被拒：退回复制（此时仍在拖放事件里）
+            try:
+                os.replace(tmp, dst)
+            except OSError:
+                shutil.copy2(src, dst)
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        reserve(dst)
+        logger.info(f"已在拖放事件内搬走压缩包拖出的临时文件: {os.path.basename(src)}")
+        return dst
+    except Exception as e:
+        # 搬不动就退回旧路径（后台暂存仍会再试一次；失败也只是这几秒里的竞态）
+        logger.warning(f"搬走拖出临时文件失败（改走后台暂存）: {src} → {e}")
+        return ""
 
 
 # ── 清理（引用计数清扫） ──

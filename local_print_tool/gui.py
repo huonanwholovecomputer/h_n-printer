@@ -7154,7 +7154,9 @@ class StageFilesWorker(QThread):
 
     def __init__(self, items, image_orientation: str = "auto", parent=None):
         super().__init__(parent)
-        self._items = list(items)          # [(src, ext), ...]，主线程已做过存在性/后缀过滤
+        # [(src, ext, adopted), ...]，主线程已做过存在性/后缀过滤；adopted=True 表示
+        # src 是 snatch() 在拖放事件里就搬进暂存目录的副本（已 reserve，只等这里记账）。
+        self._items = list(items)
         self._image_orientation = image_orientation or "auto"
         self._cancelled = False
 
@@ -7171,7 +7173,9 @@ class StageFilesWorker(QThread):
         available = None
         engines_probed = False
         out: list = []
-        for src, ext in self._items:
+        for item in self._items:
+            src, ext = item[0], item[1]
+            adopted = bool(item[2]) if len(item) > 2 else False
             if self._cancelled:
                 break
             rec = {
@@ -7198,6 +7202,10 @@ class StageFilesWorker(QThread):
                         staging.reserve(work_path)
                 elif reserved:
                     staging.unreserve(reserved)
+                if adopted:
+                    # snatch() 已经在拖放事件内搬好并 reserve() 了这份副本：这里只记账，
+                    # 交给 _apply_staged_files 末尾统一 unreserve。
+                    rec["staged"] = True
                 rec["work_path"] = work_path
                 # ② 文件属性（预转换要用 MD5 查缓存；PDF 要页数/朝向/末页空白）
                 if ext != ".pdf":
@@ -17579,7 +17587,15 @@ class MainWindow(QMainWindow):
                 continue
             if ext not in allowed_types:
                 continue
-            picked.append((src, ext))
+            # 从压缩包拖出来的文件住在解压软件的临时目录里，那个目录只活到这次拖放事件
+            # 返回（2026-11-23 现场：Bandizip 的 %TEMP%\7zE…\x.docx，后台线程去复制时已经
+            # 被删了，用户看到「工作副本不可用」）。所以必须在这里、事件还没返回时就用
+            # staging.snatch() 同卷 rename 搬进暂存目录 —— rename 瞬时，和文件大小无关，
+            # 不会把「拖放不卡主线程」又改回去。普通文件 snatch() 直接返回 ""。
+            adopted = staging.snatch(src)
+            if adopted:
+                src = adopted
+            picked.append((src, ext, bool(adopted)))
         if html_rejected:
             # 拖入/粘贴/对话框选择 .html/.htm：明确告知不支持并给出替代路径
             self._warn_html_unsupported(html_rejected)
@@ -17605,6 +17621,16 @@ class MainWindow(QMainWindow):
                 return k
         return ""
 
+    @staticmethod
+    def _release_adopted(items) -> None:
+        """放弃一批还没交给 StageFilesWorker 的文件：把 snatch() 预占的副本交还清扫。"""
+        for item in (items or []):
+            try:
+                if len(item) > 2 and item[2]:
+                    staging.unreserve(item[0])
+            except Exception:
+                pass
+
     def _drain_staging_queue(self) -> None:
         """把排队中的批次发出去（同一时刻只允许一个 StageFilesWorker 在跑）。"""
         if self._staging_worker is not None:
@@ -17614,15 +17640,19 @@ class MainWindow(QMainWindow):
             key = self._tab_key_of(tab)
             if not key:
                 self._log("⚠ 目标标签页已被删除，这一批文件未添加")
+                self._release_adopted(picked)
                 continue
             jobs = list(tab.jobs or [])
             existing_paths = {getattr(j, "file_path", "") for j in jobs
                               if getattr(j, "file_path", "")}
             existing_sources = {os.path.normcase(os.path.abspath(j.source_path))
                                 for j in jobs if getattr(j, "source_path", "")}
-            todo = [(src, ext) for src, ext in picked
-                    if src not in existing_paths
-                    and os.path.normcase(src) not in existing_sources]
+            todo = [item for item in picked
+                    if item[0] not in existing_paths
+                    and os.path.normcase(item[0]) not in existing_sources]
+            # 被当作重复项丢掉的（含 snatch 搬好的副本）：把「使用中」预占还回去，
+            # 否则那份副本永远清扫不到。
+            self._release_adopted([item for item in picked if item not in todo])
             if not todo:
                 self._log(f"ℹ 标签页 {key}: 这些文件已经在列表里，已跳过")
                 continue
@@ -17729,8 +17759,12 @@ class MainWindow(QMainWindow):
                         self._log(f"⚠ {os.path.basename(str(rec.get('src') or ''))}："
                                   f"读属性失败，按默认值加入（{rec['error']}）")
                     if not work_path or not os.path.isfile(work_path):
+                        # 压缩包拖出：解压软件的临时文件只活到拖放事件结束。正常路径已在
+                        # _add_files_to_table 里被 staging.snatch() 抢先搬走，走到这里说明
+                        # 搬也没搬成（被占用/跨卷失败），给一句能照做的提示。
                         self._log(f"⚠ 跳过 {os.path.basename(str(rec.get('src') or ''))}："
-                                  "工作副本不可用")
+                                  "工作副本不可用（文件已不在原处；若来自压缩包拖拽，"
+                                  "请先解压到文件夹再拖入）")
                         continue
                     src = str(rec.get("src") or "")
                     src_key = os.path.normcase(os.path.abspath(src)) if src else ""

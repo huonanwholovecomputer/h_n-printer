@@ -20,6 +20,7 @@
 import hashlib
 import io
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -81,6 +82,8 @@ check("done 连的是绑定方法（连 lambda 会在发射线程直接跑）",
 check("finished 连的是绑定方法",
       "worker.finished.connect(self." in _batch and "connect(lambda" not in _batch)
 check("入口走排队（worker 忙时不叠加线程）", "self._staging_queue.append" in _entry)
+check("★ 压缩包拖出的临时文件在入口就搬走（staging.snatch，不能留给后台线程）",
+      "staging.snatch" in _entry)
 
 # 打桩前先拿住原函数
 import staging  # noqa: E402
@@ -186,6 +189,36 @@ if _txt_job is not None:
 
 check("两批都落地后队列与 worker 都已清空",
       not win._staging_queue and win._staging_worker is None)
+
+print("\n=== B2. 压缩包拖出：解压软件在拖放返回后立刻清场（2026-11-23 现场）===")
+# 解压软件的拖出临时目录：IDropTarget::Drop 一返回就被删。这里用一个 7-Zip 命名的
+# 临时目录复现：入口调用返回后立刻整目录删掉，任务仍必须可用。
+_VOL_DIR = os.path.join(tempfile.gettempdir(), "7zE00A1B2C3")
+os.makedirs(_VOL_DIR, exist_ok=True)
+VOL = os.path.join(_VOL_DIR, "压缩包里的报告.pdf")
+_c = canvas.Canvas(VOL, pagesize=A4)
+_c.drawString(72, 720, "snatched from archive")
+_c.showPage()
+_c.save()
+
+_t0 = time.perf_counter()
+win._add_files_to_table([VOL])
+_vol_elapsed = time.perf_counter() - _t0
+check("压缩包拖出的文件：入口依旧立即返回（rename 是瞬时的，不因文件大而卡）",
+      _vol_elapsed < 0.25, f"{_vol_elapsed * 1000:.0f} ms")
+check("★ 入口返回那一刻源文件已搬进暂存目录（不是留给后台线程去复制）",
+      not os.path.isfile(VOL))
+shutil.rmtree(_VOL_DIR, ignore_errors=True)      # 模拟解压软件清场
+_vol_idle = win._wait_staging_idle(30.0)
+check("压缩包拖出的文件：后台批次正常落地", _vol_idle)
+_vol_job = next((j for j in (win._get_current_jobs() or [])
+                 if os.path.basename(j.file_path) == "压缩包里的报告.pdf"), None)
+check("★ 临时目录被清掉后，任务仍指向可用的暂存副本",
+      _vol_job is not None and staging.is_staged(_vol_job.file_path)
+      and os.path.isfile(_vol_job.file_path),
+      str(_vol_job.file_path if _vol_job else None))
+check("★ 副本的「使用中」预占已交还（_apply_staged_files 记账没漏）",
+      staging._reserved_snapshot() == set(), str(staging._reserved_snapshot()))
 
 # ════════════════════ C. 对照：阈值能把「退回同步」判红 ════════════════════
 print("\n=== C. 对照实验：同步调用的耗时 ===")
