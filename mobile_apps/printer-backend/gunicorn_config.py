@@ -134,6 +134,11 @@ def post_worker_init(worker):
     _ensure_job("resync_prices", resync_pending_prices, minutes=10)
     _ensure_job("release_stuck_frozen", release_stuck_frozen_orders, minutes=5)
 
+    # 启动时把真正注册到的任务清单打出来：2026-11-23 那次「生产只注册 9 个、直跑注册 14 个」
+    # 就是因为没有任何一行日志能看出少了谁，靠人比对两份清单才发现。
+    _job_ids = sorted(j.id for j in scheduler.get_jobs())
+    print(f"[SCHEDULER] 已注册 {len(_job_ids)} 个定时任务: {', '.join(_job_ids)}")
+
     try:
         scheduler.start()
     except Exception as e:
