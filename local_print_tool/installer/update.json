@@ -1,9 +1,9 @@
 {
-  "version": "4.7.2",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.2.exe",
-  "md5": "0abf0c2e9575880354748ec4537999b6",
-  "sha256": "cd42c660e43fb987e1c9b7dfc53e38e2d379ee48a4d9d2d9b225bfb27956b7b4",
-  "notes": "v4.7.2：①「空白页率拆单」的提示文案按打印机分两套 —— 支持自动双面的机型不再说「单面文件白走一趟」「会变成两个打印作业」，改成「双面一次成型、不用翻纸；拆开只买两叠不混，纸一张不多、一张不少」；需要人工翻纸的机型文案不变，仍然提示打完要翻一次纸。② 拆单后的取纸提示改成等单面那叠纸真的出完才弹（主机型的打印作业会先消失、纸还在往外吐，原来会催你提前去取），等待期间点「取消」立即中断。③ 拆单确认框里的空白页率不再重复显示两次。",
+  "version": "4.7.3",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.3.exe",
+  "md5": "d510e268dd03c20585bb66b90e51dc0f",
+  "sha256": "1a2421b415606e90aeeedb2546a4032dad1994f694f00a99ba57a1f72a35f1af",
+  "notes": "v4.7.3：「发现新版本」收成一个小窗口 —— 左边「本站加速通道」填下载码直接下载，右边 GitHub Release 公开免费、不限量；下载码填错就当左栏红字提示，不用关窗再重开。原来先提示、再输入、再弹校验失败的三连窗收掉了。",
   "sig_algo": "ed25519",
-  "sig": "iWmLyotjkGfq58HlH0gFtNfDl41TYcbJLEs3HFon12akOoSTFB2RrDN0bTIJjOWYGNXYLP4pH7RkXpQTM8UrAg=="
+  "sig": "d5rz2LmPLbw1hv5Hcal9UzBvaPv+38yfbXE7WCkQGFQjvn5uAbSDH5VsIO8GzBDdy6JbmFzXJIDUYGaTcl+iBA=="
 }
