@@ -1,9 +1,9 @@
 {
-  "version": "4.7.3",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.3.exe",
-  "md5": "d510e268dd03c20585bb66b90e51dc0f",
-  "sha256": "1a2421b415606e90aeeedb2546a4032dad1994f694f00a99ba57a1f72a35f1af",
-  "notes": "v4.7.3：「发现新版本」收成一个小窗口 —— 左边「本站加速通道」填下载码直接下载，右边 GitHub Release 公开免费、不限量；下载码填错就当左栏红字提示，不用关窗再重开。原来先提示、再输入、再弹校验失败的三连窗收掉了。",
+  "version": "4.7.4",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.4.exe",
+  "md5": "4820666b5af496368710d058565e9167",
+  "sha256": "863374baf46d8f4a207f85f6509e6aab42fbfd65775e98b4317111d59c531d36",
+  "notes": "v4.7.4：修三处会悄悄出错的地方 —— ①云端单有时按「0 页」计费：缓存里「页数待定」的占位 0 被当成真页数，十几页的单只算 0 元，现在命中缓存会回读 PDF 重新数；②Word/WPS 转换引擎中途掉线原来只会静默重试，第一份文件必定白失败一次，现在一掉线就立刻重建实例并立刻重试；③取号被云端拒绝时日志里只剩「超时」，现在会写明 HTTP 状态码并提示重新签发 token。另外：外部打印监视中断会记录中断时长，超过 5 分钟提示检查 Print Spooler；程序崩溃也会写进当日日志，不再只落一个单独文件。",
   "sig_algo": "ed25519",
-  "sig": "d5rz2LmPLbw1hv5Hcal9UzBvaPv+38yfbXE7WCkQGFQjvn5uAbSDH5VsIO8GzBDdy6JbmFzXJIDUYGaTcl+iBA=="
+  "sig": "Rb8Lz8Rm9CPqdu2mrsod/+fdfubX4KmzjoW63xLdHxN0MAwxWfewZF3fnc6KTnVh4KzGzHpvWXdNekoPRsinAg=="
 }
