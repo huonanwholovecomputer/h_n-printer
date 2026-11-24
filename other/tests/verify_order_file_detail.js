@@ -240,6 +240,36 @@ check('APP 样式：图带横向可滑、单图固定比例（不新增裸选择
   /\.myfile-local-thumbs \{[\s\S]{0,200}?overflow-x: auto/.test(APP_CSS) &&
   /\.myfile-local-thumb \{[\s\S]{0,200}?object-fit: contain/.test(APP_CSS));
 
+console.log('\n--- 8) 点缩略图全屏放大（2026-11-24 用户：移动端的略缩图不允许放大吗） ---');
+check('小程序：本地单缩略图挂了 bindtap（点了要能全屏）',
+  /bindtap="onLocalThumbTap"/.test(ME_WXML) &&
+  /data-index="\{\{index\}\}"/.test(ME_WXML));
+check('小程序：onLocalThumbTap 把 localShots 的 URL 交给现成的自绘全屏层',
+  /\n    onLocalThumbTap\(e\)/.test(ME_JS) &&
+  /pvCore\(\)\.open\(this, urls, idx\)/.test(ME_JS) &&
+  /shots\.map\(s => String\(\(s && s\.url\) \|\| ''\)\)/.test(ME_JS));
+check('APP：点图带里任意一张 → openLocalPreviewViewer（图列表按 DOM 顺序取）',
+  /t\.closest\('\.myfile-local-thumb'\)/.test(APP_JS) &&
+  /band\.querySelectorAll\('\.myfile-local-thumb'\)/.test(APP_JS) &&
+  /function openLocalPreviewViewer\(urls, index, title\)/.test(APP_JS));
+check('APP：全屏层两种取图模式（本地 url 数组 / 云端 z 档），翻页与顶栏都走 pfvSrcFor',
+  /localUrls: null, localTitle: ''/.test(APP_JS) &&
+  /function pfvSrcFor\(page\)/.test(APP_JS) &&
+  /img\.setAttribute\('src', pfvSrcFor\(next\)\);/.test(APP_JS) &&
+  /const pages = local \? pfvState\.localUrls\.length/.test(APP_JS));
+check('APP：本地图失败不误走 JPEG 备档（服务端只存 WebP，换地址只会再失败一次）',
+  /if \(!pfvLocalMode\(\) && previewFmt !== 'jpeg' && pfvState\.open\)/.test(APP_JS));
+
+// 2026-11-24：放大到全屏后 640px 会糊，回传尺寸抬到 1024（仍只存前 6 页）
+const thumbsSrc = fs.readFileSync(path.join(ROOT, 'local_print_tool', 'order_thumbs.py'), 'utf8');
+check('回传缩略图默认边长 1024（load_pages 的 edge 形参）',
+  /def load_pages\(order_number: str, name: str = "", limit: int = 6,\s*\n?\s*edge: int = 1024\)/.test(thumbsSrc) ||
+  /edge: int = 1024/.test(thumbsSrc), 'load_pages 默认 edge');
+check('两端「有图」文案都提示点图可放大',
+  CARD.localDetail(LRO, 'local', { baseUrl: 'https://api.test', orderNumber: 'HN20261123-0009', pages: 9 })
+    .localNote.indexOf('点图可全屏放大') > 0 &&
+  /点图可全屏放大/.test(APP_JS));
+
 console.log('\n结果：通过 ' + pass + ' 条，失败 ' + fail + ' 条');
 if (fail > 0) {
   console.log('❌ 订单文件详情验收未通过');

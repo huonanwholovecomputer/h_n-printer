@@ -1,8 +1,8 @@
 {
-  "version": "1.1.74",
-  "versionCode": 75,
-  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.74.apk",
-  "md5": "58fd48118ce68f686384b39f0e2a9ffa",
-  "notes": "v1.1.74：修好本地单缩略图在 APP 里显示不出来的问题 —— 1.1.73 取图地址误用了小程序那套 CONFIG 变量，APP 里会抛 ReferenceError，所以详情弹窗停在「没有预览图」。这版起，「我」页和「我的订单」里点开本地单的文件详情就能左右翻看店主电脑打印时回传的稿子。",
+  "version": "1.1.75",
+  "versionCode": 76,
+  "url": "https://hn-space.cn/updates/h_n-printer_android_v1.1.75.apk",
+  "md5": "e6e0d6b62b4019dc01110960c69c0ca0",
+  "notes": "v1.1.75：本地单缩略图点开就能全屏看 —— 双指捏合 / 双击放大、左右滑翻页；顺带把回传的缩略图从 640px 抬到 1024px，放大后不再糊。（1.1.74 修的是上一版取图地址报错、详情里完全没有图。）",
   "force": false
 }

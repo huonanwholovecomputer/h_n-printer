@@ -3807,7 +3807,7 @@ function localFilePanelHTML(rowFile, reason, opt) {
   if (reason === 'cleaned') {
     note = '云端副本已被清理（保留期到了或手动删除过），预览图取不回来了；这单的打印参数还在，一起放在下面。';
   } else if (thumbs) {
-    note = '这单是本地打单 —— 预览图是店主电脑在打印时渲染的（最多前几页），源文件仍在店主电脑上。';
+    note = '这单是本地打单 —— 预览图是店主电脑在打印时渲染的（最多前几页），源文件仍在店主电脑上；点图可全屏放大。';
   } else {
     note = '这单是本地打单 —— 源文件只保存在店主的电脑上，云端没有副本，所以没有预览图。';
   }
@@ -3908,7 +3908,24 @@ function closeOrderFileDetail() {
 
 /* ---------------- 全屏查看层：捏合缩放 / 双击缩放 / 单指拖动 / 左右翻页 ---------------- */
 
-const pfvState = { open: false, fileId: '', page: 1, pages: 1, scale: 1, x: 0, y: 0 };
+/* 2026-11-24：全屏层也从「只认云端 fileId」扩成能直接吃一串本地图 URL（本地单缩略图）。
+   localUrls 非空时优先按它取页/取标题，不再去 previewFileOf(fileId) 里查。 */
+const pfvState = { open: false, fileId: '', page: 1, pages: 1, scale: 1, x: 0, y: 0,
+  localUrls: null, localTitle: '' };
+
+function pfvLocalMode() {
+  return !!(pfvState.localUrls && pfvState.localUrls.length);
+}
+
+/* 当前页该显示的图：本地图直接从数组取，云端走 previewShotUrl 的 z 档 */
+function pfvSrcFor(page) {
+  if (pfvLocalMode()) {
+    const i = Math.min(Math.max(1, Math.floor(Number(page) || 1)), pfvState.localUrls.length);
+    return pfvState.localUrls[i - 1];
+  }
+  const f = previewFileOf(pfvState.fileId);
+  return f ? previewShotUrl(f, page, 'z') : '';
+}
 const pfvTouch = { mode: '', startDist: 0, startScale: 1, originX: 0, originY: 0,
   lastX: 0, lastY: 0, lastTapAt: 0, lastTapX: 0, lastTapY: 0, moved: false };
 
@@ -3970,14 +3987,19 @@ function pfvZoomAt(nextScale, cx, cy) {
 
 /* 顶栏页码/标题，以及翻页按钮的显隐 */
 function pfvUpdateBar() {
-  const f = previewFileOf(pfvState.fileId);
-  const pages = previewPagesOf(f, previewStateOf(pfvState.fileId));
+  const local = pfvLocalMode();
+  const f = local ? null : previewFileOf(pfvState.fileId);
+  const pages = local ? pfvState.localUrls.length
+    : previewPagesOf(f, previewStateOf(pfvState.fileId));
   pfvState.pages = pages;
   if (pfvState.page > pages) pfvState.page = pages;
   const count = document.getElementById('pfvCount');
   if (count) count.textContent = pfvState.page + ' / ' + pages;
   const title = document.getElementById('pfvTitle');
-  if (title) title.textContent = (f && f.original_name) ? f.original_name : '预览';
+  if (title) {
+    const label = local ? pfvState.localTitle : ((f && f.original_name) || '');
+    title.textContent = label || '预览';
+  }
   const prev = document.getElementById('pfvPrev');
   if (prev) prev.style.display = (pages > 1 && pfvState.page > 1) ? '' : 'none';
   const next = document.getElementById('pfvNext');
@@ -4006,9 +4028,11 @@ function pfvFrameReset() {
 }
 
 function pfvShowPage(page) {
-  const f = previewFileOf(pfvState.fileId);
-  if (!f) return;
-  const pages = previewPagesOf(f, previewStateOf(pfvState.fileId));
+  const local = pfvLocalMode();
+  const f = local ? null : previewFileOf(pfvState.fileId);
+  if (!local && !f) return;
+  const pages = local ? pfvState.localUrls.length
+    : previewPagesOf(f, previewStateOf(pfvState.fileId));
   const cur = Math.min(Math.max(1, Math.floor(Number(pfvState.page) || 1)), pages);
   const next = Math.min(Math.max(1, Math.floor(Number(page) || 1)), pages);
   const dir = next > cur ? 1 : -1;
@@ -4024,7 +4048,7 @@ function pfvShowPage(page) {
   if (mask) mask.classList.remove('pfv-loaded');
   if (img) {
     img.style.visibility = 'hidden';
-    img.setAttribute('src', previewShotUrl(f, next, 'z'));
+    img.setAttribute('src', pfvSrcFor(next));
   }
   pfvApplyTransform();
   pfvUpdateBar();
@@ -4053,7 +4077,7 @@ function pfvShowPage(page) {
     if (oldFrame) oldFrame.classList.remove('pfv-frame-show', 'pfv-out-next', 'pfv-out-prev');
   }, 240);
   const st = previewStateOf(pfvState.fileId);
-  if ((Number(st.page) || 1) !== next) {
+  if (!local && (Number(st.page) || 1) !== next) {
     st.page = next;
     refreshPreviewHosts(pfvState.fileId, false);
   }
@@ -4066,6 +4090,8 @@ function openPreviewViewer(fileId, page) {
   const pages = previewPagesOf(f, st);
   pfvState.open = true;
   pfvState.fileId = String(fileId);
+  pfvState.localUrls = null;             // 云端文件模式：别残留上一单的本地图
+  pfvState.localTitle = '';
   pfvState.pages = pages;
   pfvState.page = Math.min(Math.max(1, Math.floor(Number(page) || Number(st.page) || 1)), pages);
   pfvState.scale = 1;
@@ -4090,11 +4116,47 @@ function openPreviewViewer(fileId, page) {
   ensurePreviewPages(fileId);            // 全屏里也顺手核对一次（同一文件只问一次）
 }
 
+/* 本地单缩略图 → 全屏（2026-11-24：用户问「移动端的略缩图不允许放大吗」）。
+   与云端文件不同，这里没有 file_id / previewState / JPEG 备档，只有一串已经带 token 的
+   图地址（最多 6 页、1024px WebP），所以直接按数组取页。 */
+function openLocalPreviewViewer(urls, index, title) {
+  const list = (urls || []).filter(Boolean);
+  if (!list.length) return;
+  const i = Math.max(0, Math.min(list.length - 1, Number(index) || 0));
+  pfvState.open = true;
+  pfvState.fileId = '';
+  pfvState.localUrls = list;
+  pfvState.localTitle = String(title || '');
+  pfvState.pages = list.length;
+  pfvState.page = i + 1;
+  pfvState.scale = 1;
+  pfvState.x = 0;
+  pfvState.y = 0;
+  pfvTouch.mode = '';
+  pfvTouch.moved = false;
+  const mask = document.getElementById('pfvMask');
+  if (mask) {
+    mask.classList.remove('pfv-loaded');
+    mask.classList.add('pfv-open');
+    mask.style.display = 'flex';
+  }
+  pfvFrameReset();
+  const img = document.getElementById('pfvImg');
+  if (img) {
+    img.style.visibility = 'hidden';
+    img.setAttribute('src', list[i]);
+  }
+  pfvApplyTransform();
+  pfvUpdateBar();
+}
+
 function closePreviewViewer() {
   pfvState.open = false;
   pfvState.scale = 1;
   pfvState.x = 0;
   pfvState.y = 0;
+  pfvState.localUrls = null;
+  pfvState.localTitle = '';
   const mask = document.getElementById('pfvMask');
   if (mask) {
     mask.classList.remove('pfv-open');
@@ -4246,6 +4308,17 @@ function previewUIClick(e) {
     return;
   }
   if (t.closest('[data-close-myfile-detail]')) { closeOrderFileDetail(); return; }
+  // ・本地单缩略图：点任意一张 → 全屏（图列表从同一条图带的 <img src> 取，顺序即页序）
+  const lthumb = t.closest('.myfile-local-thumb');
+  if (lthumb) {
+    const band = lthumb.closest('.myfile-local-thumbs');
+    const imgs = band ? Array.prototype.slice.call(band.querySelectorAll('.myfile-local-thumb')) : [lthumb];
+    const urls = imgs.map((im) => im.getAttribute('src')).filter(Boolean);
+    const idx = Math.max(0, imgs.indexOf(lthumb));
+    const titleEl = document.querySelector('#myFileDetailBody .myfile-detail-title');
+    openLocalPreviewViewer(urls, idx, titleEl ? titleEl.textContent : '');
+    return;
+  }
   const dot = t.closest('[data-preview-dot]');
   if (dot) {
     const host = dot.closest('[data-preview-host]');
@@ -4290,7 +4363,8 @@ function setupMyFilePreviewUI() {
       });
       img.addEventListener('error', () => {
         // 2026-11-19：全屏图同样先给 WebP 一次翻案机会（换成 JPEG 重载），再报失败。
-        if (previewFmt !== 'jpeg' && pfvState.open) {
+        // 本地单缩略图没有 JPEG 备档（服务端只存 WebP），别走这个分支。
+        if (!pfvLocalMode() && previewFmt !== 'jpeg' && pfvState.open) {
           previewFmt = 'jpeg';
           const f = previewFileOf(pfvState.fileId);
           if (f) {

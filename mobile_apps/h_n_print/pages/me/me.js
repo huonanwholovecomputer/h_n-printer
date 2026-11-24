@@ -2021,6 +2021,25 @@ Component({
       this.setData({ 'fileDetail.localPreviewIndex': idx })
     },
 
+    /* 点本地单缩略图 → 全屏（2026-11-24 用户：「移动端的略缩图不允许放大吗」）。
+       复用自绘全屏层（utils/preview_viewer.js）：双击/捏合放大、左右滑翻页。
+       地址直接取 swiper 里那几条（已经带 token 查询串）；刻意不填 pv.fileId ——
+       本地图没有 JPEG 备档，onPvImageError 的 WebP 回退对它不适用。 */
+    onLocalThumbTap(e) {
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const f = this.data.fileDetail
+      const shots = (f && Array.isArray(f.localShots)) ? f.localShots : []
+      const urls = shots.map(s => String((s && s.url) || '')).filter(Boolean)
+      if (!urls.length) return
+      const idx = Math.max(0, Math.min(urls.length - 1, Number(ds.index) || 0))
+      pvCore().open(this, urls, idx)
+      this.setData({
+        'pv.fileId': '',
+        'pv.pages': shots.map(s => Number(s.page) || 1),
+        'pv.fmt': 'webp',
+      })
+    },
+
     /* 某一页没取到（上传失败/已过期）：把它摘掉，别留一块空白在 swiper 里 */
     onLocalThumbError(e) {
       const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}

@@ -908,6 +908,7 @@
             <image class="myfile-preview myfile-preview-loaded"
                    src="{{shot.url}}" mode="aspectFit"
                    webp="{{f.localPreviewFmt !== 'jpeg'}}"
+                   bindtap="onLocalThumbTap" data-index="{{index}}"
                    binderror="onLocalThumbError"
                    data-page="{{shot.page}}" data-scope="{{scope}}" />
           </swiper-item>

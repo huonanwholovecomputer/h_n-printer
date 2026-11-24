@@ -119,12 +119,13 @@ def page_count(order_number: str, name: str = "") -> int:
 
 
 def load_pages(order_number: str, name: str = "", limit: int = 6,
-               edge: int = 640) -> list:
+               edge: int = 1024) -> list:
     """读出已落盘的缩略图，按需缩小后给**云端回传**用（2026-11-23）。
 
     为什么单独一条：本机存的是 1024px（结算页放大那一档），云端要给移动端看，
     单页 60 KB × 20 页 = 1.2 MB/文件，900 个订单就能吃掉几个 G。这里只取前
-    `limit` 页并缩到 `edge`（默认 640，与移动端详情卡 p 档同宽）—— 用 PIL 就地
+    `limit` 页并缩到 `edge`（2026-11-24 起默认 1024：移动端点开可全屏放大，
+    640 撑满屏幕偏糊；每页约 30~60 KB，仍只存前 6 页）—— 用 PIL 就地
     缩，不重新渲 PDF（重渲一页要 1~3 秒）。
     返回 `[(page_no, bytes, fmt)]`，任何异常都当"没有"处理（缩略图绝不打扰主流程）。
     """

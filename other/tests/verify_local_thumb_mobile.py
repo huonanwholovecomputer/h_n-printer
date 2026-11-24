@@ -10,7 +10,7 @@
 云端没有副本，所以没有预览图」。
 
 本轮补的路子：
-  ① 打印工具收尾渲完本地缩略图，顺手把前几页（640px、最多 6 页）回传云端
+  ① 打印工具收尾渲完本地缩略图，顺手把前几页（1024px、最多 6 页）回传云端
      —— `POST /api/local/order_thumb`，键是 **(订单号, 文件名)**（不能用 order_files.id：
      每次上报都 DELETE + 重插，行 id 会变；也不能用 files.id：本地单根本没有那一行）；
   ② 移动端问 `GET /api/local_order_thumb/info` 拿页数，再逐页取
@@ -325,8 +325,8 @@ def _edge_of(data):
     return max(Image.open(io.BytesIO(data)).size)
 
 
-chk("B1 每页都缩到 640 以内（本机存 1024px 给结算页放大用，回传只要 p 档）",
-    all(_edge_of(d) <= 640 for _, d, _ in pages)
+chk("B1 每页都缩到 1024 以内（2026-11-24 起：移动端可全屏放大，640 撑满屏幕偏糊）",
+    all(_edge_of(d) <= 1024 for _, d, _ in pages)
     and all(len(d) < len(big) for _, d, _ in pages),
     [(_edge_of(d), len(d)) for _, d, _ in pages])
 chk("B1 返回 (page_no, bytes, fmt) 三元组，fmt 是 webp 或 jpeg",
