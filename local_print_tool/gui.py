@@ -8613,6 +8613,162 @@ class OfflineOrdersDialog(QDialog):
 
 
 # ============================================================
+# 发现新版本：左 COS 加速通道 / 右 GitHub Release
+# ============================================================
+
+class UpdateChannelDialog(QDialog):
+    """「发现新版本」窗口：左边本站加速通道（要下载码），右边 GitHub Release。
+
+    2026-11-24 用户要求（依据现场三连框太碎）：点「帮助 → 检查更新」发现新版本时，
+    **只弹这一个窗口**，左右两栏摊开两条下载渠道：
+      · 左 COS：内部工作人员用，填 8 位下载码（形如 ABCD-EFGH）就从本站直连下载；
+      · 右 GitHub：公开、免费、不限量，打开 Release 页在浏览器里手动下载（本工具不退出）。
+    原来的「一句话 + 三选一按钮」提示框、独立的 QInputDialog 要码框、以及事后那个
+    「下载码未通过校验」框都收进这里：校验失败时用 `error` 参数把原因直接显示在左栏，
+    用户要么改码重试，要么改走右栏 —— 不再是"关一个框再开一个框"。
+
+    `choice` 只有三种结果：`"cos"`（附 `code`）/ `"github"` / `""`（稍后或按 Esc）。
+    """
+
+    COS = "cos"
+    GITHUB = "github"
+
+    def __init__(self, parent=None, *, version: str = "", current_version: str = "",
+                 notes: str = "", needs_code: bool = True, error: str = "",
+                 startup: bool = False):
+        super().__init__(parent)
+        self.setWindowTitle("发现新版本")
+        self.setMinimumWidth(720)
+        self.choice = ""
+        self.code = ""
+        self._needs_code = bool(needs_code)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 14)
+        root.setSpacing(12)
+
+        head = QLabel(
+            f"<span style='font-size:16pt;'><b>发现新版本 v{version}</b></span>"
+            f"<span style='color:#8a8a8a;'>　当前 v{current_version}</span>")
+        root.addWidget(head)
+
+        if startup:
+            tip = QLabel("启动时只提示、不自动安装：选好渠道后还要点一下按钮才会开始。")
+            tip.setWordWrap(True)
+            tip.setStyleSheet("color:#8a8a8a;")
+            root.addWidget(tip)
+
+        if notes:
+            root.addWidget(QLabel("更新说明"))
+            note_box = QPlainTextEdit(notes)
+            note_box.setReadOnly(True)
+            note_box.setMaximumHeight(112)
+            note_box.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+            note_box.setFocusPolicy(Qt.NoFocus)   # 只读说明不该抢焦点（否则蓝框落在它身上）
+            root.addWidget(note_box)
+
+        cards = QHBoxLayout()
+        cards.setSpacing(14)
+        root.addLayout(cards, 1)
+
+        # ── 左栏：本站加速通道 ─────────────────────────────────
+        grp_cos = QGroupBox("🚀 本站加速通道（COS）")
+        v_cos = QVBoxLayout(grp_cos)
+        v_cos.setSpacing(8)
+        if self._needs_code:
+            d_cos = QLabel("内部工作人员使用。填入下载码后从本站直连下载，国内通常比 GitHub 快。")
+        else:
+            d_cos = QLabel("这次更新由本站直接提供安装包（旧版清单自带下载地址），点下面按钮即可。")
+        d_cos.setWordWrap(True)
+        v_cos.addWidget(d_cos)
+        self._code_edit = None
+        if self._needs_code:
+            self._code_edit = QLineEdit()
+            self._code_edit.setPlaceholderText("ABCD-EFGH（8 位，不分大小写）")
+            self._code_edit.setMaxLength(16)
+            self._code_edit.textEdited.connect(self._on_code_edited)
+            self._code_edit.returnPressed.connect(self._on_use_cos)
+            v_cos.addWidget(self._code_edit)
+            hint = QLabel("没有下载码？找超级管理员要；本机是已授权设备时，可在"
+                          "「帮助 → 安装包下载码」里看到当前这一串。")
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color:#8a8a8a;")
+            v_cos.addWidget(hint)
+        self._err = QLabel(str(error or ""))
+        self._err.setWordWrap(True)
+        self._err.setStyleSheet("color:#d9534f;")
+        self._err.setVisible(bool(error))
+        v_cos.addWidget(self._err)
+        v_cos.addStretch(1)
+        self._btn_cos = QPushButton("用下载码更新" if self._needs_code else "从本站下载")
+        self._btn_cos.clicked.connect(self._on_use_cos)
+        v_cos.addWidget(self._btn_cos)
+        cards.addWidget(grp_cos, 1)
+
+        # ── 右栏：GitHub Release ──────────────────────────────
+        grp_gh = QGroupBox("🐙 GitHub Release")
+        v_gh = QVBoxLayout(grp_gh)
+        v_gh.setSpacing(8)
+        d_gh = QLabel("公开、免费、不限量。打开 Release 页面在浏览器里下载安装包，"
+                      "下好双击安装即可（本工具不会退出）。")
+        d_gh.setWordWrap(True)
+        v_gh.addWidget(d_gh)
+        gh_hint = QLabel("国内直连较慢时，可以先试左栏的加速通道。")
+        gh_hint.setWordWrap(True)
+        gh_hint.setStyleSheet("color:#8a8a8a;")
+        v_gh.addWidget(gh_hint)
+        v_gh.addStretch(1)
+        self._btn_gh = QPushButton("打开 GitHub 下载页")
+        self._btn_gh.clicked.connect(self._on_use_github)
+        v_gh.addWidget(self._btn_gh)
+        cards.addWidget(grp_gh, 1)
+
+        foot = QHBoxLayout()
+        foot.addWidget(QLabel("选一个渠道；点「稍后」下次再升。"))
+        foot.addStretch(1)
+        btn_later = QPushButton("稍后")
+        btn_later.clicked.connect(self.reject)
+        foot.addWidget(btn_later)
+        root.addLayout(foot)
+
+        # 推荐渠道是 GitHub（免费公开）：默认焦点给它，回车也落在它上面
+        self._btn_gh.setDefault(True)
+        self._btn_gh.setAutoDefault(True)
+        self._btn_cos.setAutoDefault(False)
+        btn_later.setAutoDefault(False)
+        # 需要码时把光标放进输入框：用户打开窗口就能直接粘码，不用先用鼠标点一下
+        if self._code_edit is not None:
+            self._code_edit.setFocus()
+
+    # ── 交互 ────────────────────────────────────────────────
+    def _on_code_edited(self, text: str) -> None:
+        """输入时把字母转大写、自动补连字符，省得用户记格式。"""
+        raw = "".join(ch for ch in str(text or "").upper() if ch.isalnum())
+        pretty = raw if len(raw) <= 4 else f"{raw[:4]}-{raw[4:12]}"
+        if pretty != text:
+            self._code_edit.setText(pretty)
+            self._code_edit.setCursorPosition(len(pretty))
+
+    def _on_use_cos(self) -> None:
+        if self._needs_code:
+            try:
+                from updater import normalize_download_code
+                code = normalize_download_code(self._code_edit.text())
+            except Exception as e:  # noqa: BLE001 —— 长度不对（ValueError）/导入失败都按"码不对"提示
+                self._err.setText(f"{e}。没有下载码就改走右边 GitHub。")
+                self._err.setVisible(True)
+                self._code_edit.setFocus()
+                return
+            self.code = code
+        self.choice = self.COS
+        self.accept()
+
+    def _on_use_github(self) -> None:
+        self.choice = self.GITHUB
+        self.accept()
+
+
+# ============================================================
 # 主窗口
 # ============================================================
 
@@ -10778,31 +10934,10 @@ class MainWindow(QMainWindow):
             if manual:
                 # S1-02 改动 4（2026-10-23）：只有**这一次明确点击**才允许进入下载 → 生成
                 # update.cmd（/VERYSILENT 静默安装）。
-                # 2026-11 起默认按钮改成「从 GitHub 下载」：GitHub Release 免费、公开、
-                # 不限量；本站 COS 通道是内部人员用的，要走它必须有超级管理员创建的下载码。
-                if needs_code:
-                    code = self._ask_download_code(manifest)
-                    if code:
-                        self._perform_update(manifest, code=code)
-                    return
-                msg += ("\n\n推荐直接从 GitHub 下载安装包（免费、不限速，任何人都能下）。\n"
-                        "本站加速通道仅限内部工作人员使用，需要超级管理员创建的下载码。")
-                box = QMessageBox(self)
-                box.setIcon(QMessageBox.Question)
-                box.setWindowTitle("发现新版本")
-                box.setText(msg)
-                btn_gh = box.addButton("从 GitHub 下载", QMessageBox.AcceptRole)
-                btn_code = box.addButton("输入下载码后更新", QMessageBox.ActionRole)
-                btn_later = box.addButton("稍后", QMessageBox.RejectRole)
-                box.setDefaultButton(btn_gh)
-                box.exec()
-                clicked = box.clickedButton()
-                if clicked is btn_gh:
-                    self._open_github_release()
-                elif clicked is btn_code:
-                    code = self._ask_download_code(manifest)
-                    if code:
-                        self._perform_update(manifest, code=code)
+                # 2026-11-24 用户要求：不再「先弹一句话框再弹输入框」——直接开左右两栏的
+                # 「发现新版本」窗口（左 COS 要码 / 右 GitHub 免费），选哪栏由用户当场决定。
+                # 这也是唯一能让更新进入下载的入口：窗口里的按钮点下去才调 _perform_update。
+                self._prompt_update_channel(manifest, needs_code=needs_code)
             else:
                 # 启动检查（manual=False）：**只提示**，不下载、不写 update.cmd、不安装。
                 # 用户此刻多半正要开工，自动装会打断打印（旧行为：启动 4 秒弹「是否立即更新」，
@@ -10986,28 +11121,25 @@ class MainWindow(QMainWindow):
             message, suggest_github = (manifest if isinstance(manifest, tuple)
                                        else (str(manifest), True))
             self._log(f"⚠ 下载码未通过校验：{message}")
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Warning)
-            box.setWindowTitle("下载码未通过校验")
-            box.setText(f"{message}\n\n"
-                        "下载码由超级管理员创建，形如 ABCD-EFGH，区分不了大小写。")
-            btn_gh = None
-            if suggest_github:
-                btn_gh = box.addButton("从 GitHub 下载", QMessageBox.AcceptRole)
-            btn_retry = box.addButton("重新输入下载码", QMessageBox.ActionRole)
-            btn_close = box.addButton("关闭", QMessageBox.RejectRole)
-            box.setDefaultButton(btn_gh or btn_close)
-            box.exec()
-            clicked = box.clickedButton()
-            if btn_gh is not None and clicked is btn_gh:
-                self._open_github_release()
-            elif clicked is btn_retry:
-                # 版本信息还在（预先存下），不需要重新请求清单
-                manifest2 = getattr(self, '_update_needs_code_manifest', None)
-                if isinstance(manifest2, dict):
-                    code = self._ask_download_code(manifest2)
-                    if code:
-                        self._perform_update(manifest2, code=code)
+            # 2026-11-24：不再单开一个「下载码未通过校验」框 —— 回到同一个左右两栏窗口，
+            # 把失败原因显示在左栏（用户可以就地改码，或直接改走右栏 GitHub）。
+            manifest2 = getattr(self, '_update_needs_code_manifest', None)
+            if isinstance(manifest2, dict):
+                self._prompt_update_channel(manifest2, needs_code=True, error=message)
+            else:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Warning)
+                box.setWindowTitle("下载码未通过校验")
+                box.setText(f"{message}\n\n"
+                            "下载码由超级管理员创建，形如 ABCD-EFGH，区分不了大小写。")
+                btn_gh = None
+                if suggest_github:
+                    btn_gh = box.addButton("从 GitHub 下载", QMessageBox.AcceptRole)
+                btn_close = box.addButton("关闭", QMessageBox.RejectRole)
+                box.setDefaultButton(btn_gh or btn_close)
+                box.exec()
+                if btn_gh is not None and box.clickedButton() is btn_gh:
+                    self._open_github_release()
         elif kind == "download_fail":
             if getattr(self, '_update_cancelled', False):
                 QMessageBox.information(self, "更新已取消", "更新下载已取消。")
@@ -11055,7 +11187,8 @@ class MainWindow(QMainWindow):
         else:
             valid = "定期更换"
         text = (f"当前安装包下载码：{code}\n{valid}\n\n"
-                "更新时在「立即下载并更新」的输入框里填这串码即可（不分大小写）。\n"
+                "更新时点「帮助 → 检查更新」，在「发现新版本」窗口左栏（本站加速通道）\n"
+                "填这串码即可（不分大小写）；右栏是 GitHub 免费下载。\n"
                 "公开用户请直接从 GitHub Release 下载安装包（免费、不限量）。")
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Information)
@@ -11068,41 +11201,40 @@ class MainWindow(QMainWindow):
             QApplication.clipboard().setText(code)
             self._log("☁ 安装包下载码已复制到剪贴板")
 
-    def _ask_download_code(self, manifest: dict):
-        """向用户要「下载码」（由超级管理员创建，8 位字母数字）。
+    def _prompt_update_channel(self, manifest: dict, needs_code=None, error: str = ""):
+        """发现新版本 → 弹「左 COS / 右 GitHub」窗口，并按用户点的那一栏分派。
 
-        返回规范化后的 `XXXX-XXXX`；用户取消返回空串（并在确认后打开 GitHub）。
+        这是**唯一**能让更新进入「下载 + 静默安装」的入口（_perform_update 的调用点只在这里）：
+        用户点了左栏的「用下载码更新」或右栏的「打开 GitHub 下载页」才继续，
+        「稍后」/Esc 一律什么都不做。
+
+        `needs_code=None` 时按清单自己判断（没带 url = 必须凭码）；
+        传 `error` 表示这是「上一次编码校验失败」的重开，把原因显示在左栏。
         """
-        from PySide6.QtWidgets import QInputDialog
-        try:
-            from updater import normalize_download_code, GITHUB_RELEASE_URL
-        except Exception:
-            return ""
-        version = str((manifest or {}).get("version") or "")
-        while True:
-            box = QInputDialog(self)
-            box.setWindowTitle("从本站加速通道更新")
-            box.setLabelText(
-                f"新版本 v{version} 需要下载码才能从本站加速通道下载。\n\n"
-                "下载码由管理员创建，形如 ABCD-EFGH（不分大小写）。\n"
-                "如果手上没有下载码，请点「取消」，改从 GitHub Release 下载\n"
-                "（公开、免费、不限量）。")
-            box.setInputMode(QInputDialog.TextInput)
-            box.resize(520, 220)
-            ok = box.exec()
-            if not ok:
-                ans = QMessageBox.question(
-                    self, "没有下载码？",
-                    "本站加速通道仅限内部工作人员使用。\n\n"
-                    "要现在打开 GitHub Release 下载页吗？（免费、不限量，任何人都能下）",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-                if ans == QMessageBox.Yes:
-                    self._open_github_release()
-                return ""
+        if needs_code is None:
             try:
-                return normalize_download_code(box.textValue())
-            except ValueError as e:
-                QMessageBox.warning(self, "下载码格式不对", f"{e}\n\n请核对后重新输入。")
+                from updater import manifest_needs_code
+                needs_code = manifest_needs_code(manifest)
+            except Exception:
+                needs_code = True
+        dlg = UpdateChannelDialog(
+            self,
+            version=str((manifest or {}).get("version") or ""),
+            current_version=APP_VERSION,
+            notes=str((manifest or {}).get("notes") or "").strip(),
+            needs_code=bool(needs_code),
+            error=error)
+        accepted = dlg.exec() == QDialog.Accepted
+        choice, code = dlg.choice, dlg.code
+        dlg.deleteLater()
+        if not accepted or not choice:
+            return
+        # 「重新输入下载码」也要能不重新拉清单：版本信息已经验签过，存下来给重试路径用
+        self._update_needs_code_manifest = manifest if needs_code else None
+        if choice == UpdateChannelDialog.GITHUB:
+            self._open_github_release()
+            return
+        self._perform_update(manifest, code=code)
 
     def _setup_theme_menu(self, menu):
         """构建主题切换子菜单（单选模式）。"""

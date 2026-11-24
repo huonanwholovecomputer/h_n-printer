@@ -122,6 +122,12 @@ def func_source(src: str, name: str) -> str:
     return src[start:] if not nxt else src[start:m.end() + nxt.start()]
 
 
+def class_source(src: str, name: str) -> str:
+    """截取一个类体（到下一个顶层 class/def 或文件尾）。"""
+    m = re.search(rf"^class {re.escape(name)}\b.*?(?=^class |^def |\Z)", src, re.M | re.S)
+    return m.group(0) if m else ""
+
+
 def top_level_const(src: str, name: str):
     try:
         tree = ast.parse(src)
@@ -463,41 +469,54 @@ def run_static():
     check('GUI 源码可读', bool(gui), GUI_PY)
     result_fn = func_source(gui, "_on_update_check_result")
     check("启动检查路径写明「启动时不会自动更新」", "启动时不会自动更新" in result_fn)
-    check("更新确认框有「稍后」按钮", "稍后" in result_fn)
-    check("默认按钮设成稍后（setDefaultButton(btn_later)）",
-          "setDefaultButton(btn_later)" in result_fn)
-    check("不再用「默认 Yes」的二选一框（QMessageBox.Yes 计数为 0）",
-          "QMessageBox.Yes" not in result_fn)
-    # 2026-11（COS 下载码）：发起下载的入口从「一处」变成「两种用户动作」——
-    #   ① 检查更新结果框里（manual 分支，用户点了下载/输了码）；
-    #   ② 「下载码未通过校验」后再点「重新输入下载码」（_on_update_ready 里，同样是用户点出来的）。
-    # 判据没放松：仍然是「所有发起下载都排在任何自动路径之后，且必先拿到用户的码」。
+    check("启动定时器注释写明「只提示」（防回归成自动下载）",
+          "启动检查**只提示**" in gui)
+
+    # 2026-11-24（用户现场反馈「三连框太碎」）：发现新版本只剩**一个**窗口，
+    # 左栏 COS（要下载码）/ 右栏 GitHub，「稍后」= 什么都不做。
+    # 判据没放松：发起下载仍然只发生在用户明确点出来的那一支，且必先拿到用户的码。
+    dlg_fn = class_source(gui, "UpdateChannelDialog")
+    check("新增「发现新版本」双栏窗口 UpdateChannelDialog",
+          "class UpdateChannelDialog(QDialog)" in gui)
+    check("独立的 QInputDialog 要码框已删除（_ask_download_code 残留 0）",
+          gui.count("_ask_download_code") == 0,
+          f"残留 {gui.count('_ask_download_code')} 处")
+    check("窗口里左栏是本站加速通道（COS）、右栏是 GitHub Release",
+          "本站加速通道（COS）" in dlg_fn and "GitHub Release" in dlg_fn
+          and dlg_fn.find("grp_cos") < dlg_fn.find("grp_gh"),
+          "左 COS / 右 GitHub 的布局顺序写反了")
+    check("「稍后」按钮只做 reject（不下载、不装）",
+          'QPushButton("稍后")' in dlg_fn and "self.reject" in dlg_fn)
+    check("默认按钮是 GitHub（免费公开那栏），不是加速通道",
+          "self._btn_gh.setDefault(True)" in dlg_fn)
+    check("左栏失败原因就地显示（error 标签），不再关框重开",
+          "self._err.setText(" in dlg_fn and "setVisible(True)" in dlg_fn)
+    check("输入即大写 + 自动补连字符（用户不用记格式）",
+          "_on_code_edited" in dlg_fn and ".upper()" in dlg_fn)
+
     ready_fn = func_source(gui, "_on_update_ready")
-    calls_in_result = result_fn.count("self._perform_update(")
-    calls_in_ready = ready_fn.count("self._perform_update(")
-    check("发起下载的调用点只在这两处：检查更新结果框 + 「重新输入下载码」回调",
-          gui.count("self._perform_update(") == calls_in_result + calls_in_ready
-          and calls_in_result >= 1,
-          f"total={gui.count('self._perform_update(')} result={calls_in_result} ready={calls_in_ready}")
+    prompt_fn = func_source(gui, "_prompt_update_channel")
+    total_calls = gui.count("self._perform_update(")
+    check("★ 发起下载的调用点全仓库只有 1 处：_prompt_update_channel（用户点完窗口才走）",
+          total_calls == 1 and "self._perform_update(" in prompt_fn,
+          f"total={total_calls}")
+    check("窗口是唯一入口：_on_update_check_result 只调 _prompt_update_channel",
+          "_prompt_update_channel(" in result_fn
+          and "self._perform_update(" not in result_fn)
     manual_pos = result_fn.find("if manual:")
-    first_call = result_fn.find("self._perform_update(")
+    prompt_pos = result_fn.find("_prompt_update_channel(")
     check("结果框里所有发起下载都在 manual 分支之后（启动静默检查绝不自动下载）",
-          manual_pos >= 0 and first_call > manual_pos,
-          f"manual@{manual_pos} first_call@{first_call}")
-    check("需要下载码的清单：先问码（_ask_download_code）再下载",
-          first_call >= 0
-          and "_ask_download_code(" in result_fn
-          and result_fn.find("_ask_download_code(") < first_call)
-    check("「重新输入下载码」回调同样先问码再下载",
-          "_ask_download_code(" in ready_fn
-          and ready_fn.find("_ask_download_code(") < ready_fn.find("self._perform_update(")
-          if calls_in_ready >= 1 else True)
+          manual_pos >= 0 and prompt_pos > manual_pos,
+          f"manual@{manual_pos} prompt@{prompt_pos}")
+    check("★ 校验失败时用同一个窗口重开（带 error 文案），不再单开一个失败框",
+          "_prompt_update_channel(" in ready_fn and "error=message" in ready_fn)
+    check("窗口按 choice 分派：GITHUB → 打开 Release 页，COS → 带码下载",
+          "GITHUB" in prompt_fn and "_open_github_release()" in prompt_fn
+          and "code=code" in prompt_fn)
     check("下载时传 user_confirmed=True（第二道闸）",
           "user_confirmed=True" in func_source(gui, "_update_download_worker"))
     check("生成 update.cmd 时显式 allow_silent_install=True",
           "allow_silent_install=True" in func_source(gui, "_update_download_worker"))
-    check("启动定时器注释写明「只提示」（防回归成自动下载）",
-          "启动检查**只提示**" in gui)
     write_cmd = api("write_update_cmd")
     if write_cmd is not None:
         tmp = new_tmpdir()
