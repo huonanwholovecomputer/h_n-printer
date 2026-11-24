@@ -4756,6 +4756,62 @@ def fetch_and_lock_task(client_id):
 # ==================== 定时任务：扫描并推送打印任务 ====================
 
 
+class _WaitThrottle:
+    """把 `[WAIT]` 从「每轮每个子任务一行」收敛成「首次 + 每 10 分钟」，并在等太久时升级。
+
+    现场（2026-11-24 日志体检 P1-3）：25 个子任务被绑在旧 client_id
+    `R7000-AHP10-168dbdc3d1` 上，扫描器把它们轮询了 **10,234 次**；
+    `扫描到 10 个排队子任务` 出现 857 次 —— 积压长期存在，而日志除了刷屏没告诉人任何东西
+    （哪个单、等了多久、目标设备是谁，一个都没有）。
+
+    只做记账与措辞，**不碰排队语义**：不判失败、不改状态、不自动改派
+    （人工订正只允许终态的硬规矩照旧）。
+    """
+
+    REPEAT_EVERY_S = 600.0      # 同一个子任务最多每 10 分钟再念一次
+    ESCALATE_AFTER_S = 1800.0   # 等超过 30 分钟 ⇒ 升级一条，点名订单号与目标设备
+
+    def __init__(self, now_fn=None):
+        self._now = now_fn or time.time
+        self._state: dict[int, dict] = {}
+        self._lock = threading.Lock()
+
+    def note(self, of_id: int, ident: str, reason: str, extra: str = "") -> str | None:
+        """返回这一轮要打印的行；None = 这一轮不吭声。"""
+        now = self._now()
+        with self._lock:
+            st = self._state.get(of_id)
+            if st is None:
+                self._state[of_id] = {"first": now, "last": now, "n": 1,
+                                      "esc": False, "ident": ident}
+                return f"  [WAIT] 子任务 #{of_id}: {reason}，保持排队{extra}"
+            st["n"] += 1
+            st["ident"] = ident
+            waited = now - st["first"]
+            if not st["esc"] and waited >= self.ESCALATE_AFTER_S:
+                st["esc"] = True
+                st["last"] = now
+                return (f"  [WAIT] 子任务 #{of_id}: 已排队 {waited / 60:.0f} 分钟仍未派出"
+                        f"（目标设备 {ident or '-'}，累计 {st['n']} 次扫描）"
+                        f" —— 目标设备身份可能已更换，请人工改派或作废{extra}")
+            if now - st["last"] >= self.REPEAT_EVERY_S:
+                st["last"] = now
+                return (f"  [WAIT] 子任务 #{of_id}: {reason}"
+                        f"（已等 {waited / 60:.0f} 分钟，累计 {st['n']} 次扫描）{extra}")
+            return None
+
+    def forget_absent(self, seen: set) -> int:
+        """本轮没再出现的子任务（已派出 / 已取消）从状态里剔除，防止状态无限增长。"""
+        with self._lock:
+            gone = [k for k in self._state if k not in seen]
+            for k in gone:
+                self._state.pop(k, None)
+            return len(gone)
+
+
+_wait_throttle = _WaitThrottle()
+
+
 def process_pending_orders():
     """扫描排队中的子任务（order_files）：当目标打印机客户端上线时，推送排队任务。
     2026-12：多设备接单 —— 订单指定了目标设备（target_client）则只发往该设备，
@@ -4766,7 +4822,7 @@ def process_pending_orders():
         SELECT of.id AS of_id, of.order_id, of.file_id, of.file_name,
                of.copies, of.page_range, of.duplex, of.image_orientation,
                of.simplex_pages, of.blank_tail_exclude,
-               o.auto_print, o.target_client
+               o.auto_print, o.target_client, o.order_number
         FROM order_files of
         JOIN orders o ON of.order_id = o.id
         WHERE of.status = 'queued'
@@ -4788,8 +4844,10 @@ def process_pending_orders():
         print("  无启用接单的打印机，订单保持排队（等待接单设备上线）")
         return
 
+    seen_ids: set = set()
     for row in rows:
         of_id = row["of_id"]
+        seen_ids.add(of_id)
         order_id = row["order_id"]
         file_id = row["file_id"]
         file_name = row["file_name"]
@@ -4797,17 +4855,32 @@ def process_pending_orders():
         page_range = row["page_range"] or ""
         duplex = row["duplex"]
         target_client = row["target_client"] or ""
+        # 订单号只用于把 [WAIT] 与结算页那笔单对上（同一子任务被轮询上千次时，
+        # 光有 of_id 在现场查不到是哪一单）
+        try:
+            _order_no = row["order_number"] or ""
+        except (IndexError, KeyError):
+            _order_no = ""
 
         # 确定目标设备：指定设备 → 仅该设备（须在接单集合且在线）；未指定 → 任一在线接单设备
         if target_client:
             if target_client not in claiming_ids or target_client not in online:
-                print(f"  [WAIT] 子任务 #{of_id}: 目标设备 {target_client} 未在线/未接单，保持排队")
+                _line = _wait_throttle.note(
+                    of_id, target_client,
+                    f"目标设备 {target_client} 未在线/未接单",
+                    extra=(f"（订单 {_order_no}）" if _order_no else ""))
+                if _line:
+                    print(_line)
                 continue
             dest_client = target_client
         else:
             dest_client = next((c for c in claiming_ids if c in online), None)
             if not dest_client:
-                print(f"  [WAIT] 子任务 #{of_id}: 无在线接单设备，保持排队")
+                _line = _wait_throttle.note(
+                    of_id, "", "无在线接单设备",
+                    extra=(f"（订单 {_order_no}）" if _order_no else ""))
+                if _line:
+                    print(_line)
                 continue
 
         # 查找文件路径
@@ -4853,6 +4926,9 @@ def process_pending_orders():
 
         # 推送失败：保持 queued，等待下次扫描
         print(f"  [WAIT] 子任务 #{of_id}: 推送失败，保持排队")
+
+    # 本轮已经不在 queued 里的子任务（派出 / 取消）从节流状态剔除，防状态无限增长
+    _wait_throttle.forget_absent(seen_ids)
 
 
 # ── 预约单 start_print 兜底推送的节流状态（2026-11-10 现场 HN20261110-0005）──────────

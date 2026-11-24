@@ -26,6 +26,53 @@ from typing import Callable
 from urllib.parse import unquote
 
 logger = logging.getLogger(__name__)
+com_err_logger = logging.getLogger("com.error")
+
+# Office COM/RPC 失联的 HRESULT（2026-11-24 日志体检：7 天 389 条，业务日志只认 2 条）。
+#   -2147023174 / 0x800706BA  RPC_S_SERVER_UNAVAILABLE —— 服务端（WINWORD/WPS）没了
+#   -2147023170 / 0x800706BE  RPC_S_CALL_FAILED         —— 调用中途断
+#   -2147417848 / 0x80010108  RPC_E_DISCONNECTED        —— 对象存在但连接断了
+#   -2147023179 / 0x800706B5  RPC_S_UNKNOWN_AUTHN_SERVICE
+#   -2147418111 / 0x80010001  RPC_E_CALL_REJECTED       —— 实例忙（通常自带重试）
+_RPC_LOST_CODES = frozenset({
+    -2147023174, -2147023170, -2147417848, -2147023179, -2147418111,
+})
+_RPC_LOST_NAMES = ("RPC_S_SERVER_UNAVAILABLE", "RPC_S_CALL_FAILED",
+                   "RPC_E_DISCONNECTED", "RPC_S_UNKNOWN_AUTHN_SERVICE",
+                   "RPC 服务器不可用", "0x800706ba", "0x800706be",
+                   "0x80010108", "0x800706b5")
+
+
+def _rpc_error_code(exc: BaseException) -> int:
+    """从 pywintypes.com_error 里取 HRESULT（取不到返回 0）。"""
+    for attr in ("hresult", "args"):
+        val = getattr(exc, attr, None)
+        if attr == "args":
+            if val:
+                val = val[0]
+            else:
+                continue
+        try:
+            if isinstance(val, int):
+                return int(val) if int(val) < 0 else int(val) - (1 << 32)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def is_rpc_lost(exc: BaseException) -> bool:
+    """这个异常是不是「Office COM 实例失联」（而不是坏文档）。
+
+    用途（本批只用于**分类与记录**，恢复策略见 P1-1）：坏文档抛的是
+    `RuntimeError: docx 直转产物无效` / `Package not found` / `Bad CRC-32` 之类，
+    它们不该被当成实例失联去重建池实例；反过来 0x800706BA 也不该被当成坏文档。
+    """
+    if exc is None:
+        return False
+    if _rpc_error_code(exc) in _RPC_LOST_CODES:
+        return True
+    text = f"{type(exc).__name__}: {exc}"
+    return any(name in text for name in _RPC_LOST_NAMES)
 
 
 def _com_uninitialize_quietly() -> None:
@@ -829,6 +876,10 @@ def _convert_via_wps_com(file_path: str, output_pdf: str) -> None:
 # 单份文件在池里最长等多久；超时的实例标记为「卡死」不再派活（它会一直占着那个线程），
 # 由看门狗在调用方抛错，GUI 照旧降级到 LibreOffice。
 _POOL_JOB_TIMEOUT = 600.0
+# COM 实例失联后对**同一件**活的重投上限（2026-11-24 P1-1）。1 次足够：失联是环境掉了，
+# 重建实例后同一份文件几乎必然成功；给 2 次只会让真坏的文件多等两轮。坏文档（不匹配
+# is_rpc_lost）一次都不重投。
+_RPC_RETRY_LIMIT = 1
 
 
 def _convert_pool_enabled() -> bool:
@@ -863,15 +914,20 @@ def _convert_pool_idle_ttl() -> float:
 
 
 class _PoolJob:
-    """池里的一件活：把 `src` 转成 `dst`。`done` 由执行线程置位，`error` 原样带回调用方。"""
+    """池里的一件活：把 `src` 转成 `dst`。`done` 由执行线程置位，`error` 原样带回调用方。
 
-    __slots__ = ("src", "dst", "done", "error")
+    `retries`：COM 实例失联后的重投次数（2026-11-24 P1-1）。只对**实例失联**计数，
+    坏文档不重投（重投一次也还是坏，白等一轮）。
+    """
+
+    __slots__ = ("src", "dst", "done", "error", "retries")
 
     def __init__(self, src: str, dst: str):
         self.src = src
         self.dst = dst
         self.done = threading.Event()
         self.error: BaseException | None = None
+        self.retries = 0
 
 
 # 队列里的两种哨兵：停止（收尾）/ 预热（只建实例，不转文件）
@@ -895,6 +951,7 @@ class _ComPoolWorker(threading.Thread):
         self._busy = False
         self._hung = False       # 单份任务超时 ⇒ 这个实例卡死了，别再派活给它
         self._failures = 0       # 连续失败次数（成功一次就清零）
+        self._rpc_lost_count = 0  # RPC 失联累计次数（只增，给 com_errors.log 与汇总用）
 
     # ── 供池（主线程）读取的状态 ──
     def load(self) -> int:
@@ -990,19 +1047,43 @@ class _ComPoolWorker(threading.Thread):
                         logger.debug(f"{self.label} 池预热失败: {e}")
                     continue
                 self._busy = True
+                requeued = False
                 try:
                     self._ensure_app()
                     self._convert_one(job)
                     self._failures = 0
                 except Exception as e:  # noqa: BLE001
-                    job.error = e
-                    self._failures += 1
-                    # 单份坏文档不该拖垮池（连续失败阈值留一次容错）；
-                    # 但实例真的失联了（探活失败）必须立刻换一个。
-                    if self._failures >= 2 or not self._app_alive():
+                    lost = is_rpc_lost(e)
+                    # 2026-11-24 日志体检：这类失败原来只有 faulthandler 里那行无时间戳的
+                    # `Windows fatal exception: code 0x800706ba`，业务日志里只有当它一路
+                    # 恶化到降级 LibreOffice 时才留一条 —— 389 条 vs 2 条。这里按「实例失联」
+                    # 与「其它」分开记：前者进 com_errors.log 并计入统计，后者保持原样。
+                    if lost:
+                        self._rpc_lost_count += 1
+                        com_err_logger.warning(
+                            "%s COM 实例失联（code=0x%08x，第 %d 次，本实例连续失败 %d 次，"
+                            "本件已重试 %d 次）：%s",
+                            self.label, _rpc_error_code(e) & 0xFFFFFFFF,
+                            self._rpc_lost_count, self._failures + 1, job.retries, e)
+                    if lost and job.retries < _RPC_RETRY_LIMIT:
+                        # P1-1：实例失联是"环境掉了"，不是"这份文件坏了"。立刻重建实例，并把
+                        # **同一件**活重投一次（旧逻辑要等 _failures >= 2 才重建，于是第一份
+                        # 文件注定跑在死实例上白失败一次，还得靠下一次调度碰巧换实例自愈）。
+                        # 重投不置 done：调用方（submit_and_wait）等的还是同一个事件。
+                        job.retries += 1
                         self._reset_app()
+                        self._q.put(job)
+                        requeued = True
+                    else:
+                        job.error = e
+                        self._failures += 1
+                        # 单份坏文档不该拖垮池（连续失败阈值留一次容错）；
+                        # 但实例真的失联了（探活失败）必须立刻换一个。
+                        if self._failures >= 2 or not self._app_alive():
+                            self._reset_app()
                 finally:
-                    job.done.set()
+                    if not requeued:
+                        job.done.set()
                     self._busy = False
         finally:
             self._reset_app()

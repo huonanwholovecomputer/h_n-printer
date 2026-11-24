@@ -223,6 +223,34 @@ def pdf_cache_key(source_md5: str, image_orientation: str = "", engine: str = ""
     return parts
 
 
+def resolve_cached_page_count(meta: dict | None, pdf_path: str, info_fn=None) -> int:
+    """缓存命中时的页数：索引里的 0 只是「下载时还没数页」的占位，**不能当真页数**。
+
+    现场（2026-11-24 日志体检 §2.3）：`_save_pdf_to_cache(..., page_count=0)` 是正常写法
+    —— 下载完成时注释就写着"页数在打印时确定"（cloud_client.py `_download_file_inner`）。
+    可云端的缓存命中分支见 0 就跳过 `get_pdf_info`、直接记「→ 0 页」，那 0 又进了报价
+    （11-23 22:20 记 0 页、22:32 同一单实际打了 20 页）。
+
+    所以判据是「索引正数就用索引；<=0 就回 PDF 本身数」——用的是**同一把 `get_pdf_info`**，
+    不另立计费口径（硬规矩 7），也不替它编数字。
+    """
+    try:
+        n = int((meta or {}).get("page_count") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n > 0:
+        return n
+    try:
+        fn = info_fn
+        if fn is None:
+            from pdf_printer import get_pdf_info as fn  # noqa: PLC0415
+        info = fn(pdf_path) or {}
+        return int(info.get("page_count", 0) or 0)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"缓存命中回读页数失败: {pdf_path} ({e})")
+        return 0
+
+
 def get_cached_pdf_path(source_md5: str, image_orientation: str = "") -> str | None:
     """模块级函数：检查 PDF 缓存（供 PrintWorker 使用）。
     返回缓存 PDF 路径，无缓存返回 None。"""

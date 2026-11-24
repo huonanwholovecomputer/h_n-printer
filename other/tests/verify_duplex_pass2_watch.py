@@ -15,6 +15,8 @@
   ② 常驻窗"确认态"（prev2）：文案是**上一批第 2 趟**的已用/预计、按钮叫
      「✔ 确定上一个任务已完成」、`_on_go` 只发 prev_pass2_confirmed（绝不发
      continue_requested —— 那会被 worker 当成"翻纸了"直接去打上一批第 2 趟）；
+     该按钮也走**放行比例**（2026-11-23）：不到「上一批第 2 趟预估 × 比例」是禁用态，
+     到点自动放开，且闸门钳在 worker 的自动放行时刻之内；
   ③ worker 闸门：确认 → 本批第 1 趟照打 + 这笔实测发样本；到期没事人确认 → 照常开打
      **但不写样本**（没人看见纸）；跳过/取消 → 一页纸都不打；
   ④ 主线程：确认写 Pass2Watch、第 2 趟实测写档案，且**不冻结新批次窗口的计时**；
@@ -264,13 +266,21 @@ check("★ 大号计时显示的是**上一批第 2 趟**的已用/预计（不�
       "上一批第 2 趟" in _dlg._pass1.text()
       and format_duration(7) in _dlg._pass1.text()
       and format_duration(40) in _dlg._pass1.text(), _dlg._pass1.text())
-check("★ 按钮就叫「✔ 确定上一个任务已完成」且立刻可点",
-      _dlg._btn_go.text() == "✔ 确定上一个任务已完成" and _dlg._btn_go.isEnabled())
+check("★ 按钮就叫「✔ 确定上一个任务已完成」，但放行比例没到 ⇒ 禁用（2026-11-23 防误触）",
+      _dlg._btn_go.text() == "✔ 确定上一个任务已完成" and not _dlg._btn_go.isEnabled()
+      and abs(_dlg._prev_gate_at - 20.0) < 0.01,
+      f"gate={_dlg._prev_gate_at} enabled={_dlg._btn_go.isEnabled()}")
+check("禁用时鼠标悬停说清原因（放行比例 / 预计 / 第几秒才可点 / 还能等自动开始）",
+      "放行比例 50%" in _dlg._btn_go.toolTip() and "防误触" in _dlg._btn_go.toolTip()
+      and "预计 00:40" in _dlg._btn_go.toolTip(), _dlg._btn_go.toolTip())
 check("确认态里「跳过本任务」也可点（不想等就明说）",
       _dlg._btn_skip.text() == "⏭ 跳过本任务" and _dlg._btn_skip.isEnabled())
 check("倒计时提示「还有多久自动开始本批」，并说明到点就不再等",
       "自动开始本批" in _dlg._countdown.text() and "还有" in _dlg._countdown.text(),
       _dlg._countdown.text())
+check("没到放行比例时倒计时那行写明「还要多久才允许按确认」",
+      "放行比例 50%" in _dlg._countdown.text() and "才允许按「确定上一个任务已完成」"
+      in _dlg._countdown.text(), _dlg._countdown.text())
 
 # 已用时间随时间走（不再从 0 起跑，接的是 worker 报的已用）
 _dlg._prev_base = 7.0
@@ -281,8 +291,21 @@ _dlg._pass1_tick()
 check("刷新只改文本/配色，不会自己放行（放行只由 worker / 操作员决定）",
       _dlg._mode == "prev2")
 
+_dlg._on_go()
+check("★ 不到放行比例时点确认没有任何反应（按钮禁用 + _on_go 里还有一道守卫）",
+      _dlg._mode == "prev2" and not _conf, f"mode={_dlg._mode} conf={_conf}")
+
 check("到点也不由界面 emit 任何信号（放行是 worker 的到期分支）",
       not _go and not _conf)
+
+# 走到放行比例那一刻（22s ≥ 20s）：下一个 tick 就把按钮放开
+_dlg._prev_base = 22.0
+_dlg._prev_t0.invalidate()
+_dlg._pass1_tick()
+check("★ 到放行比例那一刻按钮自动可点、tooltip 清空、倒计时改回「自动开始本批」",
+      _dlg._btn_go.isEnabled() and _dlg._btn_go.toolTip() == ""
+      and "自动开始本批" in _dlg._countdown.text()
+      and "放行比例" not in _dlg._countdown.text(), _dlg._countdown.text())
 
 _dlg._on_go()
 check("★ 点「确定上一个任务已完成」只发 prev_pass2_confirmed，绝不发 continue_requested"
@@ -291,6 +314,34 @@ check("★ 点「确定上一个任务已完成」只发 prev_pass2_confirmed，
 check("确认后按钮禁用、标题改成「本批马上开始第 1 趟」",
       _dlg._mode == "prev2_confirmed" and not _dlg._btn_go.isEnabled()
       and "本批马上开始第 1 趟" in _dlg._status.text(), _dlg._status.text())
+
+# 放行比例就是档案里那个开关（不是写死 50%），且闸门永远钳在自动放行时刻之内
+_dlg7 = gui.ManualDuplexDialog()
+_dlg7.announce_prev_pass2("说明", sheets=3, estimate_sec=40.0, elapsed_sec=7.0, gate_ratio=1.0)
+check("★ 放行比例取档案值：100% ⇒ 闸门 = 预估 40s（不是写死 50%）",
+      abs(_dlg7._prev_gate_at - 40.0) < 0.01 and not _dlg7._btn_go.isEnabled(),
+      f"gate={_dlg7._prev_gate_at}")
+
+_dlg8 = gui.ManualDuplexDialog()
+_dlg8.announce_prev_pass2("说明", sheets=2, estimate_sec=40.0, elapsed_sec=1.0, gate_ratio=0.0)
+check("放行比例 0% ⇒ 不设闸门，按钮立刻可点（比例就是开关）",
+      _dlg8._prev_gate_at == 0.0 and _dlg8._btn_go.isEnabled(),
+      f"gate={_dlg8._prev_gate_at}")
+
+_dlg7._prev_deadline = 10.0       # 人为把 worker 的自动放行时刻提前
+check("★ 闸门被钳在自动放行时刻之内（按钮按不动 = 把无人值守那条路堵死）",
+      abs(_dlg7._prev2_confirm_gate() - 9.0) < 0.01, f"{_dlg7._prev2_confirm_gate()}")
+
+_dlg9 = gui.ManualDuplexDialog()
+_dlg9.announce("本批第 1 趟开打", sheets=3, estimate_sec=40.0)
+check("★ 闸门只管确认按钮：「▶ 继续打第 2 趟」仍是一出现就可点（硬规矩 12 不变）",
+      _dlg9._btn_go.isEnabled() and _dlg9._btn_go.text().startswith("▶ 继续打第 2 趟"),
+      f"{_dlg9._btn_go.text()} enabled={_dlg9._btn_go.isEnabled()}")
+
+_dlg7.announce("本批第 1 趟开打", sheets=3, estimate_sec=40.0)      # 确认态 → 第 1 趟
+check("★ 确认态那条「放行比例」tooltip 不会挂到「继续打第 2 趟」上（换态就清）",
+      _dlg7._btn_go.toolTip() == "" and _dlg7._btn_go.isEnabled(),
+      _dlg7._btn_go.toolTip())
 
 _dlg2 = gui.ManualDuplexDialog()
 _skip2 = []
@@ -322,7 +373,7 @@ _dlg4.announce("本批第 1 趟开打", sheets=2, estimate_sec=10.0)
 check("确认态之后进正常第 1 趟：计时从 0 起跑、文案回到「第 1 趟」",
       _dlg4._mode == "pass1" and not _dlg4._prev_t0.isValid()
       and "第 1 趟" in _dlg4._pass1.text(), _dlg4._pass1.text())
-for _d in (_dlg, _dlg2, _dlg3, _dlg4):
+for _d in (_dlg, _dlg2, _dlg3, _dlg4, _dlg7, _dlg8, _dlg9):
     _d._close_timer.stop()
     _d.close()
 
@@ -332,7 +383,7 @@ _dlg5.announce_prev_pass2("说明", sheets=2, estimate_sec=10.0, elapsed_sec=1.0
 _dlg5.finish("手动双面批次结束")
 check("★ 上一批晚到的「批次结束」不会收掉确认窗（否则操作员没机会按确认）",
       _dlg5._mode == "prev2" and not _dlg5._close_timer.isActive()
-      and _dlg5._btn_go.isEnabled(), f"mode={_dlg5._mode}")
+      and _dlg5._btn_go.text() == "✔ 确定上一个任务已完成", f"mode={_dlg5._mode}")
 _dlg5._close_timer.stop()
 _dlg5.close()
 
@@ -523,6 +574,15 @@ check("★ 关窗算跳过的态里**没有** prev2（等上一批出纸时关�
       "pass1" in _names and "prev2" not in _names and "remedy_pass2" not in _names,
       f"{_names}")
 
+# 2026-11-23：确认按钮的放行比例必须来自档案（参数不传下去 ⇒ 功能静默消失，跑不出红）
+_i_prev2_call = GUI_SRC.index("dlg.announce_prev_pass2(")
+_i_prev2_call_end = GUI_SRC.index("dlg.set_speed_hint", _i_prev2_call)
+check("★ 确认态也吃档案里的放行比例（_on_duplex_pass2_watch 传 gate_ratio=prof.gate_ratio）",
+      "gate_ratio=prof.gate_ratio" in GUI_SRC[_i_prev2_call:_i_prev2_call_end],
+      GUI_SRC[_i_prev2_call:_i_prev2_call_end].strip()[:200])
+check("★ 确认按钮的开关只有一个来源（_prev2_refresh_gate），不散落在各处手工 setEnabled",
+      GUI_SRC.count("_prev2_refresh_gate(") >= 4)
+
 
 # ============================================================
 # ⑥ 2026-11-22 现场补齐：闸门覆盖**所有**路径 / 双击尾击 / 确认态收窗
@@ -554,6 +614,9 @@ _cont6b, _conf6b = [], []
 _dlg6b.continue_requested.connect(lambda: _cont6b.append(1))
 _dlg6b.prev_pass2_confirmed.connect(lambda: _conf6b.append(1))
 _dlg6b.announce_prev_pass2("上一批还在出纸", sheets=8, estimate_sec=60.0, elapsed_sec=10.0)
+_dlg6b._prev_base = 40.0          # 越过放行比例（60 × 50% = 30s），按钮这时才可点
+_dlg6b._prev_t0.invalidate()
+_dlg6b._pass1_tick()
 _dlg6b._on_go()
 check("确认上一个任务只发 prev_pass2_confirmed（绝不发 continue_requested）",
       _conf6b == [1] and not _cont6b, f"{_conf6b} {_cont6b}")
@@ -567,6 +630,8 @@ check("过了 0.8s 尾击窗口照常可点", _cont6b == [1] and _dlg6b._mode ==
 
 _dlg6c = gui.ManualDuplexDialog()
 _dlg6c.announce_prev_pass2("上一批还在出纸", sheets=8, estimate_sec=60.0, elapsed_sec=10.0)
+_dlg6c._prev_base = 40.0          # 越过放行比例（60 × 50% = 30s）再点确认
+_dlg6c._prev_t0.invalidate()
 _dlg6c._on_go()
 _dlg6c.finish_prev2()
 check("★ 确认态能收窗（finish() 在 prev2 会早退，finish_prev2 才收得掉）",

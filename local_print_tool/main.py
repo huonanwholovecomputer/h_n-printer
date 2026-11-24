@@ -173,6 +173,87 @@ def load_stylesheet(path: str) -> str:
 #   ② threading.excepthook：后台线程里没被捕获的异常以前直接蒸发（云端下载 / 上报 /
 #      页数分析全是后台线程，GUI 主线程看不到），现在落盘 + 进当日日志。
 _CRASH_FH = None          # 保活：faulthandler 只在文件对象上持弱引用，被 GC 就静默失效
+_COM_ERR_HANDLER = None   # 保活：logger 只持 WeakRef，被 GC 就静默停止写 com_errors.log
+
+
+def _emit_crash_to_log(etype, value) -> None:
+    """把未捕获异常写进**业务日志**（2026-11-24 日志体检 D2）。
+
+    独立成模块级函数有两个理由：① 给 verify_logbase.py 一个能直接调的入口；
+    ② 用独立 logger 名（"crash"），避开 main() 里 logger 尚未赋值的窗口期。
+    """
+    try:
+        logging.getLogger("crash").error(
+            "未捕获异常（栈已写 crash_traceback.txt）: %s: %s",
+            getattr(etype, "__name__", etype), value)
+    except Exception:
+        pass
+
+
+def _register_window_end(fh, logger=None):
+    """给 crash_faulthandler.log 补一条「窗口终」边界（2026-11-24 日志体检）。
+
+    为什么需要：faulthandler 的栈块本身没有时间戳，只能靠下一条「进程启动」反推。
+    11-23 12:07:20 那一批横跨 12,602 行才遇到下一个锚点 —— 那 106 条 COM 错误到底
+    分布在 5 分钟还是 5 小时里，从日志里读不出来。补一条退出边界，每批就闭合了：
+    没有边界 = 进程被强杀/崩溃（那本身也是信息）。
+    """
+    import atexit
+    import os as _os
+
+    def _on_exit():
+        try:
+            fh.write(f"===== 进程退出 {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                     f"(pid={_os.getpid()}) =====\n")
+            fh.flush()
+        except Exception:
+            pass
+
+    try:
+        atexit.register(_on_exit)
+    except Exception as e:
+        if logger:
+            logger.warning(f"注册进程退出边界失败（不影响使用）: {e}")
+    return _on_exit
+
+
+def _install_com_error_log(logger=None) -> None:
+    """把 Office COM/RPC 失败从 crash_faulthandler.log 里分出来（2026-11-24 日志体检）。
+
+    为什么要分：7 天里 crash_faulthandler.log 记了 389 条 `Windows fatal exception`，
+    绝大多数是 pywin32 经 SEH 抛出的 com_error，被 converter 捕获后重建实例重试成功
+    —— 进程根本没死。真正的致命崩溃（2026-11-04 那次）就混在这几百条噪音里。
+    分开后：crash_faulthandler.log 只留真正的 SEH 致命栈，COM 失败进 com_errors.log
+    并带次数，业务日志只留汇总（不给每日日志刷屏）。
+
+    RotatingFileHandler（不是 Timed）—— 理由同 daily_log：定时器会在打包环境里
+    拖住退出流程，而这里只需要按大小滚动。
+    """
+    global _COM_ERR_HANDLER
+    if _COM_ERR_HANDLER is not None:
+        return
+    try:
+        import logging.handlers
+
+        path = os.path.join(paths.logs_dir(), "com_errors.log")
+        handler = logging.handlers.RotatingFileHandler(
+            path, maxBytes=2 * 1024 * 1024, backupCount=3,
+            encoding="utf-8", errors="replace")
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s",
+                                              datefmt="%Y-%m-%d %H:%M:%S"))
+        handler.setLevel(logging.INFO)
+        com_logger = logging.getLogger("com.error")
+        com_logger.setLevel(logging.INFO)
+        com_logger.addHandler(handler)
+        com_logger.propagate = False      # 不往每日日志转发：它自己已经有汇总行
+        _COM_ERR_HANDLER = handler
+        if logger:
+            logger.info(f"COM/RPC 失败单独立卷已启用（{path}）")
+    except Exception as e:
+        _COM_ERR_HANDLER = None
+        if logger:
+            logger.warning(f"COM 错误日志未启用（不影响使用）: {e}")
+
 
 
 def install_crash_handlers(logger=None) -> str:
@@ -192,6 +273,7 @@ def install_crash_handlers(logger=None) -> str:
                             f"(pid={os.getpid()}) =====\n")
             _CRASH_FH.flush()
             faulthandler.enable(file=_CRASH_FH, all_threads=True)
+            _register_window_end(_CRASH_FH, logger)
             if logger:
                 logger.info(f"崩溃取证已启用（致命信号栈 → {fh_path}）")
         except Exception as e:
@@ -221,6 +303,10 @@ def install_crash_handlers(logger=None) -> str:
             pass
 
     threading.excepthook = _thread_excepthook
+
+    # ③ COM/RPC 失败单独立卷（2026-11-24 日志体检：389 条 COM 错误把真崩溃淹了）
+    _install_com_error_log(logger)
+
     return fh_path if _CRASH_FH is not None else ""
 
 
@@ -303,6 +389,12 @@ def main():
             print(text, file=sys.stdout, flush=True)
         except Exception:
             pass
+        # ⑤ 进业务日志（2026-11-24 日志体检 D2）。
+        # 为什么必须补这一步：这条 hook 原来只写 crash_traceback.txt + stderr，**不碰 logger**，
+        # 于是 GUI 线程的未捕获异常在每日日志里完全不可见 —— 11-18 那 16 次
+        # `StackQueueDialog already deleted` 崩溃，当日 1,856 行日志一字未提。
+        # 具体实现放在模块级 `_emit_crash_to_log`（给验收脚本一个可调入口）。
+        _emit_crash_to_log(etype, value)
     sys.excepthook = _debug_excepthook
 
     # ── 必须在一切输出之前安装，拦截 C 库直接写 stderr ──

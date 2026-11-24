@@ -48,6 +48,7 @@ KEEP_MARKER_MAX_DAYS = 30          # 人工保留标记最长活 30 天
 SIDECAR_NAME = ".retention"        # cloud_<task_id> 目录里的保留期侧车（JSON，无顾客内容）
 _EMPTY_DIR_GRACE = 300.0           # 空目录宽限（与 staging._EMPTY_DIR_GRACE 同口径）
 _PART_MAX_AGE = 3600.0             # 写了一半的 .part/.tmp 残留最多活 1 h
+_INDEX_MISSING_GRACE_S = 600.0     # 索引条目对应的 PDF 已不在时，先留 10 分钟再剔除（避开落盘竞态）
 
 # 设置页「保存转换副本到桌面」的显式警告文案（GUI 用同一份，避免两处口径漂移）
 KEEP_TEMP_WARNING = (
@@ -324,17 +325,32 @@ def sweep_pdf_cache(cache_dir: str, index: dict, hours=None,
         index = {}
 
     live: set[str] = set()
+    pruned = 0
     for key in list(index.keys()):
         meta = index.get(key)
         meta = meta if isinstance(meta, dict) else {}
         created = _parse_created(meta.get("created_at", ""))
         pdf_path = os.path.join(cache_dir, f"{key}.pdf")
+        if not os.path.isfile(pdf_path):
+            # 2026-11-24 P0-1：索引有、文件没的条目**永远不可能命中**（读侧 _get_cached_pdf /
+            # find_cached_pdf 都先看文件在不在），留着只会在取证时骗人 —— 现场 187 条里
+            # 125 条是这种情况。留 10 分钟宽限，避开"文件刚写完、索引紧接着落盘"的窗口。
+            if created is None or (now - created) > _INDEX_MISSING_GRACE_S:
+                index.pop(key, None)
+                pruned += 1
+                continue
+            live.add(f"{key}.pdf")
+            continue
         if created is not None and created < cutoff:
             freed += _remove(pdf_path)
             index.pop(key, None)
             removed += 1
         else:
             live.add(f"{key}.pdf")
+
+    if pruned:
+        logger.warning(f"PDF 缓存索引清理：{pruned} 条条目对应的 PDF 已不存在，已一并剔除")
+        removed += pruned
 
     # 孤儿：磁盘上有、索引里没有（历史 key 失配 / 崩溃半途产物）。只收早于 cutoff 的，
     # 避免误删"刚写完文件、索引尚未落盘"的竞态窗口。

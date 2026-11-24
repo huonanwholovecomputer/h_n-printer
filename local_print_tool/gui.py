@@ -131,7 +131,7 @@ import agent_ops  # 控制接口的 op 实现（建页/加文件/改参数/打�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.7.3"
+APP_VERSION = "4.7.4"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -1071,6 +1071,9 @@ class ManualDuplexDialog(QDialog):
 
         self._countdown = QLabel("")
         self._countdown.setStyleSheet("color: #e67e22;")
+        # 2026-11-23：确认态的倒计时那行要同时交代「还要多久才允许按确认」（放行比例闸门），
+        # 一行放不下，允许换行，否则窗口最小宽 600 时后半句被裁掉。
+        self._countdown.setWordWrap(True)
         lay.addWidget(self._countdown)
 
         row = QHBoxLayout()
@@ -1138,6 +1141,10 @@ class ManualDuplexDialog(QDialog):
         self._prev_base = 0.0            # 立窗那一刻，上一批第 2 趟已经用掉的秒数
         self._prev_t0 = QElapsedTimer()  # 本窗在这个态里又走了多久（无效 = 不在这个态）
         self._prev_deadline = 0.0        # 到点自动放行（没人确认也不再等）
+        # 「✔ 确定上一个任务已完成」的放行时刻（2026-11-23 用户要求：防误触）：
+        # 上一批第 2 趟的第几秒才允许按 = 预估 × 放行比例（钳在自动放行时刻之内）。
+        # 0 = 不设闸门（没有预估 / 比例设成 0）。
+        self._prev_gate_at = 0.0
         # 操作员按「✔ 确定上一个任务已完成」的时刻（2026-11-22）。Announce() 紧接着会把
         # 同一位置的同一个按钮变成可点的「▶ 继续打第 2 趟」——操作员连点两下时，第二下会
         # 落在它上面，worker 立刻当成「第 1 趟打完了」⇒ 第 2 趟秒发（现场串页）。
@@ -1303,9 +1310,21 @@ class ManualDuplexDialog(QDialog):
             self._pass1.setText(self._prev2_text(elapsed))
             self._pass1.setStyleSheet(f"color: {self.pass1_color(elapsed, self._pass1_est)};")
             left = int(max(0.0, self._prev_deadline - elapsed))
-            self._countdown.setText(
-                f"⏳ 还有 {format_duration(left)} 就自动开始本批（到点就不再等 —— "
-                "两批纸叠在一起会串页，纸出齐了就早点按上面的按钮）")
+            # 2026-11-23：确认按钮也按放行比例放行（防误触）—— 每跳刷新一次开关，
+            # 到点自动变可点；没到点就在下一行交代"还要多久才允许按"，别让人以为是坏了。
+            self._prev2_refresh_gate(elapsed)
+            wait = self._prev2_gate_wait(elapsed)
+            if wait > 0:
+                pct = int(round(float(getattr(self, "_gate_ratio",
+                                              self.FLIP_GATE_RATIO) or 0.0) * 100))
+                self._countdown.setText(
+                    f"🔒 放行比例 {pct}%：还要 {format_duration(int(wait + 0.999))}"
+                    " 才允许按「确定上一个任务已完成」（上一批多半还在出纸，防误触）"
+                    f" · 还有 {format_duration(left)} 就自动开始本批")
+            else:
+                self._countdown.setText(
+                    f"⏳ 还有 {format_duration(left)} 就自动开始本批（到点就不再等 —— "
+                    "两批纸叠在一起会串页，纸出齐了就早点按上面的按钮）")
             return
         if self._mode == "waiting":
             return      # 等待上一个任务：本态计时器应当是停的，万一被 tick 也绝不许显示「已用」
@@ -1422,7 +1441,11 @@ class ManualDuplexDialog(QDialog):
         # 上一批「第 2 趟确认态」的参数（announce_prev_pass2 会在本函数之后重设）
         self._prev_base = 0.0
         self._prev_deadline = 0.0
+        self._prev_gate_at = 0.0        # 确认按钮放行时刻，同样由 announce_prev_pass2 重算
         self._prev_t0.invalidate()
+        # 「放行比例还没到」的 tooltip 只属于确认态那套文案（2026-11-23）：这里统一清掉，
+        # 否则换回第 1 趟/补打时，「▶ 继续打第 2 趟」上会挂着"还要 mm:ss 才允许按"的说明。
+        self._btn_go.setToolTip("")
 
     def announce_waiting(self, text: str, sheets: int = 0, estimate_sec: float = 0.0,
                          gate_ratio: float | None = None, gate_extra: float = 0.0):
@@ -1508,8 +1531,63 @@ class ManualDuplexDialog(QDialog):
             head += f"（超出 {int(elapsed - est)} 秒）"
         return head
 
+    def _prev2_confirm_gate(self) -> float:
+        """「✔ 确定上一个任务已完成」最早在第几秒允许按（0 = 不设闸门）。
+
+        ★ 2026-11-23 用户要求：这个按钮也要和第 2 趟打印**同一套放行比例**，不到比例
+        不允许点击，防误触（现场 24 张那批第 2 趟才开始出纸 3 秒，就有人按了确认：
+        还在出纸的那批被当成打完了 ⇒ 本批第 1 趟紧跟着往下压纸，两批叠成一摞；
+        顺带还把"3 秒打完 24 张"写进第 2 趟速度学习，预估被压坏）。
+
+        公式与 `_flip_gate_for_now` 同源（`flip_gate_at` = 预估 × 放行比例），两处差别：
+          · **不加 `_gate_extra`**：那是「人工翻页准备时间」，确认上一批有没有出完并没有
+            翻页动作，加上去只会让确认按钮白白晚放开；
+          · 钳制方向相反：第 2 趟按钮钳在"等翻纸超时"之内，这里钳在 worker 的**自动放行
+            时刻**（预估 + 宽限）之内 —— 闸门绝不能晚于自动开始本批那一刻，否则按钮永远
+            按不动，把"没人值守也能过"这条路堵死。
+        """
+        gate = self.flip_gate_at(getattr(self, "_pass1_est", 0.0),
+                                 getattr(self, "_gate_ratio", None))
+        if gate <= 0:
+            return 0.0
+        cap = float(getattr(self, "_prev_deadline", 0.0) or 0.0)
+        if cap > 0:
+            gate = min(gate, max(0.0, cap - 1.0))
+        return gate
+
+    def _prev2_gate_wait(self, elapsed: float | None = None) -> float:
+        """离"允许按确认"还剩几秒（<=0 ⇒ 已放行 / 本就不设闸门）。"""
+        gate = float(getattr(self, "_prev_gate_at", 0.0) or 0.0)
+        if gate <= 0:
+            return 0.0
+        e = self._prev2_elapsed() if elapsed is None else max(0.0, float(elapsed))
+        return max(0.0, gate - e)
+
+    def _prev2_refresh_gate(self, elapsed: float | None = None) -> None:
+        """按放行比例开/关「✔ 确定上一个任务已完成」（2026-11-23，防误触）。
+
+        只作用于确认态：`announce()` 里那个「▶ 继续打第 2 趟」仍是窗口一出现就可点
+        （硬规矩 12），那条口径不受这里影响。
+        """
+        if self._mode != "prev2":
+            return
+        wait = self._prev2_gate_wait(elapsed)
+        want = wait <= 0
+        if self._btn_go.isEnabled() != want:
+            self._btn_go.setEnabled(want)
+        if want:
+            self._btn_go.setToolTip("")
+            return
+        now = self._prev2_elapsed() if elapsed is None else max(0.0, float(elapsed))
+        pct = int(round(float(getattr(self, "_gate_ratio", self.FLIP_GATE_RATIO) or 0.0) * 100))
+        left = int(max(0.0, float(getattr(self, "_prev_deadline", 0.0) or 0.0) - now))
+        self._btn_go.setToolTip(
+            f"放行比例 {pct}%：上一批第 2 趟预计 {format_duration(self._pass1_est)}，"
+            f"要到第 {format_duration(self._prev_gate_at)} 才允许按（防误触）。"
+            f"也可以等 {format_duration(left)} 后自动开始本批 — 那一趟不记实测。")
+
     def announce_prev_pass2(self, text: str, sheets: int = 0, estimate_sec: float = 0.0,
-                            elapsed_sec: float = 0.0):
+                            elapsed_sec: float = 0.0, gate_ratio: float | None = None):
         """新批次要开始第 1 趟，可**上一个任务的第 2 趟可能还在出纸** → 先拦住问一句。
 
         为什么会有这个态（2026-11-12 用户现场）：手动双面的第 2 趟是"一次提交进 spooler
@@ -1523,22 +1601,26 @@ class ManualDuplexDialog(QDialog):
             既放行本批第 1 趟，也把上一批第 2 趟的实测耗时交给速度学习
             （`pass2_watch.Pass2Watch.confirm` → `duplex_pass2_sample`）；
           · 到点（预估 + 宽限）没人按也放行：云端自动单/无人值守不能被这一步卡死，
-            但那一趟**不记**实测（没人看见纸，那个数字不可信）。
+            但那一趟**不记**实测（没人看见纸，那个数字不可信）；
+          · 确认按钮也走**放行比例**（2026-11-23 用户要求，见 `_prev2_confirm_gate`）：
+            不到「预估 × 比例」按钮禁用，防误触（按太早点下去会把还在出纸的那批当成
+            打完了，本批第 1 趟紧跟着压纸，两批叠成一摞）。
         """
         self._timer.stop()
         self._pass1_timer.stop()
         self._close_timer.stop()
-        self._apply_batch_params(sheets, estimate_sec, None, 0.0)
+        self._apply_batch_params(sheets, estimate_sec, gate_ratio, 0.0)
         self._prev_base = max(0.0, float(elapsed_sec or 0.0))
         self._prev_t0.start()
         self._prev_deadline = max(0.0, float(self._pass1_est) + pass2_watch.GRACE_SEC)
+        self._prev_gate_at = self._prev2_confirm_gate()      # 必须排在 _prev_deadline 之后
         self._mode = "prev2"
         self._flip_text = text
         self._flip_timeout = 0
         self._status.setText("⏳ 上一个打印任务的第 2 趟可能正在进行中…")
         self._detail.setText(text)
         self._btn_go.setText("✔ 确定上一个任务已完成")
-        self._btn_go.setEnabled(True)
+        self._prev2_refresh_gate()          # 放行比例没到就禁用（窗口一出现就该是灰的）
         self._btn_skip.setText("⏭ 跳过本任务")
         self._btn_skip.setEnabled(True)
         self._pass1_tick()
@@ -1768,6 +1850,12 @@ class ManualDuplexDialog(QDialog):
             # 这一按**不是**"第 1 趟打完了"，而是"上一个任务的第 2 趟确实出完纸了"
             # （2026-11-12）：本批第 1 趟由 worker 收到确认后自己发起。绝不能再 emit
             # continue_requested —— 那会让 worker 以为翻纸了、直接去打上一批的第 2 趟。
+            # 放行比例守卫（2026-11-23，防误触）：按钮此时本来就是禁用态，这里再挡一道，
+            # 是为了挡住程序化点击/键盘（以及将来谁把按钮改回常亮时不会静默失效）。
+            if self._prev2_gate_wait() > 0:
+                self._prev2_refresh_gate()
+                self._pass1_tick()
+                return
             self._pass1_timer.stop()
             self._prev_t0.invalidate()
             self._mode = "prev2_confirmed"
@@ -17287,6 +17375,13 @@ class MainWindow(QMainWindow):
                 info = _gpi(cached_pdf)
                 page_count = info.get("page_count", cached_meta.get("page_count", 0))
                 orientation = info.get("orientation", "")
+                # 2026-11-24 P0-1：缓存命中却数出 0 页时留 WARNING（原来只有 INFO 一行，
+                # 而 0 页会一路进报价）。这里**不替它编页数**，只把可追溯性补上。
+                if int(page_count or 0) <= 0:
+                    logger.warning(
+                        "缓存命中但页数为 0，将按 0 页计费上报: %s (MD5=%s, info=%s)",
+                        os.path.basename(file_path), source_md5[:8],
+                        {k: v for k, v in (info or {}).items() if k in ("page_count", "pages")})
                 self._log(f"📦 缓存命中: {os.path.basename(file_path)} → {page_count} 页 (MD5={source_md5[:8]}...)")
                 # 按 file_path 在目标标签页匹配行回写（不依赖调用方传入的 row，防多文件订单行错位写错行）
                 jobs = self._tab_jobs(tab_key)
@@ -17740,6 +17835,11 @@ class MainWindow(QMainWindow):
             result: dict = {}
 
             def _net():
+                # 2026-11-24 日志体检：这一支原来 `except Exception: result[...]=""` 全吞，
+                # 非 2xx 也直接置空 —— 服务端 7 天里对 /api/next_order_number 记了 110 次
+                # 403（body `{"success":false,"message":"token 无效"}`），本地日志一条都没留，
+                # 现场只看得到「订单号获取超时（>4s）」，两端无法对齐。口径对齐
+                # `_acquire_order_number_and_upload_net` 里的 23720/23727 两处。
                 try:
                     resp = http_requests.get(
                         f"{self._cloud_client.api_url}/api/next_order_number",
@@ -17749,11 +17849,23 @@ class MainWindow(QMainWindow):
                     )
                     if resp.ok:
                         data = resp.json()
-                        result["order_number"] = data.get("order_number", "") if data.get("success") else ""
+                        if data.get("success"):
+                            result["order_number"] = data.get("order_number", "")
+                        else:
+                            result["order_number"] = ""
+                            logger.warning(
+                                f"取号被云端拒绝（HTTP {resp.status_code}，"
+                                f"req={str(_req_id)[:8] or '-'}）："
+                                f"{str(data.get('message') or data)[:200]}")
                     else:
                         result["order_number"] = ""
-                except Exception:
+                        logger.warning(
+                            f"取号失败：HTTP {resp.status_code}"
+                            f"（req={str(_req_id)[:8] or '-'}）"
+                            f" {str(getattr(resp, 'text', '') or '')[:200]}")
+                except Exception as e:
                     result["order_number"] = ""
+                    logger.warning(f"取号异常（req={str(_req_id)[:8] or '-'}）: {e}")
 
             threading.Thread(target=_net, daemon=True).start()
             # S1-09：取号等待 ≤ 5s（原 6s），超时直接回落本地 -L 临时号
@@ -17950,16 +18062,21 @@ class MainWindow(QMainWindow):
                     else:
                         # 🟡-E2：换号补报失败原来被 `except Exception: pass` 吞掉 ——
                         # 界面上这单还是"已换号"，云端却从没收到。至少要留一行能查的话。
+                        # 2026-11-24：再补一条 logger.warning（带状态码），同步面板不是日志文件。
+                        logger.warning(
+                            "换号补报失败: %s → HTTP %s %s",
+                            new_num, getattr(resp, "status_code", "?"),
+                            str(getattr(resp, "text", "") or "")[:200])
                         self._cloudConnSyncLog.emit(
                             f"⚠ 换号补报失败（{new_num}）：HTTP "
                             f"{getattr(resp, 'status_code', '?')} "
                             f"{str(getattr(resp, 'text', '') or '')[:120]}"
                             " —— 订单仍留在离线库里，稍后会自动重试")
             except Exception as e:
+                logger.warning("换号补报异常: %s → %s: %s", new_num, type(e).__name__, e)
                 self._cloudConnSyncLog.emit(
                     f"⚠ 换号补报异常（{new_num}）：{type(e).__name__}: {e}"
                     " —— 订单仍留在离线库里，稍后会自动重试")
-
     def _report_order_failed_after_sync(self, order_number: str):
         """离线单换号补报成功后，按「本地其实没打出来」回落成 failed（后台线程内调用）。"""
         client = self._cloud_client
@@ -20131,13 +20248,18 @@ class MainWindow(QMainWindow):
         起跑、显示成"本批第 1 趟"，正是当年"计时起点早于送纸"的老 bug。这里走
         `announce_prev_pass2()`：显示的是上一批第 2 趟的已用/预计，按钮叫
         「✔ 确定上一个任务已完成」。
+
+        放行比例（2026-11-23）：`prof.gate_ratio` 必须传下去 —— 确认按钮不到
+        「上一批第 2 趟预估 × 比例」是禁用态（防误触），这里的接线就是那条比例的来源
+        （与 `_on_duplex_announce` / `_on_duplex_waiting` 同一个档案字段）。
         """
         dlg = self._ensure_duplex_dialog()
         try:
             prof = self._printer_profile()
             dlg.announce_prev_pass2(text, sheets=int(sheets or 0),
                                     estimate_sec=float(estimate_sec or 0.0),
-                                    elapsed_sec=float(elapsed_sec or 0.0))
+                                    elapsed_sec=float(elapsed_sec or 0.0),
+                                    gate_ratio=prof.gate_ratio)
             dlg.set_speed_hint(prof.speed_summary())
         except Exception:
             dlg.announce_prev_pass2(text, sheets=int(sheets or 0),
@@ -23519,8 +23641,12 @@ class MainWindow(QMainWindow):
                 # 等待期间窗口被关闭（closeEvent 已清理标签页）→ 中止，不再启动打印
                 return "", False
             if "order_number" not in result:
-                # 超时兜底：本地临时号，连线后自动换正式号
-                self._log(f"⚠️ 订单号获取超时（>{ORDER_NUMBER_WAIT_S}s），改用本地临时号")
+                # 超时兜底：本地临时号，连线后自动换正式号。
+                # 措辞注意（2026-11-24 日志体检）：这里**真的只是等超了**，不代表云端拒绝；
+                # 后台线程照常跑完，它的结果（HTTP 状态码 / token 无效）会单独留一行。
+                # 旧文案只写「超时」，现场读日志的人会以为网络慢，看不出其实是 403。
+                self._log(f"⚠️ 订单号获取超时（>{ORDER_NUMBER_WAIT_S}s），"
+                          f"先用本地临时号；后台取号结果稍后见本日志")
                 result["order_number"] = self._generate_local_order_number_l()
                 # 兜底单必须落本地库：否则用户删掉这个已完成的标签页，这单就再没有换号的路
                 self._cache_local_order_locally(
@@ -23702,8 +23828,16 @@ class MainWindow(QMainWindow):
                 if resp.ok and resp.json().get("success"):
                     self._cloudConnSyncLog.emit(f"📋 订单已上报云端: {num} ({len(files_data)} 个文件)")
                     return True
+                # 2026-11-24 日志体检：这里原来只 emit 到同步面板，日志文件里查不到状态码，
+                # 于是服务端那 48 次 POST /api/local_orders 403（token 无效）在本地完全无痕。
+                # logger.warning 一行保底：状态码 + 正文摘要，便于和服务端 journald 对账。
+                logger.warning(
+                    "订单上报云端失败: %s → HTTP %s %s",
+                    num, getattr(resp, "status_code", "?"),
+                    str(getattr(resp, "text", "") or "")[:200])
                 self._cloudConnSyncLog.emit(f"⚠️ 订单上报云端失败: {resp.text[:200] if resp.text else '无响应'}")
             except Exception as e:
+                logger.warning("订单上报云端异常: %s → %s: %s", num, type(e).__name__, e)
                 self._cloudConnSyncLog.emit(f"⚠️ 订单上报云端失败: {e}")
             return False
 
@@ -26742,14 +26876,21 @@ class MainWindow(QMainWindow):
             cached_pdf, cached_meta = self._cloud_client._get_cached_pdf(
                 source_md5, getattr(task, 'image_orientation', 'auto'), cache_engine)
             if cached_pdf and cached_meta:
-                page_count = cached_meta.get("page_count", 0)
+                # 2026-11-24 P0-1：索引里的 0 是「下载时还没数页」的占位，不是真页数。
+                # 原来见 0 就跳过 get_pdf_info、直接记「→ 0 页」，那 0 又进了报价。
+                # 现在 <=0 一律回 PDF 本身数（同一把 get_pdf_info，不另立口径）。
+                from cloud_client import resolve_cached_page_count as _rcpc
+                page_count = _rcpc(cached_meta, cached_pdf)
                 orientation = ""  # 缓存里可能没有 orientation，从 PDF 读取
                 if page_count > 0:
                     from pdf_printer import get_pdf_info as _gpi
                     _info = _gpi(cached_pdf)
-                    page_count = _info.get("page_count", page_count)
                     orientation = _info.get("orientation", "")
                     blank_tail = self._detect_blank_tail(cached_pdf)
+                if int(page_count or 0) <= 0:
+                    logger.warning(
+                        "云端缓存命中但页数为 0，将按 0 页计费上报: %s (MD5=%s)",
+                        task.file_name, source_md5[:8])
                 self._log(f"📦 缓存命中: {task.file_name} → {page_count} 页 (MD5={source_md5[:8]}...)"
                           + (f", 引擎={cache_engine}" if cache_engine else ""))
         if _skip_cache_for_com:

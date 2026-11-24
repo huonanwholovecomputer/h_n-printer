@@ -120,11 +120,22 @@ mobile_apps/docs/*.md
 # 规矩：commit 前逐项过 `git status --short`，先问「这份东西能公开吗」。
 审计报告_*.md
 修复计划_*.md
+日志体检_*.md
 隐私与取件须知*
 
 # 拆分基线（拆分前的 CLAUDE.md 原文，供 other/tests/verify_context_docs.py 逐字节对账）。
 # 目录不是 .md 文件，`docs/*.md` 盖不住，必须显式忽略，否则 134 KB 原文会被 `git add -A` 带进仓库。
 docs/拆分基线_2026-10-30/
+
+# 验收/构建的本地产物（2026-11-24）：`_run_all_*.log` / `_build_*.log` 是一次性输出，
+# `other/tmp/` 与 `tools/_tmp_versions.py` 是临时脚本产物。都不属于源码，别被 `git add -A` 带走。
+other/tests/_run_all_*.log
+other/tests/_run_all_*.err
+other/tests/_build_*.log
+other/tests/_last_run.log
+other/tests/_*.out.txt
+other/tmp/
+local_print_tool/tools/_tmp_versions.py
 
 # 已结案的历史待办/交接原文（2026-11-03 清理时移入）。同「拆分基线」：子目录不被 docs/*.md 盖住。
 docs/归档/

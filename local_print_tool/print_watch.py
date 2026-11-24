@@ -1027,15 +1027,64 @@ def default_enum_jobs(printer: str) -> list[dict]:
                 pass
 
 
+class _EnumFailureTracker:
+    """EnumPrinters（spooler RPC）连续失败的节流 + 恢复记账（2026-11-24 日志体检 P1-2）。
+
+    现场（2026-11-23 22:54:58–22:56:24）：spooler 的 RPC 不可用，`EnumPrinters` 抛 1722，
+    每 2 秒一条 warning，88 秒打了 44 条；之后恢复时**一条都没留**，日志直接跳到 23:28。
+    读日志的人既看不出中断持续多久，也看不出有没有恢复。
+
+    为什么不交给 `_loop` 的 errors 计数器：那个计数器只包 `scan_once` 里的异常，
+    而本函数在内部把异常吞成 `[]` 返回 ⇒ 扫描"成功"、计数器永远是 0、恢复话术永不触发。
+    所以节流必须在这里做，状态也在这里存。
+
+    `now_fn` 可注入，验收脚本用假时钟把 5 分钟阈值压成毫秒级。
+    """
+
+    ESCALATE_AFTER_S = 300.0     # 连续失败超过 5 分钟 ⇒ 升级成"要操作员去看服务"
+
+    def __init__(self, now_fn: Callable[[], float] = time.monotonic):
+        self._now = now_fn
+        self.failures = 0
+        self.since = 0.0
+        self.escalated = False
+
+    def note_failure(self, exc: BaseException) -> None:
+        if self.failures == 0:
+            self.since = self._now()
+            logger.warning(f"外部打印监视：枚举打印机失败: {exc}"
+                           " —— 出纸对账暂停，恢复正常时会再记一条")
+        self.failures += 1
+        if not self.escalated and self._now() - self.since >= self.ESCALATE_AFTER_S:
+            self.escalated = True
+            logger.warning(
+                f"🔴 出纸对账不可用已超过 {self.ESCALATE_AFTER_S:.0f}s"
+                f"（累计失败 {self.failures} 次）—— 请检查 Print Spooler 服务是否在跑")
+
+    def note_success(self) -> None:
+        if not self.failures:
+            return
+        dur = max(0.0, self._now() - self.since)
+        logger.warning(f"外部打印监视已恢复（中断 {dur:.0f}s，累计失败 {self.failures} 次）")
+        self.failures = 0
+        self.since = 0.0
+        self.escalated = False
+
+
+_enum_failures = _EnumFailureTracker()
+
+
 def default_list_printers() -> list[str]:
     """本机全部队列（本地 + 连接）。虚拟打印机不在这里过滤 —— 交给 should_record 记日志。"""
     import win32print
     try:
         flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
-        return [str(row[2]) for row in win32print.EnumPrinters(flags) if len(row) > 2 and row[2]]
+        names = [str(row[2]) for row in win32print.EnumPrinters(flags) if len(row) > 2 and row[2]]
     except Exception as e:
-        logger.warning(f"外部打印监视：枚举打印机失败: {e}")
+        _enum_failures.note_failure(e)
         return []
+    _enum_failures.note_success()
+    return names
 
 
 # ══════════════════════════════════════════════════════════════════
