@@ -3758,7 +3758,10 @@ const LOCAL_FILE_STATUS_TEXT = {
 /* 2026-11-23：本地单的打印稿缩略图（店主电脑打印时渲好回传，键 = 订单号 + 文件名）。
    有图就在参数上面铺一条横向滑动的图带；老订单没传过 ⇒ 照旧只有那句说明。 */
 function localThumbURL(orderNumber, name, page, token) {
-  return CONFIG.BASE_URL + '/api/local_order_thumb' +
+  // 注意：这里是 APP 的 www，没有小程序那套 utils/config.js 的 CONFIG 对象；
+  // 地址常量叫 BASE_URL（app.js 顶层 const）。写成 CONFIG.BASE_URL 会抛
+  // ReferenceError: CONFIG is not defined —— 2026-11-24 现场就是它把图带掐掉的。
+  return BASE_URL + '/api/local_order_thumb' +
     '?order_number=' + encodeURIComponent(String(orderNumber || '')) +
     '&name=' + encodeURIComponent(String(name || '')) +
     '&page=' + (Number(page) > 0 ? Math.floor(Number(page)) : 1) +

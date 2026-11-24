@@ -206,6 +206,36 @@ check('APP 端同款：localThumbURL / localThumbPages / 面板里有图带',
   /localThumbPages\(num, name\)\.then\(\(pages\)/.test(APP_JS));
 check('APP 端只有真的拿到页数才重刷面板（没图保持"只摊参数"）',
   /if \(!pages \|\| seq !== myFileDetailSeq\) return;/.test(APP_JS));
+
+// 2026-11-24 线上实锤：www/me.js 的 localThumbURL 写了小程序那套 CONFIG.BASE_URL，
+// 而 APP 里根本没有 CONFIG 对象 ⇒ ReferenceError: CONFIG is not defined。
+// 后果极隐蔽：/info 明明回了 pages:1，面板也已经打开（无图文案），但异步重画在拼
+// <img src> 时炸掉，浏览器连一张图都没请求（服务端日志里只有 /info，没有图）。
+// 静态正则只查"函数在不在"是抓不到这种作用域的，所以这里**真的把函数跑一遍**。
+const thumbFn = (APP_JS.match(/function localThumbURL[\s\S]*?\n\}/) || [''])[0];
+let thumbUrl = '';
+let thumbErr = '';
+try {
+  const runLocalThumbURL = new Function('BASE_URL', 'localStorage',
+    thumbFn + '\nreturn localThumbURL("HN20261123-0064", "副本.docx", 1, "tok");');
+  thumbUrl = runLocalThumbURL('https://api.test', { getItem: () => 'tok' });
+} catch (e) {
+  thumbErr = String(e && (e.message || e));
+}
+check('APP localThumbURL 能真的执行（不许引用 APP 里不存在的 CONFIG）',
+  /^https:\/\/api\.test\/api\/local_order_thumb\?order_number=HN20261123-0064&name=/.test(thumbUrl),
+  thumbErr ? '抛错：' + thumbErr : thumbUrl);
+
+// 全量兜底：APP 的 www/*.js 里不该出现小程序的 CONFIG 标识符（注释不算）
+const appSources = ['me.js', 'app.js', 'print.js', 'logger.js', 'orders.js']
+  .filter((n) => fs.existsSync(path.join(APP_DIR, n)))
+  .map((n) => {
+    const src = read(path.join(APP_DIR, n));
+    return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/[^\n]*/g, '$1');
+  });
+check('APP www 源码里没有裸 CONFIG 引用（小程序与 APP 的全局变量不是一套）',
+  appSources.every((s) => !/\bCONFIG\b/.test(s)),
+  appSources.map((s) => /\bCONFIG\b/.test(s)).filter(Boolean).length + ' 个文件仍有引用');
 check('APP 样式：图带横向可滑、单图固定比例（不新增裸选择器覆盖既有断言）',
   /\.myfile-local-thumbs \{[\s\S]{0,200}?overflow-x: auto/.test(APP_CSS) &&
   /\.myfile-local-thumb \{[\s\S]{0,200}?object-fit: contain/.test(APP_CSS));
