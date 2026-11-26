@@ -663,7 +663,7 @@
       <view class="wheel-mask"></view>
       <view class="wheel-indicator"></view>
       <!-- 小时列 -->
-      <scroll-view id="wheel-hour" class="wheel-scroll" scroll-y show-scrollbar="{{false}}"
+      <scroll-view id="wheel-hour" class="wheel-scroll" scroll-y enhanced="{{true}}" bounces="{{false}}" show-scrollbar="{{false}}"
                    scroll-top="{{hourWheelTop}}" scroll-with-animation="{{hourWheelAnim}}"
                    data-wheel="hour"
                    bindscroll="onWheelScroll"
@@ -676,7 +676,7 @@
         <view class="wheel-pad"></view>
       </scroll-view>
       <!-- 分钟列：今天已过的时间直接从数组中删除；选中小时变化时级联重建（只在吸附时重建） -->
-      <scroll-view id="wheel-minute" class="wheel-scroll" scroll-y show-scrollbar="{{false}}"
+      <scroll-view id="wheel-minute" class="wheel-scroll" scroll-y enhanced="{{true}}" bounces="{{false}}" show-scrollbar="{{false}}"
                    scroll-top="{{minuteWheelTop}}" scroll-with-animation="{{minuteWheelAnim}}"
                    data-wheel="minute"
                    bindscroll="onWheelScroll"
@@ -705,7 +705,7 @@
       <view class="wheel-mask"></view>
       <view class="wheel-indicator"></view>
       <!-- 分钟列（范围 00-59） -->
-      <scroll-view id="wheel-cdmin" class="wheel-scroll" scroll-y show-scrollbar="{{false}}"
+      <scroll-view id="wheel-cdmin" class="wheel-scroll" scroll-y enhanced="{{true}}" bounces="{{false}}" show-scrollbar="{{false}}"
                    scroll-top="{{cdMinWheelTop}}" scroll-with-animation="{{cdMinWheelAnim}}"
                    data-wheel="cdMin"
                    bindscroll="onWheelScroll"
@@ -718,7 +718,7 @@
         <view class="wheel-pad"></view>
       </scroll-view>
       <!-- 秒列（范围 00-59） -->
-      <scroll-view id="wheel-cdsec" class="wheel-scroll" scroll-y show-scrollbar="{{false}}"
+      <scroll-view id="wheel-cdsec" class="wheel-scroll" scroll-y enhanced="{{true}}" bounces="{{false}}" show-scrollbar="{{false}}"
                    scroll-top="{{cdSecWheelTop}}" scroll-with-animation="{{cdSecWheelAnim}}"
                    data-wheel="cdSec"
                    bindscroll="onWheelScroll"

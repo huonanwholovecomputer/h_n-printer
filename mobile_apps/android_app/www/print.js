@@ -1883,6 +1883,10 @@ function refreshMinuteWheel(hourIdx, hourStart, curHour, minuteStart) {
 // 契约不变：readWheelIndex() / confirmScheduleTime() 仍按"item 中心离视口中心最近"取索引。
 const WHEEL_SNAP_IDLE_MS = 140;  // 手指/惯性静止多久后吸附（太快会在惯性里截断，太慢显得没收住）
 const WHEEL_SNAP_MAX_MS = 420;   // smooth 滚动兜底复位时间（环境不支持 smooth 时也要解锁）
+// 2026-11-26（用户：「点击任意一个未选中的数字，那个数字会高亮，但列表不滚过去」）：
+// 点某一格必须让列表真的滚到那一格。手势位移超过这个像素数就按"拖动"处理、不当作点选
+// （浏览器对明显拖动的触摸本来就不派发 click，这里再兜一层，避免慢速拖动结束时误触）。
+const WHEEL_TAP_MAX_MOVE = 8;
 function buildWheel(wheelId, items, selectedIndex, onChange) {
   const col = document.getElementById(wheelId);
   col.innerHTML = `
@@ -1936,24 +1940,89 @@ function buildWheel(wheelId, items, selectedIndex, onChange) {
   const prefersReducedMotion = () =>
     !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
   const cancelSnap = () => { if (snapTimer) { clearTimeout(snapTimer); snapTimer = null; } };
+  // 吸附锁的「代次」：解锁定时器只认自己那一代。
+  // 否则上一次吸附留下的 420ms 定时器会在新一轮动画（点选 or 新吸附）中途把 snapping 解开，
+  // 于是 update() 排一次吸附、和正在跑的 smooth 抢 scrollTop —— 现场表现是"滚到一半被拽一下"。
+  let snapGen = 0;
+  const lockSnapping = () => {
+    snapping = true;
+    const gen = ++snapGen;
+    setTimeout(() => { if (snapGen === gen) snapping = false; }, WHEEL_SNAP_MAX_MS);
+  };
+  const unlockSnapping = () => { snapping = false; snapGen++; };
   const snapToNearest = () => {
     snapTimer = null;
-    if (touching) { snapping = false; return; }   // 手指又按下去了，让位
+    if (touching) { unlockSnapping(); return; }   // 手指又按下去了，让位
     const idx = Math.max(0, Math.min(items.length - 1, nearestIndex()));
     const target = targetTopFor(idx);
-    if (target === null || Math.abs(vp.scrollTop - target) < 0.5) { snapping = false; return; }
-    snapping = true;
+    if (target === null || Math.abs(vp.scrollTop - target) < 0.5) { unlockSnapping(); return; }
+    lockSnapping();
     try {
       vp.scrollTo({ top: target, behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
     } catch (e) {
       vp.scrollTop = target; // 老环境不支持 options 形式
     }
-    // 兜底解锁：'auto' 分支或环境不吃 smooth 时，滚动可能不再发 scroll 事件
-    setTimeout(() => { snapping = false; }, WHEEL_SNAP_MAX_MS);
   };
   const scheduleSnap = () => {
     cancelSnap();
     snapTimer = setTimeout(snapToNearest, WHEEL_SNAP_IDLE_MS);
+  };
+  /* ---- 点选某一格：让列表真的滚过去（2026-11-26 用户反馈的第二个 bug） ----
+     旧实现只有 scroll/touch 监听，点一下只会因为浏览器把手指按下当成"轻微滚动"而
+     让相邻格高亮一下，列表本身不动 ⇒ 用户看到"数字亮了但没滚过去"。
+     这里用事件委托接 click（每格带 data-i），走与吸附同一条路径：
+     targetTopFor(i) 算落点 → smooth 滚过去 → 停稳后由 update() 收尾（高亮 + onChange）。 */
+  const itemIndexFromEvent = (e) => {
+    let el = e && e.target;
+    while (el && el !== vp && el !== col) {
+      if (el.classList && el.classList.contains && el.classList.contains('wheel-item')) {
+        const raw = (el.dataset && el.dataset.i != null)
+          ? el.dataset.i
+          : (typeof el.getAttribute === 'function' ? el.getAttribute('data-i') : null);
+        const i = parseInt(raw, 10);
+        return isNaN(i) ? -1 : i;
+      }
+      el = el.parentNode;
+    }
+    return -1;
+  };
+  const goToIndex = (i) => {
+    if (!(i >= 0 && i < items.length)) return;
+    cancelSnap();
+    unlockSnapping();
+    const target = targetTopFor(i);
+    if (target === null) {           // 布局未就绪（弹窗还没显示）：等下一帧再来
+      requestAnimationFrame(() => goToIndex(i));
+      return;
+    }
+    // 已经在正中：不必滚（同值写 scrollTop 也会让人以为"没反应"，但高亮本就对）
+    if (Math.abs(vp.scrollTop - target) < 0.5) { update(); return; }
+    lockSnapping();                  // 期间不要再排吸附，别自己和自己抢 scrollTop
+    try {
+      vp.scrollTo({ top: target, behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+    } catch (e) {
+      vp.scrollTop = target;         // 老环境不支持 options 形式
+    }
+  };
+  let touchStartX = 0, touchStartY = 0, touchMoved = false;
+  const onTouchStart = (e) => {
+    touching = true; unlockSnapping(); cancelSnap();
+    touchMoved = false;
+    const p = e && (e.touches ? e.touches[0] : e);
+    touchStartX = p && typeof p.clientX === 'number' ? p.clientX : 0;
+    touchStartY = p && typeof p.clientY === 'number' ? p.clientY : 0;
+  };
+  const onTouchMove = (e) => {
+    const p = e && (e.touches ? e.touches[0] : e);
+    if (!p || typeof p.clientX !== 'number') return;
+    if (Math.abs(p.clientX - touchStartX) > WHEEL_TAP_MAX_MOVE
+      || Math.abs(p.clientY - touchStartY) > WHEEL_TAP_MAX_MOVE) touchMoved = true;
+  };
+  const onTouchEnd = () => {
+    touching = false;
+    // 拖动结束照旧吸附；点选则在紧随其后的 click 里接管（click 会先 cancelSnap）
+    if (!touchMoved) cancelSnap();
+    scheduleSnap();
   };
   const update = () => {
     const idx = Math.max(0, Math.min(items.length - 1, nearestIndex()));
@@ -1964,9 +2033,15 @@ function buildWheel(wheelId, items, selectedIndex, onChange) {
     if (!touching && !snapping) scheduleSnap();
   };
   vp.addEventListener('scroll', update, { passive: true });
-  vp.addEventListener('touchstart', () => { touching = true; snapping = false; cancelSnap(); }, { passive: true });
-  vp.addEventListener('touchend', () => { touching = false; scheduleSnap(); }, { passive: true });
-  vp.addEventListener('touchcancel', () => { touching = false; scheduleSnap(); }, { passive: true });
+  vp.addEventListener('touchstart', onTouchStart, { passive: true });
+  vp.addEventListener('touchmove', onTouchMove, { passive: true });
+  vp.addEventListener('touchend', onTouchEnd, { passive: true });
+  vp.addEventListener('touchcancel', onTouchEnd, { passive: true });
+  vp.addEventListener('click', (e) => {
+    if (touchMoved) { touchMoved = false; return; }   // 刚才是拖动，不是点选
+    const i = itemIndexFromEvent(e);
+    if (i >= 0) goToIndex(i);
+  });
 }
 
 function openScheduleCountdownPicker() {

@@ -147,19 +147,34 @@ const COUNT = 10;
 
 function makeWheelDom() {
   const items = [];
+  const vp = { /* 见下，先占位以便 items 挂 parentNode */ };
+  const wrap = { parentNode: vp };
+  const mkClassList = (el) => {
+    const set = new Set(['wheel-item']);
+    return {
+      add(n) { set.add(n); },
+      remove(n) { set.delete(n); },
+      contains(n) { return set.has(n); },
+      toggle(n, on) {
+        const want = (on === undefined) ? !set.has(n) : !!on;
+        if (want) set.add(n); else set.delete(n);
+        if (n === 'wheel-item-active') el._active = want;
+      },
+    };
+  };
   for (let i = 0; i < COUNT; i++) {
-    items.push({
+    const el = {
       offsetTop: PAD + i * ITEM_H,
       offsetHeight: ITEM_H,
       textContent: String(i),
+      dataset: { i: String(i) },
       _active: false,
-      classList: {
-        toggle(name, on) { if (name === 'wheel-item-active') items[i]._active = !!on; },
-        add() {}, remove() {}, contains() { return false; },
-      },
-    });
+      parentNode: wrap,
+    };
+    el.classList = mkClassList(el);
+    items.push(el);
   }
-  const vp = {
+  Object.assign(vp, {
     scrollTop: 0,
     clientHeight: VP_H,
     scrollHeight: PAD * 2 + COUNT * ITEM_H,
@@ -179,8 +194,8 @@ function makeWheelDom() {
       this.scrollTop = top;
       if (this._listeners.scroll) this._listeners.scroll.fn();
     },
-    fire(type) { if (this._listeners[type]) this._listeners[type].fn(); },
-  };
+    fire(type, ev) { if (this._listeners[type]) this._listeners[type].fn(ev); },
+  });
   const col = {
     innerHTML: '',
     querySelector(sel) { return sel === '.wheel-viewport' ? vp : null; },
@@ -234,6 +249,23 @@ const targetTop = (i) => PAD + i * ITEM_H + ITEM_H / 2 - VP_H / 2; // = 40*i
   check('⑥ onChange 仍是 120ms 去抖后回调（契约不变）',
         /deb = setTimeout\(\(\) => \{ if \(typeof onChange === 'function'\) onChange\(idx\); \}, 120\)/.test(block));
   check('⑦ 尊重 reduce-motion（吸附退化为瞬时）', /prefers-reduced-motion/.test(block));
+  /* 2026-11-26 用户第二个 bug：点未选中的数字只高亮、列表不滚过去 */
+  check('⑧ 有「点选 vs 拖动」的位移阈值常量（WHEEL_TAP_MAX_MOVE）',
+        /const WHEEL_TAP_MAX_MOVE\s*=\s*\d+/.test(block));
+  check('⑨ 接了 click 委托并交给 goToIndex（点某一格要真的滚过去）',
+        /addEventListener\('click'/.test(block) && /const goToIndex = \(i\) =>/.test(block)
+        && /goToIndex\(i\)/.test(block));
+  check('⑩ goToIndex 与吸附用同一落点算法（targetTopFor）并走 smooth',
+        /const goToIndex[\s\S]*?targetTopFor\(i\)[\s\S]*?\}/.test(block)
+        && /const goToIndex[\s\S]*?prefersReducedMotion\(\) \? 'auto' : 'smooth'/.test(block));
+  check('⑪ 点选前先取消排着的吸附（cancelSnap），且期间锁住吸附（lockSnapping）',
+        /const goToIndex[\s\S]*?cancelSnap\(\);[\s\S]*?lockSnapping\(\)/.test(block));
+  check('⑬ 吸附锁带「代次」：旧定时器不得在动画中途解锁（避免和 smooth 抢 scrollTop）',
+        /const lockSnapping = \(\) => \{[\s\S]*?snapGen === gen[\s\S]*?\}/.test(block)
+        && /const unlockSnapping = \(\) => \{ snapping = false; snapGen\+\+; \}/.test(block));
+  check('⑫ 明显拖动后不当作点选（touchMoved 守卫，且 touchmove 里按像素阈值置位）',
+        /if \(touchMoved\) \{ touchMoved = false; return; \}/.test(block)
+        && /WHEEL_TAP_MAX_MOVE/.test(block));
 
   section('三、行为：初始定位 / 拖动 / 松手吸附');
   const w = loadWheel('hourWheel');
@@ -293,6 +325,63 @@ const targetTop = (i) => PAD + i * ITEM_H + ITEM_H / 2 - VP_H / 2; // = 40*i
   await wait(240);
   check('④ 已经在正中时不再重复吸附（差值 <0.5px 直接收尾）',
         w2.dom.vp._scrollCalls.length === before, 'calls=' + w2.dom.vp._scrollCalls.length);
+
+  section('五、点选某一格：列表必须真的滚过去（2026-11-26 用户第二个 bug）');
+  const w3 = loadWheel('hourWheel');
+  /* 当前停在第 3 格（scrollTop=120）。点第 8 格 —— 旧实现只会让 8 高亮一下、列表不动 */
+  const n0 = w3.dom.vp._scrollCalls.length;
+  w3.dom.vp.fire('click', { target: w3.dom.items[8] });
+  const goCall = w3.dom.vp._scrollCalls[w3.dom.vp._scrollCalls.length - 1];
+  check('① 点第 8 格 ⇒ 真的发出一次滚动到第 8 格中心（scrollTop=320）',
+        w3.dom.vp._scrollCalls.length === n0 + 1 && goCall && Math.round(goCall.top) === targetTop(8),
+        JSON.stringify(goCall));
+  check('② 点选也走 smooth（不是硬跳，和吸附手感一致）', goCall && goCall.behavior === 'smooth');
+  check('③ 点选后 scrollTop 落在目标', Math.round(w3.dom.vp.scrollTop) === targetTop(8));
+  w3.dom.vp.fire('scroll');
+  await wait(160);
+  check('④ 高亮跟到被点的那一格', w3.dom.items[8]._active === true && w3.dom.items[3]._active === false);
+  check('⑤ onChange 回调被点的索引（8）',
+        w3.changes[w3.changes.length - 1] === 8, JSON.stringify(w3.changes));
+  check('⑥ readWheelIndex 也读到 8（确认面板取同一套索引）', w3.readWheelIndex('hourWheel') === 8);
+  /* 点选后 snapping 期间不许再补一次吸附，免得和 smooth 抢 scrollTop */
+  const n1 = w3.dom.vp._scrollCalls.length;
+  await wait(260);
+  check('⑦ 点选之後不会再补一次吸附（snapping 挡住）',
+        w3.dom.vp._scrollCalls.length === n1, 'calls=' + JSON.stringify(w3.dom.vp._scrollCalls));
+
+  /* 点已经居中的那一格：不该再滚（同值写 scrollTop 会让人以为"没反应"），但索引不能变 */
+  const n2 = w3.dom.vp._scrollCalls.length;
+  w3.dom.vp.fire('click', { target: w3.dom.items[8] });
+  await wait(160);
+  check('⑧ 点已在正中的那一格不再滚动，索引保持 8',
+        w3.dom.vp._scrollCalls.length === n2 && w3.readWheelIndex('hourWheel') === 8,
+        'calls=' + w3.dom.vp._scrollCalls.length);
+
+  /* 拖动之后浏览器仍可能派发一次 click：必须按拖动处理，不能把列表拽走 */
+  const w4 = loadWheel('minuteWheel');
+  const n3 = w4.dom.vp._scrollCalls.length;
+  w4.dom.vp.fire('touchstart', { touches: [{ clientX: 10, clientY: 10 }] });
+  w4.dom.vp.fire('touchmove', { touches: [{ clientX: 10, clientY: -40 }] });
+  w4.dom.vp.fire('touchend', { touches: [] });
+  w4.dom.vp.fire('click', { target: w4.dom.items[1] });
+  await wait(60);
+  const clickScroll = w4.dom.vp._scrollCalls.filter((c) => Math.round(c.top) === targetTop(1));
+  check('⑨ 明显拖动（位移 50px）后到来的 click 不算点选（没有被拽到第 1 格）',
+        clickScroll.length === 0 && w4.dom.vp._scrollCalls.length >= n3,
+        JSON.stringify(w4.dom.vp._scrollCalls));
+
+  /* 轻点（手指没动）不能被 touchend 的吸附抢走：click 应当取消那次吸附并走点选 */
+  const w5 = loadWheel('hourWheel');
+  w5.dom.vp.scrollToRaw(200);   // 停在第 5 格附近
+  const n4 = w5.dom.vp._scrollCalls.length;
+  w5.dom.vp.fire('touchstart', { touches: [{ clientX: 10, clientY: 10 }] });
+  w5.dom.vp.fire('touchend', { touches: [] });
+  w5.dom.vp.fire('click', { target: w5.dom.items[2] });
+  await wait(260);
+  const toTwo = w5.dom.vp._scrollCalls.filter((c) => Math.round(c.top) === targetTop(2));
+  check('⑩ 轻点一格只滚到被点的那格（touchend 排的吸附被 click 取消）',
+        toTwo.length === 1 && w5.dom.vp._scrollCalls.length === n4 + 1,
+        JSON.stringify(w5.dom.vp._scrollCalls));
 
   console.log('\n' + (failures === 0 ? '✅ 全部通过' : `❌ ${failures} 项失败`));
   process.exit(failures === 0 ? 0 : 1);

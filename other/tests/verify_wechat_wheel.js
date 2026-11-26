@@ -210,9 +210,12 @@ function runStatic() {
   check('⑨手势/吸附路径里没有直接调 _wheelAlign（只在 _wheelScheduleAlign 的定时器里跑）',
         scrollBody.indexOf('_wheelAlign') < 0 && commitBody.indexOf('_wheelAlign') < 0
         && schedAlignBody.indexOf('this._wheelAlign(') >= 0);
-  check('⑨滚动条已隐藏（scroll-view show-scrollbar=false + WXSS ::-webkit-scrollbar）',
+  check('⑨滚动条已隐藏（scroll-view enhanced + show-scrollbar=false + WXSS ::-webkit-scrollbar）',
         scrollViews.every((t) => /show-scrollbar="\{\{false\}\}"/.test(t))
-        && /::-webkit-scrollbar/.test(wxss));
+        && /::-webkit-scrollbar/.test(wxss)
+        // webview 渲染下 show-scrollbar 必须同时开 enhanced 才生效（官方社区 2023-11-10 口径）；
+        // 只写 show-scrollbar 时安卓/iOS 都会照常画出那根灰条（用户 2026-11-26 23:15 截图）。
+        && scrollViews.every((t) => /enhanced="\{\{true\}\}"/.test(t)));
 
   /* ⑩ 几何必须实测（2026-11-26 用户补充：「错位是累积的，但是到最底部却没有错位了」）
      ⇒ 真机一格 pitch ≠ 88rpx×winW/750 时，i*pitch 的估算误差随 i 累积；到底部时 scrollTop
