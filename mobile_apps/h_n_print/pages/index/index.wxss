@@ -1300,41 +1300,75 @@
   font-weight: 700;
 }
 
-/* 时间滚轮：官方 picker-view（系统 picker 同款引擎，原生贴合/惯性/边界）
-   item 高 88rpx、可视区 440rpx（5 项）；贴合单元 = item 高度，指示框由 indicator-style 定制 */
+/* 时间滚轮：自研 scroll-view 滚轮（原生滚动惯性 + 松手吸附），不用官方 picker-view。
+   ⚠ 几何常量必须与 index.js 的 WHEEL_ITEM_RPX / WHEEL_VIEW_RPX 一致：
+   item 96rpx、可视区 440rpx、上下留白 (440-96)/2 = 172rpx —— 留白让首末项也能居中，
+   于是「居中第 i 项」的 scrollTop 恒等于 i × 96rpx，JS 直接按这个式子算吸附位移，无需量 DOM。
+   选中项由行级橙色玻璃指示带表达；不给 item 加 data 驱动的 class（手势中换 class 就要 setData，
+   而 picker-view 时代每次 setData 都会把列拽回旧 value —— 慢滑闪烁的根因）。 */
 .time-wheel-row {
   position: relative;
+  display: flex;
   width: 100%;
-}
-.time-picker-view {
   height: 440rpx;
-  width: 100%;
 }
-picker-view-column {
+.wheel-scroll {
+  flex: 1;
+  height: 440rpx;
+  position: relative;
+  z-index: 2;
+  /* 惯性/边界/回弹全部交给原生滚动；**不要** scroll-snap：WebView 内核会在松手瞬间把惯性
+     收进吸附点（一次手势只走一格），App 侧上一轮的"阻力感太大"就是它 */
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
   text-align: center;
 }
+/* 滚动条：手机上本来就不显示，桌面/开发者工具会露出灰色竖条（用户截图里能看到）。
+   scroll-view 的 show-scrollbar="{{false}}" 只管部分内核，这里再兜一层。 */
+.wheel-scroll::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+.wheel-pad {
+  /* (440 - 96) / 2：上下各留半格，首末项才能滚到正中 */
+  height: 172rpx;
+}
 .wheel-item {
-  height: 88rpx;
-  /* flex 居中：line-height 在 picker-view-column 内不可靠（column 自带布局样式干扰行盒），
-     flex 是布局级居中，任何渲染环境都稳定 */
+  height: 96rpx;
+  /* flex 居中：滚动容器里 line-height 会被行盒干扰，flex 是布局级居中，任何环境都稳 */
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 30rpx;
+  font-size: 32rpx;
   font-weight: 500;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
-  transition: color 0.15s ease, font-size 0.15s ease;
 }
-.wheel-item-active {
-  color: var(--text-primary);
-  font-weight: 700;
-  font-size: 34rpx;
-  text-shadow: 0 0 20rpx rgba(255, 149, 0, 0.35);
+/* 指示带：整行一条（跨两列），压在数字下面，纯视觉、不吃触摸 */
+.wheel-indicator {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 96rpx;
+  transform: translateY(-50%);
+  background: rgba(255, 149, 0, 0.14);
+  box-shadow: inset 0 1rpx 0 rgba(255, 149, 0, 0.45), inset 0 -1rpx 0 rgba(255, 149, 0, 0.45), 0 0 24rpx rgba(255, 149, 0, 0.10);
+  border-radius: 14rpx;
+  pointer-events: none;
+  z-index: 1;
 }
-/* picker-view 上下渐隐遮罩：默认是白色渐变，深色模式下发白 → 按主题定制
-   （渐隐色与 modal-sheet 背景 --bg-card 一致，浅色 #FFF / 深色 #2C2C2E） */
+/* 上下渐隐遮罩：盖在数字之上、不吃触摸（渐隐色与 modal-sheet 背景 --bg-card 一致：
+   浅色 #FFF / 深色 #2C2C2E） */
 .wheel-mask {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  pointer-events: none;
+  z-index: 3;
   background-image: linear-gradient(180deg, rgba(255,255,255,0.92) 0%, rgba(255,255,255,0) 26%),
                     linear-gradient(0deg, rgba(255,255,255,0.92) 0%, rgba(255,255,255,0) 26%);
 }
@@ -1343,7 +1377,7 @@ picker-view-column {
                     linear-gradient(0deg, rgba(44,44,46,0.95) 0%, rgba(44,44,46,0) 28%);
 }
 
-/* 冒号：覆盖在双列指示框中间（picker-view 内部只能放 column，冒号画在容器层） */
+/* 冒号：覆盖在双列指示框中间（滚轮两列是 scroll-view，冒号画在行容器层） */
 .wheel-colon {
   position: absolute;
   left: 50%;
@@ -1353,7 +1387,7 @@ picker-view-column {
   font-weight: 700;
   color: var(--text-secondary);
   pointer-events: none;
-  z-index: 3;
+  z-index: 4;
 }
 /* 倒计时滚轮单位标签（分/秒）：垂直居中于各列数字右侧，不遮挡数字 */
 .wheel-unit {
@@ -1364,7 +1398,7 @@ picker-view-column {
   font-weight: 500;
   color: var(--text-tertiary);
   pointer-events: none;
-  z-index: 3;
+  z-index: 4;
 }
 .schedule-picker {
   flex: 1;

@@ -654,28 +654,40 @@
   <view class="modal-sheet schedule-modal-sheet" catchtap="noop">
     <view class="sheet-title">选择时间</view>
     <view class="time-wheel-row">
-      <!-- 官方 picker-view 滚轮（系统 picker 底层引擎）：贴合/惯性/边界全部原生，
-           value 指定选中索引，渲染层精确居中 → 零漂移、不过度滚动。
-           慢滑/惯性：value 只在**松手（bindpickend）**同步一次；拖动中（bindchange，immediate-change
-           逐格触发）只更新派生索引做高亮 —— 拖动中写回 value 会让原生列被拽回该索引，
-           慢滑就变成「每次都定位回开始滑动的那个数字」。（见 index.js onTimeWheelChange 注释） -->
-      <picker-view class="time-picker-view" value="{{timeWheelValue}}" immediate-change
-                   mask-class="wheel-mask"
-                   indicator-style="background: rgba(255,149,0,0.10); box-shadow: inset 0 1rpx 0 rgba(255,149,0,0.35), inset 0 -1rpx 0 rgba(255,149,0,0.35); border-radius: 12rpx;"
-                   bindchange="onTimeWheelChange"
-                   bindpickstart="onTimeWheelPickStart"
-                   bindpickend="onTimeWheelPickEnd">
-        <!-- 动态列：今天已过的时间直接从数组中删除（小时列从当前小时起，
-             当前小时仅显示可用分钟；选中小时变化时分钟列级联重建） -->
-        <picker-view-column>
-          <view wx:for="{{hourItems}}" wx:key="*this"
-                class="wheel-item {{index === hourWheelIndex ? 'wheel-item-active' : ''}}">{{item}}</view>
-        </picker-view-column>
-        <picker-view-column>
-          <view wx:for="{{minuteItems}}" wx:key="*this"
-                class="wheel-item {{index === minuteWheelIndex ? 'wheel-item-active' : ''}}">{{item}}</view>
-        </picker-view-column>
-      </picker-view>
+      <!-- 自研滚轮（scroll-view 原生惯性 + 松手吸附），替代官方 picker-view：
+           picker-view 的 value 是「让原生列滚到该索引」的指令，页面只要重渲染一次（无障碍打印 ON
+           期间每 100ms 一次的呼吸光晕 setData 就是），原生列就会把 value 重新应用一次 ⇒ 手指还
+           按着也被拽回 —— 慢滑闪烁 / 松手回起点 / 点数字只高亮不滚动 全是这一个根因。
+           scroll-view 里 JS 完全不碰手势，只有手指离手且静止后才 setData 一次做吸附；
+           点某一格 = 平滑滚到那一格。详见 index.js 的 onWheelScroll 上方长注释。 -->
+      <view class="wheel-mask"></view>
+      <view class="wheel-indicator"></view>
+      <!-- 小时列 -->
+      <scroll-view id="wheel-hour" class="wheel-scroll" scroll-y show-scrollbar="{{false}}"
+                   scroll-top="{{hourWheelTop}}" scroll-with-animation="{{hourWheelAnim}}"
+                   data-wheel="hour"
+                   bindscroll="onWheelScroll"
+                   bindtouchstart="onWheelTouchStart"
+                   bindtouchend="onWheelTouchEnd"
+                   bindtouchcancel="onWheelTouchEnd">
+        <view class="wheel-pad"></view>
+        <view wx:for="{{hourItems}}" wx:key="*this" class="wheel-item wheel-item-hour"
+              data-wheel="hour" data-index="{{index}}" bindtap="onWheelTap">{{item}}</view>
+        <view class="wheel-pad"></view>
+      </scroll-view>
+      <!-- 分钟列：今天已过的时间直接从数组中删除；选中小时变化时级联重建（只在吸附时重建） -->
+      <scroll-view id="wheel-minute" class="wheel-scroll" scroll-y show-scrollbar="{{false}}"
+                   scroll-top="{{minuteWheelTop}}" scroll-with-animation="{{minuteWheelAnim}}"
+                   data-wheel="minute"
+                   bindscroll="onWheelScroll"
+                   bindtouchstart="onWheelTouchStart"
+                   bindtouchend="onWheelTouchEnd"
+                   bindtouchcancel="onWheelTouchEnd">
+        <view class="wheel-pad"></view>
+        <view wx:for="{{minuteItems}}" wx:key="*this" class="wheel-item wheel-item-minute"
+              data-wheel="minute" data-index="{{index}}" bindtap="onWheelTap">{{item}}</view>
+        <view class="wheel-pad"></view>
+      </scroll-view>
       <text class="wheel-colon">:</text>
     </view>
     <view class="modal-buttons">
@@ -690,20 +702,34 @@
   <view class="modal-sheet schedule-modal-sheet" catchtap="noop">
     <view class="sheet-title">选择倒计时</view>
     <view class="time-wheel-row">
-      <picker-view class="time-picker-view" value="{{countdownWheelValue}}" immediate-change
-                   mask-class="wheel-mask"
-                   indicator-style="background: rgba(255,149,0,0.10); box-shadow: inset 0 1rpx 0 rgba(255,149,0,0.35), inset 0 -1rpx 0 rgba(255,149,0,0.35); border-radius: 12rpx;"
-                   bindchange="onCountdownWheelChange"
-                   bindpickend="onCountdownWheelPickEnd">
-        <picker-view-column>
-          <view wx:for="{{countdownMinItems}}" wx:key="*this"
-                class="wheel-item {{index === countdownMinWheelIndex ? 'wheel-item-active' : ''}}">{{item}}</view>
-        </picker-view-column>
-        <picker-view-column>
-          <view wx:for="{{countdownSecItems}}" wx:key="*this"
-                class="wheel-item {{index === countdownSecWheelIndex ? 'wheel-item-active' : ''}}">{{item}}</view>
-        </picker-view-column>
-      </picker-view>
+      <view class="wheel-mask"></view>
+      <view class="wheel-indicator"></view>
+      <!-- 分钟列（范围 00-59） -->
+      <scroll-view id="wheel-cdmin" class="wheel-scroll" scroll-y show-scrollbar="{{false}}"
+                   scroll-top="{{cdMinWheelTop}}" scroll-with-animation="{{cdMinWheelAnim}}"
+                   data-wheel="cdMin"
+                   bindscroll="onWheelScroll"
+                   bindtouchstart="onWheelTouchStart"
+                   bindtouchend="onWheelTouchEnd"
+                   bindtouchcancel="onWheelTouchEnd">
+        <view class="wheel-pad"></view>
+        <view wx:for="{{countdownMinItems}}" wx:key="*this" class="wheel-item wheel-item-cdmin"
+              data-wheel="cdMin" data-index="{{index}}" bindtap="onWheelTap">{{item}}</view>
+        <view class="wheel-pad"></view>
+      </scroll-view>
+      <!-- 秒列（范围 00-59） -->
+      <scroll-view id="wheel-cdsec" class="wheel-scroll" scroll-y show-scrollbar="{{false}}"
+                   scroll-top="{{cdSecWheelTop}}" scroll-with-animation="{{cdSecWheelAnim}}"
+                   data-wheel="cdSec"
+                   bindscroll="onWheelScroll"
+                   bindtouchstart="onWheelTouchStart"
+                   bindtouchend="onWheelTouchEnd"
+                   bindtouchcancel="onWheelTouchEnd">
+        <view class="wheel-pad"></view>
+        <view wx:for="{{countdownSecItems}}" wx:key="*this" class="wheel-item wheel-item-cdsec"
+              data-wheel="cdSec" data-index="{{index}}" bindtap="onWheelTap">{{item}}</view>
+        <view class="wheel-pad"></view>
+      </scroll-view>
       <text class="wheel-unit" style="left: 40%;">分</text>
       <text class="wheel-unit" style="left: 90%;">秒</text>
     </view>

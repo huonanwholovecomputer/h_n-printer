@@ -32,6 +32,42 @@ const TOGGLE_HINT_EXTRA_RPX = 40
 // 「封面单独打印」展开后的单面页输入区：一行提示/表头 + 每行输入框（与页码范围行同高）
 const SIMPLEX_BLOCK_HEADER_RPX = 44
 
+// ── 时间/倒计时滚轮的几何与手感常量（自研 scroll-view 滚轮）──
+// ⚠ 96 / 440 必须与 index.wxss 的 .wheel-item / .wheel-scroll / .wheel-pad 高度一致：
+//   pad = (440 − 96) / 2 = 172rpx，三者自洽时「居中第 i 项」的 scrollTop 才等于 i × 一格高。
+// 2026-11-26 第六轮：用户要求「每一个框都加上一点点高度」（88 → 96rpx），格与格之间松一点，
+// 停偏一点点时数字也不至于被挤在指示带边缘。
+const WHEEL_ITEM_RPX = 96          // 单格高
+const WHEEL_VIEW_RPX = 440         // 可视区高（440/96 ≈ 4.6 格）
+const WHEEL_SNAP_IDLE_MS = 140     // 手指离手/惯性静止多久后吸附（与 App 侧 buildWheel 同值）
+const WHEEL_SNAP_LOCK_MS = 420     // scroll-with-animation 兜底解锁（动画最长约 300ms）
+const WHEEL_SETTLE_MS = 260        // 弹窗打开后多久校验首次定位是否落地
+// 落点校准：吸附动画结束后，用 SelectorQuery 量一次「目标格中心 - 视口中心」。
+// 公式算出来的 scrollTop 只是估算（rpx 折算取整、惯性尾巴、动画提前被内核收尾都会差几像素），
+// 用户实测「数字停在中心偏上/偏下、偏移有规律」就是这类固定偏差，量一次补一次才居中。
+const WHEEL_ALIGN_DELAY_MS = 360   // 吸附动画跑完后再量（等内核把平滑滚动落定）
+const WHEEL_ALIGN_EPS = 0.6        // 偏差小于这个像素数就当已居中，不再动
+const WHEEL_ALIGN_IDLE_MS = 140    // 多久没有 bindscroll 才算「这一列真的停了」（量的是静止位置）
+const WHEEL_ALIGN_RETRY_MS = 120   // 没停就等这么久再量（最多 WHEEL_ALIGN_TRIES 次）
+const WHEEL_ALIGN_TRIES = 12       // 最多等 ~1.4s；再等不到就放弃，等下一次吸附重来
+
+// 四个滚轮列的数据键：wxml 的 scroll-view 用 data-wheel 指明列名，这里按列名查表，
+// 所以「滚动 / 触摸 / 点选」只需要一套通用 handler，不必给四列各写一份。
+// itemClass：每列格子的「专属 class」。
+// 为什么需要它（2026-11-26 第七轮的真凶）：微信的 SelectorQuery.selectAll 只能挂在
+// SelectorQuery 上（query.selectAll(selector)），**不能**接在 select() 返回的 NodesRef 后面
+// ——「q.select('#wheel-minute').selectAll('.wheel-item')」在真机上直接抛 TypeError，
+// 被 _wheelMeasure 的 try/catch 吃掉后退回公式估算 ⇒ 前两轮的「实测几何」在真机上从未生效，
+// 用户看到的还是「按 96rpx 估算」的落点，最后一格被 maxScroll 钳住时算出上一格（58 vs 59）。
+// 于是给每列格子加独立 class，用 query.selectAll('.wheel-item-minute') 无歧义地取到「这一列的
+// 全部格子」，不依赖作用域链式调用。
+const WHEEL_COLUMNS = {
+  hour:   { dom: 'wheel-hour',   itemClass: 'wheel-item-hour',   top: 'hourWheelTop',   anim: 'hourWheelAnim',   items: 'hourItems',         index: 'hourWheelIndex' },
+  minute: { dom: 'wheel-minute', itemClass: 'wheel-item-minute', top: 'minuteWheelTop', anim: 'minuteWheelAnim', items: 'minuteItems',       index: 'minuteWheelIndex' },
+  cdMin:  { dom: 'wheel-cdmin',  itemClass: 'wheel-item-cdmin',  top: 'cdMinWheelTop',  anim: 'cdMinWheelAnim',  items: 'countdownMinItems', index: 'countdownMinWheelIndex' },
+  cdSec:  { dom: 'wheel-cdsec',  itemClass: 'wheel-item-cdsec',  top: 'cdSecWheelTop',  anim: 'cdSecWheelAnim',  items: 'countdownSecItems', index: 'countdownSecWheelIndex' },
+}
+
 // S2-08（2026-10-26 用户要求）：隐私告知**只在第一次使用本产品时问一次**，确认后永久记住；
 // 保留期仍可随时改（保留期偏好同样记住）。清缓存/换机才会重新询问。
 const PRIVACY_AGREE_KEY = 'hn_privacy_agreed_v1'
@@ -70,8 +106,8 @@ function _fileCardHeightRpx(file) {
   return extra > 0 ? height + extra * RANGE_LINE_EXTRA_RPX : height
 }
 
-// 时间滚轮（picker-view）：item 高 88rpx、可视区 440rpx 由 WXSS 定义
-// （picker-view 的贴合单元 = column 内 item 高度，无需 JS 参与几何计算）
+// 时间滚轮（自研 scroll-view）：item 高 88rpx、可视区 440rpx 由 WXSS 定义，JS 侧的
+// WHEEL_ITEM_RPX / WHEEL_VIEW_RPX 必须与之一致（吸附位移 = 索引 × 一格高，两处不一致就错位）
 
 // 初始主题值：直接从 app.globalData 读取（同步、无延迟），绕过 storage 的异步写窗口
 // 避免首次创建组件时首帧使用过期值触发 CSS transition 闪烁
@@ -247,7 +283,12 @@ Component({
     minuteItems: Array.from({ length: 60 }, (_, i) => String(i).padStart(2, '0')),
     hourWheelIndex: 8,                // 时滚轮选中索引（默认 08:00）
     minuteWheelIndex: 0,
-    timeWheelValue: [8, 0],           // picker-view 选中索引数组（原生定位/贴合）
+    // 滚轮位置：scroll-top 绑定的值（px）。只在「松手静止吸附」或「点选」时写一次，
+    // 手势期间一次都不写（写 = 页面重渲染 = WebView 内核可能把列拽回旧位置）。
+    hourWheelTop: 0,
+    hourWheelAnim: false,             // 吸附用 scroll-with-animation 平滑滚；首次定位用直落
+    minuteWheelTop: 0,
+    minuteWheelAnim: false,
     curHour: 0,                       // 打开弹窗时的当前时刻（今天裁剪已过时间用）
     curMin: 0,
     hourStart: 0,                     // 今天：小时列起始小时（curMin=59 时为 curHour+1）
@@ -261,7 +302,10 @@ Component({
     countdownSecItems: Array.from({ length: 60 }, (_, i) => String(i).padStart(2, '0')),
     countdownMinWheelIndex: 5,
     countdownSecWheelIndex: 0,
-    countdownWheelValue: [5, 0],
+    cdMinWheelTop: 0,
+    cdMinWheelAnim: false,
+    cdSecWheelTop: 0,
+    cdSecWheelAnim: false,
     // 内层文件列表（文件卡片列表）：由 utils/scroll.wxs 直驱 translateY —— 内层到边当帧把余量
     // 交给外层页面、外层到顶再交还内层。偏移与边界全靠两个 rect 量出来，不再需要 bindscroll →
     // setData → change:prop 三跳同步贴边状态（那三跳就是「滑到底页面不跟着动」的死区）。
@@ -3439,9 +3483,9 @@ Component({
       }, 180)
     },
 
-    // ── 自定义时间选择弹窗（官方 picker-view 双列滚轮） ──
+    // ── 自定义时间选择弹窗（自研 scroll-view 双列滚轮） ──
 
-    // 分钟列构建（数组元素即真实分钟字符串，索引仅用于 picker-view 定位）：
+    // 分钟列构建（数组元素即真实分钟字符串，索引即滚轮格位）：
     // 非今天 → 00-59 全量；今天 → 选中小时为当前小时时仅 curMin+1..59，未来小时全量
     _buildMinuteItems(hourIndex, isToday, hourStart, minuteStart) {
       const full = Array.from({ length: 60 }, (_, i) => String(i).padStart(2, '0'))
@@ -3489,83 +3533,481 @@ Component({
       }
       const minuteItems = this._buildMinuteItems(hi, isToday, hourStart, minuteStart)
       if (mi >= minuteItems.length) mi = 0
-      // value 由渲染层原生定位到选中项（系统 picker 同款引擎，精确居中）
-      // 慢滑/惯性修复的实例态（不进 data，避免无谓渲染）：
-      //   _wheelHi/_wheelMi = 原生列最近一次报告的索引（拖动中每跨一格更新）
-      //   _wheelCascadeHi   = 上一次「分钟列按小时重建」级联时的小时索引
-      this._wheelHi = hi
-      this._wheelMi = mi
+      const itemPx = this._wheelItemPx()
+      // 手势态整体复位（只存实例字段，不进 data）：_wheelCascadeHi = 上次做分钟级联时的小时索引
+      this._wheels = {}
+      this._wheelEpsToggle = false
       this._wheelCascadeHi = hi
+      const hst = this._wheelState('hour')
+      const mst = this._wheelState('minute')
+      // top=-1：还不知道真实位置，等第一个 scroll 事件报回来（见 _wheelSettle）
+      hst.idx = hi; hst.top = -1; hst.snapping = true
+      mst.idx = mi; mst.top = -1; mst.snapping = true
+      // 无障碍打印 ON 时页面每 100ms 有一次「呼吸光晕」setData（_startBreathingGlow）。弹窗
+      // 打开期间它只会白白重渲染整个页面（picker-view 时代这正是「极慢滑动仍闪烁」的来源），
+      // 先停掉；光晕在遮罩后面本来也看不见，关窗再续。
+      this._stopBreathingGlow()
       this.setData({
         showScheduleTimePicker: true,
         hourItems,
         minuteItems,
         hourWheelIndex: hi,
         minuteWheelIndex: mi,
-        timeWheelValue: [hi, mi],
+        // 首次定位直落（不做动画）：位置 = 索引 × 一格高，与「居中第 i 项」的式子一致
+        hourWheelTop: hi * itemPx,
+        hourWheelAnim: false,
+        minuteWheelTop: mi * itemPx,
+        minuteWheelAnim: false,
         curHour,
         curMin,
         hourStart,
         minuteStart,
       })
+      // wx:if 刚插入时首帧的 scroll-top 可能被吞掉 → 布局落定后校验一次，没生效就补写
+      setTimeout(() => {
+        this._wheelSettle('hour', hi)
+        this._wheelSettle('minute', mi)
+      }, WHEEL_SETTLE_MS)
     },
 
-    // picker-view 滚动变化：索引由组件原生给出（immediate-change ⇒ 拖动中每跨一格触发一次）。
-    // ⚠「惯性/慢滑」病根就在这里：**拖动中绝不写回 timeWheelValue**。
-    // value 是「让原生列滚到该索引」的指令；拖动中写回 = 原生列被拽回该索引的中心，
-    // 用户看到的就是「先算出最终停在哪、直接把高亮定位到那个数字」；慢滑每跨一格都被拽一次，
-    // 表现成「每次都定位回开始滑动的那个数字、缓慢滑动无效」。value 只在松手（bindpickend）
-    // 同步一次 —— 那时轮子本来就在该索引上，写回不产生任何位移。
-    // 今天的小时列变化会改变分钟列长度 → 级联重建也推迟到松手（拖动中重建 minuteItems 会让
-    // 整棵 picker-view 子树重渲染，正在拖的列被重置回 value）。
-    onTimeWheelChange(e) {
-      const v = (e.detail && e.detail.value) || []
-      if (v.length < 2) return
-      const hi = v[0]
-      const mi = v[1]
-      this._wheelHi = hi
-      this._wheelMi = mi
-      // 只更新派生索引（决定 .wheel-item-active 高亮）→ 逐格跟手；不碰 value
-      if (hi !== this.data.hourWheelIndex || mi !== this.data.minuteWheelIndex) {
-        this.setData({ hourWheelIndex: hi, minuteWheelIndex: mi })
+    // ── 自研滚轮引擎（scroll-view 原生滚动 + 松手吸附） ──
+    //
+    // 为什么换掉官方 picker-view（第二轮反馈「极慢滑动依旧会闪烁」之后查明的结论）：
+    //   picker-view 的 value 是「让原生列滚到该索引」的**指令**，不是可回读的状态。页面只要
+    //   发生一次重渲染（无障碍打印 ON 期间每 100ms 一次的呼吸光晕 setData 就是），原生列就
+    //   会把当前绑定的 value 重新应用一次 —— 手指还按着也会被拽回去：
+    //     · 慢滑：列在「手指位置」与「绑定的 value」之间一跳一跳地闪，越慢越明显；
+    //     · 点未选中的数字：原生点选只改高亮，随即被拽回 ⇒ 看起来点了没反应。
+    //   官方文档也写明「目前滚动过程中 bind:pickstart、bind:pickend 会被触发多次」，所以靠
+    //   pickend 决定何时写回 value 从原理上就不成立（上一轮只去掉「手势中写 value」，仍会闪）。
+    //   scroll-view 是普通 DOM 滚动容器：贴合/惯性/边界全交给原生滚动，JS 不参与手势，只在
+    //   【手指离开且静止 WHEEL_SNAP_IDLE_MS 之后】setData 一次，把列平滑吸附到最近一格
+    //   （与 android_app/www/print.js 的 buildWheel 同构，App 侧这个手感已验收为正常）。
+    // [WHEEL-ZERO-SETDATA] 不变量标记：手势期间一次 setData 都不许发，验收脚本按这个 ASCII 标记定位
+
+    // 一格的高度（px）：rpx→px 折算，必须与 wxss 的 .wheel-item 高度一致
+    _wheelItemPx() {
+      let winW = 375
+      try {
+        const info = wx.getWindowInfo ? wx.getWindowInfo() : wx.getSystemInfoSync()
+        if (info && info.windowWidth) winW = info.windowWidth
+      } catch (e) { /* 取不到就按 375 宽折算 */ }
+      return WHEEL_ITEM_RPX * winW / 750
+    },
+
+    // 每列的手势态（只存实例，绝不进 data —— 进 data 就等于每次都要 setData）
+    _wheelState(name) {
+      if (!this._wheels) this._wheels = {}
+      if (!this._wheels[name]) {
+        this._wheels[name] = {
+          top: -1,          // 最近一次 scroll 事件报的 scrollTop（px）；-1 = 还不知道
+          idx: 0,           // 由 top 折算出的最近格索引
+          touching: false,  // 手指还在屏幕上
+          snapping: false,  // 程序化吸附动画进行中（期间不再排吸附，免得自己跟自己抢）
+          snapTimer: null,
+          lockTimer: null,
+          alignTimer: null,
+          lastScrollAt: 0,  // 最近一次 bindscroll 的时间戳（判「这一列真的停了没有」）
+        }
       }
+      return this._wheels[name]
     },
 
-    // 拖动开始：期间 onTimeWheelChange 只更派生索引，不写 value
-    onTimeWheelPickStart() {
-      this._wheelDragging = true
+    _wheelCount(name) {
+      const col = WHEEL_COLUMNS[name]
+      const items = (col && this.data[col.items]) || []
+      return items.length
     },
 
-    // 拖动结束（原生列已贴合最近项）：同步 value + 做级联。
-    // 级联与系统 picker 一致 —— 松手后才按新小时重建分钟列，分钟回到该小时第一个可用分钟。
-    onTimeWheelPickEnd() {
-      this._wheelDragging = false
-      const hi = this._wheelHi
-      const mi = this._wheelMi
-      if (typeof hi !== 'number' || typeof mi !== 'number') return
-      if (this.data.scheduleDayIndex === 0 && hi !== this._wheelCascadeHi) {
-        this._wheelCascadeHi = hi
-        const minuteItems = this._buildMinuteItems(hi, true, this.data.hourStart, this.data.minuteStart)
-        this._wheelMi = 0
-        this.setData({
-          hourWheelIndex: hi,
-          minuteWheelIndex: 0,
-          minuteItems,
-          timeWheelValue: [hi, 0],
-        })
+    // 实测几何（一次 SelectorQuery 量出来，缓存到实例；弹窗关闭即失效）：
+    //   pitch  = 相邻两格中心在内容坐标里的间距（真机一格多高）
+    //   c0     = 第 0 格中心在内容坐标里的位置
+    //   viewH  = 滚动视口高度
+    // 为什么必须实测：居中第 i 项的 scrollTop 理论上 = pad + i*pitch + pitch/2 - view/2，
+    // 当 pad = (view - pitch)/2 时化简成 i*pitch。这个化简只在「真机 pitch 恰好等于
+    // 88rpx×winW/750」时成立；真机 rpx 折算/取整只要差一点点，第 i 格就偏 i×差值 ——
+    // 正是用户 2026-11-26 反馈的「错位是累积的」；而滚到最底时 scrollTop 被钳在 maxScroll
+    // =（N−1)×pitch，钳位值恰好等于最后一格的正中，于是「到底部反而没有错位」。
+    _wheelGeom(name) {
+      return (this._wheelGeoms && this._wheelGeoms[name]) || null
+    },
+
+    _wheelMeasure(name, cb) {
+      const col = WHEEL_COLUMNS[name]
+      const fallback = () => { if (cb) cb(this._wheelGeom(name), null) }
+      if (!col) return fallback()
+      let q = null
+      try {
+        // Page 自带 createSelectorQuery()，返回的查询已经绑定本页（不要再多调 in(this)）
+        q = (typeof this.createSelectorQuery === 'function')
+          ? this.createSelectorQuery()
+          : wx.createSelectorQuery()
+      } catch (e) { return fallback() }
+      if (!q || typeof q.select !== 'function') return fallback()
+      const done = (resList) => {
+        const colRect = resList && resList[0]
+        const items = resList && resList[1]
+        const off = resList && resList[2]
+        const scrollTop = (off && typeof off.scrollTop === 'number') ? off.scrollTop : null
+        const scrollHeight = (off && typeof off.scrollHeight === 'number') ? off.scrollHeight : null
+        const geom = this._wheelStoreGeom(name, colRect, items, scrollTop, scrollHeight)
+        if (!geom) return fallback()
+        if (cb) cb(geom, scrollTop)
+      }
+      try {
+        // ⚠ selectAll 必须挂在 query 上：query.select('#id').selectAll(...) 在真机上抛
+        // TypeError（NodesRef 没有 selectAll），会被下面的 catch 吃掉 ⇒ 静默退回公式估算。
+        // 所以用「每列专属 class」来取这一列的格子，见 WHEEL_COLUMNS.itemClass 的注释。
+        q.select('#' + col.dom).boundingClientRect()
+        q.selectAll('.' + col.itemClass).boundingClientRect()
+        q.select('#' + col.dom).scrollOffset()
+        q.exec(done)
+      } catch (e) { fallback() }
+    },
+
+    // 把一次测量结果落成几何缓存；量不到（弹窗刚开、列还没布局好）返回 null
+    _wheelStoreGeom(name, colRect, items, scrollTop, scrollHeight) {
+      if (!colRect || !colRect.height) return null
+      if (!items || !items.length || !items[0] || !items[0].height) return null
+      if (!(typeof scrollTop === 'number' && scrollTop >= 0)) return null
+      // 每格中心换算到「内容坐标」：视口坐标 − 列顶 + 当前 scrollTop
+      const centers = []
+      for (let i = 0; i < items.length; i++) {
+        const it = items[i]
+        if (!it || typeof it.top !== 'number') continue
+        centers.push((it.top - colRect.top) + scrollTop + (it.height || 0) / 2)
+      }
+      if (!centers.length) return null
+      // 平均间距：真机 rpx 折算可能让每格高在 46/46.1/46.2 之间抖动，
+      // 只取第一对相邻差会把这点抖动带进「第 40 格」，所以用首尾跨度除以间隔数。
+      let pitch = 0
+      if (centers.length >= 2) pitch = (centers[centers.length - 1] - centers[0]) / (centers.length - 1)
+      if (!(pitch > 1)) pitch = this._wheelItemPx()
+      if (!(pitch > 0)) return null
+      // centers 整份留着：落点直接取「实测的该格中心」，连平均 pitch 的残差也不留
+      const geom = { pitch, c0: centers[0], viewH: colRect.height, n: centers.length, centers }
+      // 内容能滚到哪儿：maxScroll 决定了最后一格能不能真的居中。
+      // 最后一格的 centered 位置恒等于 maxScroll（只要 pad=(view−pitch)/2），真机上这条
+      // 关系一旦有偏差，末尾几格的索引就会差一格（用户 2026-11-26:「58 时刚好偏一格，59 选不到」）。
+      if (typeof scrollHeight === 'number' && scrollHeight > colRect.height) {
+        geom.maxScroll = scrollHeight - colRect.height
+      }
+      if (!this._wheelGeoms) this._wheelGeoms = {}
+      this._wheelGeoms[name] = geom
+      return geom
+    },
+
+    // 让第 idx 格居中的 scrollTop（有实测用实测，没有就退回公式）
+    // 有 centers 时直接取「该格实测中心」，不再用「c0 + i×pitch」线性外推
+    _wheelTarget(name, idx) {
+      const g = this._wheelGeom(name)
+      let top = null
+      if (g) {
+        if (g.centers && idx >= 0 && idx < g.centers.length) top = g.centers[idx] - g.viewH / 2
+        else if (g.pitch) top = g.c0 + idx * g.pitch - g.viewH / 2
+      }
+      if (top == null) top = idx * this._wheelItemPx()
+      // 真机能滚到的最大位置：超了内核会自己钳住，我们按钳后的值算，落点才和「看到的那一格」一致
+      if (g && typeof g.maxScroll === 'number') top = Math.max(0, Math.min(g.maxScroll, top))
+      return top
+    },
+
+    // scrollTop → 最近格索引（同样优先用实测中心，避免「索引算错一格」）
+    _wheelIndexAt(name, top) {
+      const n = this._wheelCount(name)
+      if (n <= 0) return 0
+      const g = this._wheelGeom(name)
+      // 滚到最底 ⇒ 一定是最后一格。这条比「就近取中心」更硬：底部留白 =（视口 − 单格）/2，
+      // 所以 maxScroll 处最后一格恰好居中；而按估算 pitch 折算会算出倒数第二格
+      // （2026-11-26 用户现场：「显示的是 59，确定出来是 58，59 永远选不到」）。
+      if (g && typeof g.maxScroll === 'number' && top >= g.maxScroll - 0.5) return n - 1
+      if (g && g.centers && g.centers.length) {
+        const want = top + g.viewH / 2
+        let best = 0
+        let bestD = Infinity
+        const last = Math.min(g.centers.length, n) - 1
+        for (let i = 0; i <= last; i++) {
+          const d = Math.abs(g.centers[i] - want)
+          if (d < bestD) { bestD = d; best = i }
+        }
+        return Math.max(0, Math.min(n - 1, best))
+      }
+      if (g && g.pitch) {
+        const idx = Math.round((top + g.viewH / 2 - g.c0) / g.pitch)
+        return Math.max(0, Math.min(n - 1, idx))
+      }
+      const itemPx = this._wheelItemPx()
+      if (!itemPx) return 0
+      return Math.max(0, Math.min(n - 1, Math.round(top / itemPx)))
+    },
+
+    // 写回一次位置：**全文件唯一允许写 scroll-top 的地方**。
+    // eps 抖动：scroll-view 的 scroll-top 值不变就不会重新滚动，而「同值重复吸附」很常见
+    // （点已居中的数字、拖动后又回到原位）⇒ 每次写回在 0 / 0.01px 之间交替，肉眼无差。
+    _wheelCommit(name, idx, opts) {
+      const col = WHEEL_COLUMNS[name]
+      if (!col) return
+      const n = this._wheelCount(name)
+      if (n <= 0) return
+      const st = this._wheelState(name)
+      const next = Math.max(0, Math.min(n - 1, idx | 0))
+      // topPx：校准路径按「实测偏差」给出的精确 scrollTop；否则用实测几何算的目标位置
+      const topPx = (opts && typeof opts.topPx === 'number') ? opts.topPx : this._wheelTarget(name, next)
+      this._wheelEpsToggle = !this._wheelEpsToggle
+      const patch = (opts && opts.patch) || {}
+      const animate = !(opts && opts.animate === false)
+      st.idx = next
+      st.top = topPx
+      st.snapping = animate
+      if (st.lockTimer) clearTimeout(st.lockTimer)
+      st.lockTimer = setTimeout(() => {
+        st.snapping = false
+        st.lockTimer = null
+      }, WHEEL_SNAP_LOCK_MS)
+      patch[col.top] = topPx + (this._wheelEpsToggle ? 0.01 : 0)
+      patch[col.anim] = animate
+      patch[col.index] = next
+      this.setData(patch)
+      // 落点校准：动画跑完量一次真实位置（noAlign 时由调用方自己安排，避免自我递归）
+      if (!(opts && opts.noAlign)) this._wheelScheduleAlign(name)
+    },
+
+    _wheelScheduleSnap(name) {
+      const st = this._wheelState(name)
+      if (st.snapTimer) clearTimeout(st.snapTimer)
+      st.snapTimer = setTimeout(() => {
+        st.snapTimer = null
+        this._wheelSnap(name)
+      }, WHEEL_SNAP_IDLE_MS)
+    },
+
+    // 静止后吸附：手势结束之后**唯一**该 setData 的时机。
+    // 先量一次真实几何再算目标位置 —— 「一格多高」用实测值，第 i 格才不会偏 i×差值。
+    _wheelSnap(name) {
+      const st = this._wheelState(name)
+      if (st.touching) return
+      const n = this._wheelCount(name)
+      if (n <= 0) return
+      this._wheelMeasure(name, (geom, measuredTop) => {
+        if (st.touching) return
+        // 目标格按「量到的这一刻的位置」推，不用几毫秒前的 st.idx：
+        // 量测是异步的，中间来一帧 bindscroll 就会让 st.idx 落后一格（吸附到隔壁）。
+        const top = (typeof measuredTop === 'number' && measuredTop >= 0) ? measuredTop : st.top
+        const idx = Math.max(0, Math.min(n - 1, this._wheelIndexAt(name, top)))
+        if (name === 'hour') { this._wheelSnapHour(idx); return }
+        this._wheelCommit(name, idx)
+      })
+    },
+
+    // 小时列吸附后做级联：今天且换到「当前小时」时，分钟列只剩可用分钟。
+    // 级联只在吸附时做 —— 拖动中重建分钟列等于整列跳位。
+    _wheelSnapHour(idx) {
+      if (this.data.scheduleDayIndex !== 0 || idx === this._wheelCascadeHi) {
+        this._wheelCommit('hour', idx)
         return
       }
-      this.setData({
-        hourWheelIndex: hi,
-        minuteWheelIndex: mi,
-        timeWheelValue: [hi, mi],
+      this._wheelCascadeHi = idx
+      const minuteItems = this._buildMinuteItems(idx, true, this.data.hourStart, this.data.minuteStart)
+      const mst = this._wheelState('minute')
+      if (mst.snapTimer) { clearTimeout(mst.snapTimer); mst.snapTimer = null }
+      mst.idx = 0
+      // 分钟列内容整体换掉 + 位置落回第 1 个可用分钟（与小时列同一次 setData，避免重建时先抖）
+      this._wheelCommit('hour', idx, { patch: { minuteItems } })
+      this._wheelCommit('minute', 0, { animate: false })
+    },
+
+    // 弹窗首帧后校验首次定位：先量真实几何与世界位置，按实测目标位置落位（量不到才退回公式）
+    _wheelSettle(name, idx) {
+      const st = this._wheelState(name)
+      st.snapping = false
+      if (st.lockTimer) { clearTimeout(st.lockTimer); st.lockTimer = null }
+      this._wheelMeasure(name, (geom, measuredTop) => {
+        if (st.touching) return
+        const want = this._wheelTarget(name, idx)
+        const top = (typeof measuredTop === 'number' && measuredTop >= 0) ? measuredTop : st.top
+        const itemPx = this._wheelItemPx() || 1
+        if (!(top >= 0) || Math.abs(top - want) > itemPx * 0.5) {
+          this._wheelCommit(name, idx, { animate: false, topPx: want })
+        }
+        // 首帧定位同样要校准：用户看到的「停歪了」最初就是开窗那一刻落下的位置
+        this._wheelScheduleAlign(name)
       })
+    },
+
+    // 这一列是不是「真的停了」：手指不在、没有我们的吸附动画、且 WHEEL_ALIGN_IDLE_MS 内没有 bindscroll。
+    // 为什么必须等停：动画还在跑的时候量到的 item.top 是半路位置，按它补正等于把「半路的差」
+    // 当成「落点的差」写回去 —— 用户 2026-11-26 14:18 的四张截图就是这种「偏差不累积、每次
+    // 大小还不一样」的形态（真机上平滑滚动动辄 300~600ms，360ms 一次的量法量在半路上）。
+    _wheelIdleFor(name, idleMs) {
+      const st = this._wheelState(name)
+      if (st.touching || st.snapping) return false
+      if (st.lastScrollAt && (Date.now() - st.lastScrollAt) < idleMs) return false
+      return true
+    },
+
+    _wheelScheduleAlign(name) {
+      if (!this._wheelModalOpen(name)) return
+      const st = this._wheelState(name)
+      if (st.alignTimer) clearTimeout(st.alignTimer)
+      st.alignTimer = setTimeout(() => {
+        st.alignTimer = null
+        this._wheelAlign(name, 0)
+      }, WHEEL_ALIGN_DELAY_MS)
+    },
+
+    // 弹窗还开着吗？（关掉的弹窗不再校准：列已经销毁，写 scroll-top 没有意义）
+    _wheelModalOpen(name) {
+      const flag = (name === 'hour' || name === 'minute')
+        ? 'showScheduleTimePicker'
+        : 'showScheduleCountdownPicker'
+      return !!this.data[flag]
+    },
+
+    // 落点校准（手势之外的只读测量）：量「目标格中心」与「视口中心」的差，差多少补多少。
+    // 为什么必须量而不是算：公式 top = i × 一格高 成立的前提是「item 恰好 88rpx、留白恰好
+    // 176rpx、内核对 scrollTop 不做取整、动画恰好落在目标值」—— 真机上这四条都可能差一点点，
+    // 表现为「数字停在中心偏上/偏下，而且偏移有规律」（用户 2026-11-26 反馈）。
+    // 这里用 boundingClientRect 拿真实位置（App 侧 buildWheel 也是这么做的），
+    // 只读 DOM + 最多补写两次，且永远发生在手指离开之后（[WHEEL-ZERO-SETDATA] 不受影响）。
+    _wheelAlign(name, attempt) {
+      const col = WHEEL_COLUMNS[name]
+      if (!col) return
+      if (!this._wheelModalOpen(name)) return            // 弹窗已关：列没了，别补写
+      const st = this._wheelState(name)
+      if (st.touching) return
+      // 先等「真的停下」再量：量半路位置只会把错的偏差写回去
+      if (!this._wheelIdleFor(name, WHEEL_ALIGN_IDLE_MS)) {
+        if (attempt < WHEEL_ALIGN_TRIES) {
+          setTimeout(() => this._wheelAlign(name, attempt + 1), WHEEL_ALIGN_RETRY_MS)
+        }
+        return
+      }
+      let q = null
+      try {
+        // Page 自带 createSelectorQuery()，返回的查询已经绑定本页（不要再多调 in(this)：
+        // in() 是给自定义组件用的，传 Page 实例在真机上可能被判非法参数）。
+        q = (typeof this.createSelectorQuery === 'function')
+          ? this.createSelectorQuery()
+          : wx.createSelectorQuery()
+      } catch (e) { return }
+      if (!q || typeof q.select !== 'function') return
+      const done = (resList) => {
+        const colRect = resList && resList[0]
+        const items = resList && resList[1]
+        const off = resList && resList[2]
+        const cur = (off && typeof off.scrollTop === 'number') ? off.scrollTop : st.top
+        const geom = (colRect && items && items.length && typeof cur === 'number' && cur >= 0)
+          ? this._wheelStoreGeom(name, colRect, items, cur) : null
+        if (!geom) {
+          if (attempt < WHEEL_ALIGN_TRIES) setTimeout(() => this._wheelAlign(name, attempt + 1), 160)
+          return
+        }
+        // 目标格「按这一刻离视口中心最近的那一格」重新推，不用排定时器时的旧索引：
+        // 用户看到的中心格就是它，按旧索引补正等于把另一格拉到中心（就出「数字没停中间」）。
+        const idx = this._wheelIndexAt(name, cur)
+        const item = items[idx]
+        if (!item || !item.height) return
+        st.idx = idx
+        const delta = (item.top + item.height / 2) - (colRect.top + colRect.height / 2)
+        if (Math.abs(delta) <= WHEEL_ALIGN_EPS) return             // 已经居中，收手
+        this._wheelCommit(name, idx, {
+          topPx: cur + delta,
+          animate: Math.abs(delta) > 3,                             // 小偏差直接落位，别肉眼看见「再弹一下」
+          noAlign: true,
+        })
+        // 补写之后再看一眼（最多两次，避免量不到就无限纠）
+        if (attempt < 1) setTimeout(() => this._wheelAlign(name, attempt + 1), WHEEL_ALIGN_DELAY_MS)
+      }
+      try {
+        // 同 _wheelMeasure：selectAll 必须挂 query，不能接在 select() 后面
+        q.select('#' + col.dom).boundingClientRect()
+        q.selectAll('.' + col.itemClass).boundingClientRect()
+        q.select('#' + col.dom).scrollOffset()
+        q.exec(done)
+      } catch (e) { /* 量不到就算了，下一次吸附再试 */ }
+    },
+
+    // 关窗时清掉所有还在跑的吸附定时器（弹窗销毁后再 setData 没有意义）
+    _wheelReleaseAll() {
+      // 实测几何跟着弹窗一起作废：下次开窗重新量（窗口尺寸/布局都可能变）
+      this._wheelGeoms = null
+      const wheels = this._wheels || {}
+      Object.keys(wheels).forEach((name) => {
+        const st = wheels[name]
+        if (st.snapTimer) { clearTimeout(st.snapTimer); st.snapTimer = null }
+        if (st.lockTimer) { clearTimeout(st.lockTimer); st.lockTimer = null }
+        if (st.alignTimer) { clearTimeout(st.alignTimer); st.alignTimer = null }
+        st.touching = false
+        st.snapping = false
+      })
+    },
+
+    // 滚动事件：只把位置记进实例字段。
+    // ⚠ 这里**一个 setData 都不许发**（发一次 = 整页重渲染，列可能被拽回旧 scroll-top，
+    //    慢滑又开始闪）。吸附推迟到「静止 WHEEL_SNAP_IDLE_MS」之后，见 _wheelSnap。
+    onWheelScroll(e) {
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const name = ds.wheel
+      if (!name || !WHEEL_COLUMNS[name]) return
+      const st = this._wheelState(name)
+      const top = e.detail && e.detail.scrollTop
+      if (typeof top === 'number') st.top = top
+      st.idx = this._wheelIndexAt(name, st.top)
+      st.lastScrollAt = Date.now()
+      // 手指还在屏幕上、或吸附动画正在跑：不排吸附
+      if (st.touching || st.snapping) return
+      this._wheelScheduleSnap(name)
+    },
+
+    onWheelTouchStart(e) {
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const name = ds.wheel
+      if (!name || !WHEEL_COLUMNS[name]) return
+      const st = this._wheelState(name)
+      st.touching = true
+      st.snapping = false
+      if (st.snapTimer) { clearTimeout(st.snapTimer); st.snapTimer = null }
+      if (st.lockTimer) { clearTimeout(st.lockTimer); st.lockTimer = null }
+      // 手指一落下就作废排着的落点校准：用户接手了，别在拖动中补写位置
+      if (st.alignTimer) { clearTimeout(st.alignTimer); st.alignTimer = null }
+    },
+
+    onWheelTouchEnd(e) {
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const name = ds.wheel
+      if (!name || !WHEEL_COLUMNS[name]) return
+      const st = this._wheelState(name)
+      st.touching = false
+      // 惯性还在滚 ⇒ 每个 scroll 事件都会重置这个定时器，真正停下才吸附
+      this._wheelScheduleSnap(name)
+    },
+
+    // 点某一格：平滑滚到那一格。
+    // （「点未选中的数字只高亮、列表不滚」在这个实现里天然不存在：点选 = 一次显式定位）
+    onWheelTap(e) {
+      const ds = (e && e.currentTarget && e.currentTarget.dataset) || {}
+      const name = ds.wheel
+      if (!name || !WHEEL_COLUMNS[name]) return
+      const idx = parseInt(ds.index, 10)
+      if (!(idx >= 0)) return
+      const st = this._wheelState(name)
+      st.touching = false
+      if (st.snapTimer) { clearTimeout(st.snapTimer); st.snapTimer = null }
+      if (st.lockTimer) { clearTimeout(st.lockTimer); st.lockTimer = null }
+      if (st.alignTimer) { clearTimeout(st.alignTimer); st.alignTimer = null }
+      if (name === 'hour') { this._wheelSnapHour(idx); return }
+      this._wheelCommit(name, idx)
     },
 
     onConfirmScheduleTime() {
       // 数组元素即真实时间字符串（已过时间已被裁剪，无需额外校验）
-      const hh = this.data.hourItems[this.data.hourWheelIndex]
-      const mm = this.data.minuteItems[this.data.minuteWheelIndex]
+      // 索引以滚轮态为准（手势中只写实例字段，data 里的索引要等吸附后才更新）
+      const hs = this._wheelState('hour')
+      const ms = this._wheelState('minute')
+      const hi = typeof hs.idx === 'number' ? hs.idx : this.data.hourWheelIndex
+      const mi = typeof ms.idx === 'number' ? ms.idx : this.data.minuteWheelIndex
+      const hh = this.data.hourItems[hi]
+      const mm = this.data.minuteItems[mi]
       if (!hh || !mm) {
         wx.showToast({ title: '请选择有效时间', icon: 'none', duration: 2000 })
         return
@@ -3579,6 +4021,9 @@ Component({
       this.setData({ modalClosing: true })
       setTimeout(() => {
         this.setData({ showScheduleTimePicker: false, modalClosing: false })
+        this._wheelReleaseAll()
+        // 弹窗期间停掉的呼吸光晕在这里续上（无障碍打印仍开着才续）
+        if (this.data.autoPrintEnabled) this._startBreathingGlow()
       }, 180)
     },
 
@@ -3588,46 +4033,36 @@ Component({
       if (this.data.modalClosing) return
       const mi = Math.min(Math.max(parseInt(this.data.countdownMin, 10) || 0, 0), 59)
       const si = Math.min(Math.max(parseInt(this.data.countdownSec, 10) || 0, 0), 59)
-      this._cdWheelMi = mi
-      this._cdWheelSi = si
+      const itemPx = this._wheelItemPx()
+      this._wheels = {}
+      this._wheelEpsToggle = false
+      const mst = this._wheelState('cdMin')
+      const sst = this._wheelState('cdSec')
+      mst.idx = mi; mst.top = -1; mst.snapping = true
+      sst.idx = si; sst.top = -1; sst.snapping = true
+      // 同「指定时间」：弹窗期间停掉 100ms 一次的呼吸光晕 setData
+      this._stopBreathingGlow()
       this.setData({
         showScheduleCountdownPicker: true,
         countdownMinWheelIndex: mi,
         countdownSecWheelIndex: si,
-        countdownWheelValue: [mi, si],
+        cdMinWheelTop: mi * itemPx,
+        cdMinWheelAnim: false,
+        cdSecWheelTop: si * itemPx,
+        cdSecWheelAnim: false,
       })
-    },
-
-    // 同「指定时间」滚轮：拖动中只更派生索引、**不写回 countdownWheelValue**
-    // （写回 = 让原生列滚到该索引 ⇒ 慢滑每跨一格被拽一次，缓慢滑动无效）
-    onCountdownWheelChange(e) {
-      const v = (e.detail && e.detail.value) || []
-      if (v.length < 2) return
-      this._cdWheelMi = v[0]
-      this._cdWheelSi = v[1]
-      if (v[0] !== this.data.countdownMinWheelIndex || v[1] !== this.data.countdownSecWheelIndex) {
-        this.setData({
-          countdownMinWheelIndex: v[0],
-          countdownSecWheelIndex: v[1],
-        })
-      }
-    },
-
-    // 松手（已贴合最近项）才同步 value：此时写回不产生位移，下次再拖从贴合项起步
-    onCountdownWheelPickEnd() {
-      const mi = this._cdWheelMi
-      const si = this._cdWheelSi
-      if (typeof mi !== 'number' || typeof si !== 'number') return
-      this.setData({
-        countdownMinWheelIndex: mi,
-        countdownSecWheelIndex: si,
-        countdownWheelValue: [mi, si],
-      })
+      setTimeout(() => {
+        this._wheelSettle('cdMin', mi)
+        this._wheelSettle('cdSec', si)
+      }, WHEEL_SETTLE_MS)
     },
 
     onConfirmScheduleCountdown() {
-      const mi = this.data.countdownMinWheelIndex
-      const si = this.data.countdownSecWheelIndex
+      // 索引以滚轮态为准（手势中只写实例字段，data 里的索引要等吸附后才更新）
+      const ms = this._wheelState('cdMin')
+      const ss = this._wheelState('cdSec')
+      const mi = typeof ms.idx === 'number' ? ms.idx : this.data.countdownMinWheelIndex
+      const si = typeof ss.idx === 'number' ? ss.idx : this.data.countdownSecWheelIndex
       if (mi == null || si == null) {
         wx.showToast({ title: '请选择有效倒计时', icon: 'none', duration: 2000 })
         return
@@ -3641,6 +4076,8 @@ Component({
       this.setData({ modalClosing: true })
       setTimeout(() => {
         this.setData({ showScheduleCountdownPicker: false, modalClosing: false })
+        this._wheelReleaseAll()
+        if (this.data.autoPrintEnabled) this._startBreathingGlow()
       }, 180)
     },
 
