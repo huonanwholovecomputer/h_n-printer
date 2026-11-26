@@ -1296,6 +1296,91 @@ def _read_docx_last_editor(file_path: str) -> str | None:
         return None
 
 
+# ── .doc（OLE 复合文档）作者程序识别 ──────────────────────────────────
+# 2026-11-25 现场：`计科2504朱佳琳.doc` 由 WPS 12.1 生成，页码用的是页脚里的**文本框**；
+# 用 Word 打开渲染时文本框内的「12」「13」只输出第一位「1」（实测同一份文件：WPS 转出来
+# 第 14/15 页页脚 12/13，Word 转出来 1/1）⇒ `.doc` 也必须按「谁生成的」选引擎，
+# 不能像原来那样一律 Word 优先、WPS 只在失败后兜底。
+# `.doc` 里没有 XML：直接扫字节找程序痕迹。两种编码都要扫（2026-11-25 微信 301 份 .doc 实测）：
+#   · CFB 目录里的流名、以及 WPS 写的属性串是 UTF-16LE；
+#   · 老 Word / 部分工具把 SummaryInformation 按 ANSI（GBK/codepage 936）存，那里是**裸 ASCII**
+#     （71 份 Word 文件只扫 UTF-16LE 会一个标记都找不到 → 只能靠「看不出来 ⇒ Word 兜底」蒙对）。
+# 标记名本身全是 ASCII，所以 ASCII 扫不会误命中 UTF-16LE（那边有交错 NUL）。
+_DOC_WPS_STREAM_MARKER = "WpsCustomData"   # WPS 私有存储流：Word 不会写，比程序名硬
+_DOC_WPS_MARKERS = (_DOC_WPS_STREAM_MARKER, "WPS Office", "Kingsoft")
+_DOC_WORD_MARKERS = ("Microsoft Office Word", "Microsoft Word", "MSWordDoc")
+
+
+def _read_doc_last_editor(file_path: str) -> str | None:
+    """读取 .doc（OLE 复合文档）的作者程序。返回 "wps" / "word" / None。
+
+    按 1 MiB 分块扫**两种编码**（标记名全 ASCII，见上）：UTF-16LE 与裸 ASCII（ANSI 属性串）。
+    判定优先级（2026-11-25 用微信 301 份 .doc 逐份与 olefile 的 Application 对账校准）：
+      1. 命中 Word 程序名 ⇒ word —— Application 记录的是**最后一次保存**的程序，最准；
+      2. 否则命中 WPS 痕迹（`WpsCustomData` 流名 / `WPS Office` / `Kingsoft`）⇒ wps；
+      3. 都没有（或读失败）⇒ None，调用方按原来的「Word 优先、WPS 兜底」链走，行为不退化。
+    ⚠ 不要把 `WpsCustomData` 放回第一优先：实测 39 份 WPS 模板被 Word 另存过的文件里，
+    该私有流的目录项/字节都还在，但最后保存者是 Word —— 按「流名优先」会把这些 Word 文档
+    错误地路由到 WPS。反过来 Word 程序名在这 290 份可读 Application 的文件里零误判。
+    实测该 301 份：wps 226 / word 74 / 非 OLE 1（与 Application 完全一致）。
+    """
+    if ext_of(file_path) != ".doc":
+        return None
+    try:
+        if not os.path.isfile(file_path) or os.path.getsize(file_path) <= 0:
+            return None
+    except OSError:
+        return None
+
+    def _variants(marker: str) -> list[bytes]:
+        out: list[bytes] = []
+        for form in (marker, marker.lower(), marker.upper()):
+            for enc in ("ascii", "utf-16-le"):
+                b = form.encode(enc)
+                if b not in out:
+                    out.append(b)
+        return out
+
+    wps_pats = [b for m in _DOC_WPS_MARKERS for b in _variants(m)]
+    word_pats = [b for m in _DOC_WORD_MARKERS for b in _variants(m)]
+    overlap = max(len(b) for b in wps_pats + word_pats) + 2
+    found_wps = False
+    found_word = False
+    try:
+        with open(file_path, "rb") as f:
+            tail = b""
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    break
+                buf = tail + chunk
+                if not found_word and any(p in buf for p in word_pats):
+                    found_word = True
+                if not found_wps and any(p in buf for p in wps_pats):
+                    found_wps = True
+                # 分块边界上的标记要跨块检查（UTF-16 串最长 20 字符左右）
+                tail = buf[-overlap:] if len(buf) > overlap else buf
+    except OSError:
+        return None
+    if found_word:
+        return "word"
+    return "wps" if found_wps else None
+
+
+def _read_office_last_editor(file_path: str) -> str | None:
+    """.doc / .docx 统一入口：按作者程序判首选引擎（"wps" / "word" / None）。
+
+    .docx 仍走 `_read_docx_last_editor`（多处验收脚本 stub 的就是它，名字与语义不能动）；
+    .doc 走新加的 `_read_doc_last_editor`（字节扫描，见上）。
+    """
+    ext = ext_of(file_path)
+    if ext == ".docx":
+        return _read_docx_last_editor(file_path)
+    if ext == ".doc":
+        return _read_doc_last_editor(file_path)
+    return None
+
+
 # ============================================================
 # COM 快速页数获取 (Word / WPS ComputeStatistics + 批量)
 # ============================================================
@@ -2370,27 +2455,135 @@ def _strip_docx_external_refs(src: str) -> tuple[str, int]:
     return out_path, stripped
 
 
+_RFONTS_ELEM_RE = re.compile(rb"<w:rFonts\b[^>]*/?>", re.I)
+_RFONTS_NAME_ATTR_RE = re.compile(
+    rb'\b(w:ascii|w:hAnsi|w:eastAsia|w:cs)\s*=\s*"([^"]*)"', re.I)
+
+
+def _repair_docx_font_names(src: str) -> tuple[str, int]:
+    """把 .docx 副本里「字体名被写成列表」的引用修成单个族名，返回 `(新路径, 修了几处)`。
+
+    为什么必须做（2026-11-25 现场 eaf27bdc….docx）：那份 docx 的 `word/document.xml` 里
+    115 处 `w:eastAsia="黑体;黑体"`。Word 把整串当成**一个**字体名去匹配，永远匹配不上，
+    于是静默回落默认字体 —— 本机实测转出来的 PDF 里只剩 `SimSun`（整篇宋体）。装「黑体」
+    也救不了，因为文件里写的不是「黑体」。讽刺的是 `word/fontTable.xml` 里登记的是正常单名。
+
+    做法：只改**临时副本**，源文件一个字节都不动。逐个 `<w:rFonts>` 元素，把它四个
+    字体名属性（ascii/hAnsi/eastAsia/cs）里含 `;` / `；` 的值拆开取**第一个**族名
+    （`黑体;黑体` → `黑体`，`宋体；黑体` → `宋体`，与原书写意图一致）。
+    没有可修的就原样返回 `src`、计数 0（不产生临时文件）。
+    只认 .docx（OOXML = zip）；.doc 是复合二进制，改不动，调用方记日志说明限制。
+    """
+    import zipfile  # noqa: PLC0415
+
+    try:
+        from font_check import is_broken_family_name, primary_family_name  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 —— 修不了就按原文件转，绝不能拦住打印
+        return src, 0
+
+    fixed = 0
+    changed: dict[str, bytes] = {}
+
+    def _fix_attr(m: re.Match) -> bytes:
+        nonlocal fixed
+        attr, raw_val = m.group(1), m.group(2)
+        val = raw_val.decode("utf-8", "replace")
+        if not is_broken_family_name(val):
+            return m.group(0)
+        first = primary_family_name(val)
+        if not first:
+            return m.group(0)
+        fixed += 1
+        return attr + b'="' + first.encode("utf-8") + b'"'
+
+    def _fix_elem(m: re.Match) -> bytes:
+        elem = m.group(0)
+        out = _RFONTS_NAME_ATTR_RE.sub(_fix_attr, elem)
+        return out
+
+    try:
+        with zipfile.ZipFile(src) as zin:
+            for name in zin.namelist():
+                if not (name.startswith("word/") and name.endswith(".xml")):
+                    continue
+                raw = zin.read(name)
+                # 快筛：正文/样式里没有分隔符就不用动这个部件
+                if b";" not in raw and "\uff1b".encode("utf-8") not in raw:
+                    continue
+                out = _RFONTS_ELEM_RE.sub(_fix_elem, raw)
+                if out != raw:
+                    changed[name] = out
+    except (zipfile.BadZipFile, OSError) as e:
+        logger.warning(f"修字体名失败，按原文件转换: {e} ({os.path.basename(src)})")
+        return src, 0
+
+    if not changed:
+        return src, 0
+
+    fd, out_path = tempfile.mkstemp(suffix=".docx", prefix="_hn_fontfix_")
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(src) as zin, zipfile.ZipFile(out_path, "w") as zout:
+            for item in zin.infolist():
+                data = changed.get(item.filename)
+                if data is None:
+                    data = zin.read(item.filename)
+                zi = zipfile.ZipInfo(item.filename, date_time=item.date_time)
+                zi.compress_type = item.compress_type
+                zi.external_attr = item.external_attr
+                zout.writestr(zi, data)
+    except Exception:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+        raise
+    return out_path, fixed
+
+
 def _prepare_office_src(file_path: str) -> tuple[str, str]:
     """转换前把「要交给引擎的路径」和「需要事后清理的临时副本」算出来。
 
-    返回 `(src, temp_to_clean)`；没有净化动作时 `temp_to_clean == ""`（原样用原文件）。
+    返回 `(src, temp_to_clean)`；没有净化/修复动作时 `temp_to_clean == ""`（原样用原文件）。
+    两步都只在临时副本上做（源文件永不被改）：
+      ① 剥掉指向外部的图片/域引用（S2-03 加固，防打印时外联）；
+      ② 把写成列表的字体名修成单名（2026-11-25，否则 Word 静默回落默认字体）。
     """
     ext = ext_of(file_path)
-    if ext == ".docx":
-        try:
-            src, n = _strip_docx_external_refs(file_path)
-        except Exception as e:  # noqa: BLE001 —— 净化是加固，失败不该拦住打印
-            logger.warning(f"剥离 docx 外部引用失败，按原文件转换（风险已记录）: {e}")
-            return file_path, ""
-        if src != file_path:
-            logger.info(f"已剥离 {n} 处 Office 外部引用（转换过程不访问外网）"
-                        f" ({os.path.basename(file_path)})")
-            return src, src
+    if ext != ".docx":
+        if ext == ".doc":
+            logger.warning("老格式 .doc 是复合二进制，无法剥离文档内的外部引用或修正字体名；"
+                           "如需彻底隔离/正确字体，请把文档另存为 .docx 再打印")
         return file_path, ""
-    if ext == ".doc":
-        logger.warning("老格式 .doc 是复合二进制，无法剥离文档内的外部引用；"
-                       "如需彻底隔离，请把文档另存为 .docx 再打印")
-    return file_path, ""
+
+    src, temp = file_path, ""
+    # ① 外部引用
+    try:
+        _stripped, n = _strip_docx_external_refs(src)
+    except Exception as e:  # noqa: BLE001 —— 净化是加固，失败不该拦住打印
+        logger.warning(f"剥离 docx 外部引用失败，按原文件转换（风险已记录）: {e}")
+        _stripped, n = src, 0
+    if _stripped != src:
+        logger.info(f"已剥离 {n} 处 Office 外部引用（转换过程不访问外网）"
+                    f" ({os.path.basename(file_path)})")
+        src, temp = _stripped, _stripped
+
+    # ② 写坏的字体名（`黑体;黑体`）—— 在①的副本上继续修，中间副本用完就删
+    try:
+        _fixed_path, nfix = _repair_docx_font_names(src)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"修正 docx 里的字体名失败，按当前文件转换: {e}")
+        return src, temp
+    if _fixed_path != src:
+        logger.info(f"已修正 {nfix} 处写成列表的字体名（如 黑体;黑体 → 黑体），"
+                    f"转换按正常字体渲染 ({os.path.basename(file_path)})")
+        if temp:
+            try:
+                os.remove(temp)
+            except OSError:
+                pass
+        src, temp = _fixed_path, _fixed_path
+    return src, temp
 
 
 def _sanitize_office_refs(func):
@@ -2431,7 +2624,10 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str,
       1. 首选引擎（Word 或 WPS COM）
       2. 另一 COM 引擎
       3. LibreOffice 无头模式 → 兜底
-    .doc（老格式，无 last-editor 元数据）: Word → WPS → LibreOffice
+    .doc（老格式，无 XML 元数据）: 也按作者程序决定首选引擎 —— 扫 UTF-16LE 字节找
+      `WpsCustomData` / `WPS Office`（WPS 私有痕迹）vs `Microsoft Office Word` / `MSWordDoc`
+      （见 `_read_doc_last_editor`）；看不出来才回落到 Word → WPS → LibreOffice。
+      2026-11-25 现场：WPS 生成的 `.doc` 页码是页脚里的文本框，Word 渲染会把「12」输出成「1」。
 
     表格 (.xls/.xlsx)（2026-11-02；2026-11-03 起支持显式 print_options）:
       → 默认交给 Excel/WPS **自己排版**（`xlsx_printer.export_to_pdf`：Excel → WPS 表格 →
@@ -2508,12 +2704,14 @@ def _convert_office_to_pdf(file_path: str, output_pdf: str,
 
     # Word 文档：多引擎降级
     if ext in COM_OFFICE_EXTS:
-        # docx 优先用最后编辑它的引擎渲染（WPS 特殊布局须用 WPS，Word 渲染会错位）
+        # 优先用「生成/最后编辑它」的引擎渲染：docx 的 WPS 特殊布局、.doc 的页脚文本框页码
+        # 都会被 Word 渲染错（2026-11-25 现场：WPS 生成的 .doc 页码 12/13 → Word 只出 1）。
         preferred = "word"
-        if ext == ".docx":
-            last_editor = _read_docx_last_editor(file_path)
-            if last_editor == "wps":
+        try:
+            if _read_office_last_editor(file_path) == "wps":
                 preferred = "wps"
+        except Exception:
+            preferred = "word"
 
         engines_order = [preferred] + [e for e in ("word", "wps") if e != preferred]
         for eng in engines_order:

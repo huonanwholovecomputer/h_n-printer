@@ -281,9 +281,13 @@ class PrintJob:
     #   · missing_fonts      = 本机没装 ⇒ 装上就能救（docx 转换时 Word 会静默替换）；
     #   · nonembedded_fonts  = 这份 PDF 生成时没把字形写进文件 ⇒ 装字体**也没用**，
     #                          要完全一致只能让生成方重新导出。只对 .pdf 有意义。
-    # 两者都不影响页数/计费，只影响字形；打印前用它们决定要不要弹确认。
+    #   · bad_font_names     = 文件里的字体名被写成了列表（`黑体;黑体`）⇒ Word 认不出来、
+    #                          转换时静默回落默认字体，装字体**也救不了**（装的是「黑体」，
+    #                          文件里写的不是）。只提示，不拦打印。2026-11-25 现场。
+    # 三者都不影响页数/计费，只影响字形；打印前用它们决定要不要弹确认。
     missing_fonts: list[str] = field(default_factory=list)
     nonembedded_fonts: list[str] = field(default_factory=list)
+    bad_font_names: list[str] = field(default_factory=list)
     font_checked: bool = False   # 查过就不再重复查（含"这种格式查不出"也算查过）
     font_fp: str = ""            # 查的时候的系统字体指纹，变了要重查
 
@@ -321,6 +325,7 @@ class PrintJob:
             "xlsx_options": dict(self.xlsx_options or {}),
             "missing_fonts": list(self.missing_fonts),
             "nonembedded_fonts": list(self.nonembedded_fonts),
+            "bad_font_names": list(self.bad_font_names),
             "font_checked": self.font_checked,
             "font_fp": self.font_fp,
             # cached_pdf 不持久化，每次启动重新生成
@@ -365,6 +370,8 @@ class PrintJob:
                            if isinstance(x, str) and x.strip()][:20],
             nonembedded_fonts=[str(x) for x in (data.get("nonembedded_fonts") or [])
                                if isinstance(x, str) and x.strip()][:20],
+            bad_font_names=[str(x) for x in (data.get("bad_font_names") or [])
+                            if isinstance(x, str) and x.strip()][:20],
             font_checked=bool(data.get("font_checked", False)),
             font_fp=str(data.get("font_fp", "") or ""),
         )

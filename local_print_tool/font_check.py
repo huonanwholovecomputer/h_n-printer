@@ -39,6 +39,15 @@ _THEME_REF = re.compile(r"^(\+|mj-|mn-)", re.I)
 # Type3 / 匿名资源名：F1 / C2_0 / TT0 …（没有任何字体身份，不能拿去和系统比）
 _ANON = re.compile(r"^[A-Za-z]{1,3}\d{0,3}(_[0-9]+)?$")
 
+# 字体名里的「列表分隔符」＝ 生成器把字体名写坏了。
+# 正常 OOXML 的 `w:rFonts` 只写**一个**族名；但有些转 docx 的软件会把 CSS 的
+# `font-family: 黑体, 黑体` 整串塞进单个属性，写出 `黑体;黑体` 这种名字
+# （2026-11-25 现场 eaf27bdc….docx：115 处 `黑体;黑体`、41 处 `Times New Roman;Times New Roman`）。
+# Word 把它当**一个**字体名去匹配 ⇒ 永远匹配不上 ⇒ 转换时静默回落默认字体
+# （本机实测整页变成宋体）；装「黑体」也救不了，因为文件里写的不是「黑体」。
+# 所以这类名字要拆开看、单独说，绝不能混进「本机没装（装上就能救）」。
+_FAMILY_SEP = re.compile(r"[;；]")
+
 # 中英文名互认（字号/样式后缀刻意**不**剥：等线 Light 与 等线 是两个不同字族）
 _ALIAS = {
     "simsun": "宋体", "宋体": "宋体",
@@ -104,6 +113,56 @@ def _norm(name: str) -> str:
     for ch in (" ", "\u3000", "@", "\t"):
         s = s.replace(ch, "")
     return _ALIAS.get(s, s)
+
+
+def split_family_list(name: str) -> list[str]:
+    """把写坏的复合字体名拆成单个族名：`黑体;黑体` → ['黑体']。
+
+    去空、按 `_norm` 去重、保留原顺序与原大小写。正常字体名（不含分隔符）原样返回
+    一个元素 —— 调用方不必先判断有没有分隔符。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in _FAMILY_SEP.split(_clean(name)):
+        part = part.strip()
+        key = _norm(part)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(part)
+    return out
+
+
+def is_broken_family_name(name: str) -> bool:
+    """这个字体名是不是被生成器写成了列表（`黑体;黑体` 这种 Word 不认的名字）。"""
+    return bool(_FAMILY_SEP.search(_clean(name)))
+
+
+def primary_family_name(name: str) -> str:
+    """写坏的复合名归一成第一个族名：`黑体;黑体` → `黑体`，`宋体；黑体` → `宋体`。
+
+    与 `split_family_list` 的差别是**不按 `_norm` 去重**：`宋体;宋体` 拆出来只剩一个
+    `宋体`，但它在原文里确实是"写坏了"，转换前修副本时必须能看出这一点。
+    没有分隔符的名字原样返回。
+    """
+    for part in _FAMILY_SEP.split(_clean(name)):
+        part = part.strip()
+        if part:
+            return part
+    return _clean(name)
+
+
+def _dedupe_by_norm(names: list[str]) -> list[str]:
+    """按 `_norm` 去重、保留原顺序与原大小写（`宋体` / `@宋体` / `宋体 ` 算同一个）。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for n in names:
+        key = _norm(n)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(n)
+    return out
 
 
 def _is_real_font(name: str) -> bool:
@@ -589,8 +648,8 @@ def _theme_font_map(theme_xml: str) -> dict[str, str]:
     return out
 
 
-def fonts_in_docx(path: str) -> tuple[list[str], bool]:
-    """返回 (用到的字体名列表, 是否解析成功)。
+def _fonts_in_docx_detail(path: str) -> tuple[list[str], list[str], bool]:
+    """返回 (用到的字体名列表, 名字被写坏的原始值列表, 是否解析成功)。
 
     口径（2026-11-01 修正，2026-11-04 补主题字体）：**只认正文里真正落字的字体引用** ——
       · 正文/页眉页脚/脚注/尾注的 `w:rFonts`；
@@ -605,6 +664,11 @@ def fonts_in_docx(path: str) -> tuple[list[str], bool]:
     全靠 `w:asciiTheme="minorHAnsi"` ⇒ 老逻辑「读不出名字」直接退回整张 fontTable，
     把从没用过的 Aptos Display / Arial / Times New Roman 一起报成缺。现在先解析主题，
     查不到真名才退回 fontTable，免得把模板登记的无关字体当成正文用法。
+
+    名字被写坏（`黑体;黑体`，见 `_FAMILY_SEP`）的引用：原始值单独进第二个返回值，由
+    `check_file()` 以 `bad_font_names` 带出去给界面单列一段说明；同时把它的第一个族名
+    （`黑体`）并进 `used` —— 转换前会把副本里的名字修成这个族名再交给 Word/LO，
+    所以「这个族本机没装」才是真缺（2026-11-25 起，见 `converter._repair_docx_font_names`）。
     """
     explicit: list[str] = []
     style_fonts: list[str] = []
@@ -667,13 +731,41 @@ def fonts_in_docx(path: str) -> tuple[list[str], bool]:
     # 在这里就把非字体名滤掉，别留到 missing_fonts 再滤：
     # `<w:lang w:eastAsia="zh-CN"/>` 和 `<w:rFonts .../>` 是同族属性，正则会把语言标签一起抓出来；
     # 让它漏进返回值，界面/日志上就会显示「用到的字体：zh-CN」这种鬼东西。
-    used = [n for n in explicit + style_fonts if _is_real_font(n)]
-    if not used:
+    def _partition(raw: list[str]) -> tuple[list[str], list[str]]:
+        """滤掉非字体名，再把「写坏的名字」单独摘出来。
+
+        写坏的原值进 `broken`（只作提示）；同时把它的**第一个族名**补进 `good`：
+        转换前工具会拿修好的副本交给引擎（`converter._repair_docx_font_names`），
+        那时真正用到的就是这个族名 —— 它本机没装，才是真的缺（装上就真能救）。
+        """
+        good: list[str] = []
+        broken: list[str] = []
+        for n in raw:
+            if not _is_real_font(n):
+                continue
+            name = _clean(n)
+            if is_broken_family_name(name):
+                broken.append(name)
+                first = primary_family_name(name)
+                if first and _is_real_font(first):
+                    good.append(first)
+            else:
+                good.append(name)
+        return good, broken
+
+    used, bad = _partition(explicit + style_fonts)
+    if not used and not bad:
         # 整篇靠主题字体排（Office 365 新模板默认就是这种）：只有这时候才轮到主题真名
-        used = [n for n in theme_fonts if _is_real_font(n)]
-    if not used:
-        used = [n for n in ft_fonts if _is_real_font(n)]
-    return list(dict.fromkeys(used)), True
+        used, bad = _partition(theme_fonts)
+    if not used and not bad:
+        used, bad = _partition(ft_fonts)
+    return _dedupe_by_norm(used), _dedupe_by_norm(bad), True
+
+
+def fonts_in_docx(path: str) -> tuple[list[str], bool]:
+    """返回 (用到的字体名列表, 是否解析成功) —— 薄包装，写坏的名字在这里被丢掉。"""
+    used, _bad, ok = _fonts_in_docx_detail(path)
+    return used, ok
 
 
 # ── .pdf：查 basefont，内嵌的不算缺 ─────────────────────────────────────────
@@ -783,22 +875,27 @@ def checkable(path: str) -> bool:
 
 
 def check_file(path: str) -> dict:
-    """检查一个文件。返回 {ok, fonts, missing, nonembedded, reason, fingerprint}。
+    """检查一个文件。返回 {ok, fonts, missing, nonembedded, bad_font_names, reason, fingerprint}。
 
     ok=False 只表示"这个文件没法静态检查"（.doc/.txt/图片/损坏），**不代表有缺字体**。
     `nonembedded` 只对 PDF 有意义：这些字体在文件里没有字形数据（打印时必然被替换）。
+    `bad_font_names` 是文件里被写成列表的字体名（`黑体;黑体`）：Word 认不出、会回落默认
+    字体；装「黑体;黑体」这个名字的字体救不了（不存在这个名字），但转换前 converter 会在
+    副本上把它修成 `黑体`，所以修好后的族名会照常出现在 fonts/missing 里 —— 那个缺了才该装。
+    写坏的原值只用于提示，既不算"缺"、也不该拦打印。
     """
     ext = os.path.splitext(str(path or ""))[1].lower()
-    out = {"ok": False, "fonts": [], "missing": [], "nonembedded": [], "reason": "",
-           "fingerprint": fonts_fingerprint()}
+    out = {"ok": False, "fonts": [], "missing": [], "nonembedded": [], "bad_font_names": [],
+           "reason": "", "fingerprint": fonts_fingerprint()}
     if not path or not os.path.isfile(path):
         out["reason"] = "文件不存在"
         return out
     if ext == ".docx":
-        used, ok = fonts_in_docx(path)
+        used, bad, ok = _fonts_in_docx_detail(path)
         out["ok"] = ok
-        out["fonts"] = list(dict.fromkeys(_clean(n) for n in used if _is_real_font(n)))
+        out["fonts"] = _dedupe_by_norm([_clean(n) for n in used if _is_real_font(n)])
         out["missing"] = missing_fonts(out["fonts"])
+        out["bad_font_names"] = list(bad)
         out["reason"] = "" if ok else "docx 解析失败（可能是 .doc 改了扩展名）"
         return out
     if ext == ".pdf":

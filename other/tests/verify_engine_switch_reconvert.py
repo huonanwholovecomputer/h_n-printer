@@ -278,18 +278,20 @@ check("★ ③ 没有新起转换线程（不拉 Word/WPS COM）",
 check("③ cached_pdf 回到 WPS 的那份", os.path.normcase(job.cached_pdf or "")
       == os.path.normcase(WPS_PDF), f"{os.path.basename(job.cached_pdf or '(空)')}")
 
-# ── ④ .doc：单 key 缓存（切引擎必须删文件） ──────────────────────────
-section("④ 真 MainWindow（.doc）：缓存 key 不带引擎 → 必须删旧 PDF")
+# ── ④ .doc：分引擎缓存（2026-11-25 起与 .docx 同构） ─────────────────
+section("④ 真 MainWindow（.doc）：缓存 key 也按引擎隔离 → 只丢引用、留旧文件")
 
 DOC, MD5D = make_source("旧格式.doc", b"fake doc payload for engine switch\n")
-DOC_PDF = os.path.join(_CACHE, pdf_cache_key(MD5D, "auto", cache_engine_for(DOC, "word")) + ".pdf")
-make_pdf(DOC_PDF, 2)
-check("④ 素材：.doc 的缓存名不带引擎后缀（word/wps 都会落到同一份）",
-      cache_engine_for(DOC, "word") == "" and cache_engine_for(DOC, "wps") == "",
-      f"{os.path.basename(DOC_PDF)}")
+DOC_WPS_PDF = os.path.join(_CACHE, pdf_cache_key(MD5D, "auto", cache_engine_for(DOC, "wps")) + ".pdf")
+make_pdf(DOC_WPS_PDF, 2)
+check("④ 素材：.doc 的 wps/word 缓存名不同（WPS 生成的 .doc 页码是页脚文本框）",
+      cache_engine_for(DOC, "wps") == "wps"
+      and cache_engine_for(DOC, "word") == "word"
+      and os.path.basename(DOC_WPS_PDF).endswith("_ewps.pdf"),
+      f"{os.path.basename(DOC_WPS_PDF)}")
 
 doc_job = PrintJob(file_path=DOC, copies=1, duplex="off", page_count=2, orientation="portrait",
-                   engine="wps", source_md5=MD5D, cached_pdf=DOC_PDF,
+                   engine="wps", source_md5=MD5D, cached_pdf=DOC_WPS_PDF,
                    display_name="旧格式.doc")
 seed([doc_job])
 select_row(0)
@@ -298,12 +300,23 @@ win._edit_engine.setCurrentIndex(engine_index("word"))
 _app.processEvents()
 unstub_start()
 
-check("★ ④ 旧 PDF 文件被删掉（否则重转又会命中同一份 WPS 产物）",
-      not os.path.isfile(DOC_PDF), f"{os.path.basename(DOC_PDF)}")
 check("★ ④ 依然发起了重转，引擎=word",
       len(_calls) == 1 and _calls[0]["engine"] == "word", f"{_calls}")
-check("④ 页数归零、引用清空", doc_job.page_count == 0 and doc_job.cached_pdf == "",
-      f"{doc_job.page_count}/{doc_job.cached_pdf!r}")
+check("★ ④ 旧 PDF 的引用已清掉（不会拿 WPS 的产物去打）", doc_job.cached_pdf == "",
+      f"{doc_job.cached_pdf!r}")
+check("④ .doc 的分引擎缓存**保留**（切回 WPS 可以免重转）", os.path.isfile(DOC_WPS_PDF))
+check("④ .doc 页数归零（旧页数是 WPS 排版出来的）", doc_job.page_count == 0,
+      f"page_count={doc_job.page_count}")
+
+# 切回 WPS：命中保留的 _ewps.pdf，不再起转换线程
+_workers_before_doc = len(getattr(win, "_convert_workers", []) or [])
+win._edit_engine.setCurrentIndex(engine_index("wps"))
+_app.processEvents()
+check("★ ④ 切回 WPS 直接命中 _ewps（页数回到 2，不重转）", doc_job.page_count == 2,
+      f"page_count={doc_job.page_count}")
+check("④ 切回 WPS 没有新起转换线程",
+      len(getattr(win, "_convert_workers", []) or []) == _workers_before_doc,
+      f"{_workers_before_doc} → {len(getattr(win, '_convert_workers', []) or [])}")
 
 # ── ⑤ 负例：只改份数 → 不重转 ───────────────────────────────────────
 section("⑤ 负例：只改份数（引擎没变）→ 一个都不重转")

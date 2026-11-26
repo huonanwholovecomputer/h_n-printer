@@ -174,6 +174,33 @@ def main() -> int:
     check("空列表也能出正文（不崩）",
           "没有字体提示" in gui.font_help_text([]), gui.font_help_text([])[:120])
 
+    # 2026-11-25 现场（eaf27bdc….docx）：文件把字体名写成「黑体;黑体」。旧口径把它当「本机没装」，
+    # 让人去搜「黑体;黑体」这个不存在的字体 —— 装多少遍告警都不会消失。第三类必须单独说。
+    print("④b 第三类：文件里字体名写成了列表（黑体;黑体）")
+    _jbad = printer_config.PrintJob(file_path=r"C:\tmp\写坏.docx", copies=1,
+                                    bad_font_names=["黑体;黑体", "宋体;宋体"])
+    _txt_bad = gui.font_help_text([_jbad])
+    check("只有名字写坏时也算「有提示」（否则窗口看起来像没事）",
+          "共 1 个文件有字体提示" in _txt_bad, _txt_bad[:60])
+    check("写坏的名字照原样列出来（不拆成两个字体名让人去装）",
+          "· 黑体;黑体" in _txt_bad and "· 宋体;宋体" in _txt_bad, _txt_bad[:600])
+    check("说清这一类不是「本机没装」",
+          "不是「本机没装」" in _txt_bad, _txt_bad[:500])
+    check("给出去路：Word 里全选（Ctrl+A）重设字体后另存 / 让对方重导",
+          "全选" in _txt_bad and "另存" in _txt_bad, _txt_bad[-700:])
+    check("说清打印时自动修正副本、源文件仍是坏的（2026-11-25 落地）",
+          "自动修正副本" in _txt_bad and "源文件仍是坏的" in _txt_bad, _txt_bad[:700])
+    check("不再让人去装「黑体;黑体」这个名字的字体",
+          "装「黑体;黑体」这个字体救不了" in _txt_bad, _txt_bad[:700])
+    check("只有写坏的名字时不给「怎么补字体」（job 里没有真正缺的字体可补）",
+          "怎么补字体" not in _txt_bad, _txt_bad[-400:])
+    _txt_mix = gui.font_help_text([_jbad, j1])
+    check("同时有「本机没装」与「名字写坏」⇒ 抬头改说三类不要混",
+          "这三类不要混" in _txt_mix and "③ 文件里的字体名写坏了" in _txt_mix,
+          _txt_mix[:600])
+    check("混合时「怎么补字体」仍在（本机没装那类还要补）",
+          "怎么补字体" in _txt_mix, _txt_mix[-400:])
+
     print("⑤ 详情窗（offscreen 真建控件）")
     from PySide6.QtWidgets import QApplication  # noqa: E402
     _app = QApplication.instance() or QApplication([])
@@ -191,6 +218,11 @@ def main() -> int:
                                       "TimesNewRomanPSMT", "TimesNewRomanPS-ItalicMT"},
           _clip)
     check("复制后状态行报数量", "已复制" in dlg.status.text(), dlg.status.text())
+    # 写坏的名字不能进复制清单：搜「黑体;黑体」永远搜不到对得上的字体文件。
+    dlg_bad = gui.FontHelpDialog(None, [_jbad])
+    _names_bad = dlg_bad._all_names()
+    check("「复制字体名」不列写坏的名字",
+          all(";" not in n and "；" not in n for n in _names_bad), str(_names_bad))
     # 没选文件时点安装：必须原地返回，不能炸、不能改状态
     _orig = gui.QFileDialog.getOpenFileNames
     gui.QFileDialog.getOpenFileNames = staticmethod(lambda *a, **k: ([], ""))

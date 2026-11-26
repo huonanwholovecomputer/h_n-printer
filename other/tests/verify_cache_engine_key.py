@@ -10,7 +10,9 @@
 路径（无后缀），反而能命中 —— 这就是"云端不反复转换、本地拖入才反复转换"的分裂来源。
 
 修法：判定收敛为**唯一函数** `cloud_client.cache_engine_for(path_or_ext, engine)`
-（仅 `.docx` 且引擎 ∈ {word, wps} 才返回引擎名），写/读/打印三侧共用。
+（`.doc` / `.docx` 且引擎 ∈ {word, wps} 才返回引擎名），写/读/打印三侧共用。
+（2026-11-25 把 `.doc` 也纳入：WPS 生成的 .doc 页码是页脚文本框，Word 渲染会丢数字，
+所以 `.doc` 的渲染同样随引擎变化，缓存必须按引擎隔离 —— 现场 `计科2504朱佳琳.doc`。）
 
 本脚本覆盖：
  1. cache_engine_for 的判定表（含大小写、路径形式、边界）；
@@ -18,7 +20,7 @@
  3. 静态守卫：gui.py 中所有缓存 API 调用的引擎参数都必须来自 cache_engine_for
     （防未来再次漂移回裸 engine）；
  4. 真实 CloudClient 的读写配对（图片/docx/doc 三组，写进去必须读得出来）；
- 5. 历史脏条目（非 docx 却带 _eword/_ewps）被一次性清理，有效条目保留。
+ 5. 历史脏条目（非 Word 格式却带 _eword/_ewps）被一次性清理，有效条目（含 `.doc`）保留。
 """
 import ast
 import io
@@ -62,7 +64,11 @@ CASES = [
     (".docx", "wps", "wps"),
     ("D:/x/y/报告.docx", "wps", "wps"),
     ("A.DOCX", "word", "word"),    # 大小写不敏感
-    (".doc", "word", ""),          # 老格式 .doc 与引擎无关（三侧一律无后缀）
+    (".doc", "word", "word"),      # 老格式 .doc 同样按引擎隔离（WPS 页脚文本框页码）
+    (".doc", "wps", "wps"),
+    ("D:/x/旧格式.doc", "wps", "wps"),
+    ("A.DOC", "word", "word"),
+    (".doc", "libreoffice", ""),   # 非 word/wps 引擎 → 无后缀
     (".docx", "libreoffice", ""),  # 非 word/wps 引擎 → 无后缀
     (".docx", "", ""),
     (".docx", "Word", ""),         # 引擎名大小写敏感（上游只产出小写）
@@ -126,6 +132,9 @@ key_photo = pdf_cache_key(MD5, "", cache_engine_for("photo.jpg", "word"))
 check("图片的键回到纯 MD5（与云端下载路径一致）", key_photo == MD5, key_photo)
 key_docx = pdf_cache_key(MD5, "", cache_engine_for("report.docx", "word"))
 check("docx 的键保留引擎后缀", key_docx == MD5 + "_eword", key_docx)
+key_doc = pdf_cache_key(MD5, "", cache_engine_for("legacy.doc", "wps"))
+check("doc 的键也按引擎隔离（2026-11-25：WPS 生成的 .doc 页码是页脚文本框）",
+      key_doc == MD5 + "_ewps", key_doc)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -242,6 +251,7 @@ entries = {
     "a" * 32 + "_eword": {"source_ext": ".docx", "created_at": _NOW},   # 有效
     "b" * 32: {"source_ext": ".jpg", "created_at": _NOW},           # 有效
     "c" * 32 + "_landscape": {"source_ext": ".jpg", "created_at": _NOW},  # 有效
+    "d" * 32 + "_ewps": {"source_ext": ".doc", "created_at": _NOW},  # 有效（2026-11-25 起 .doc 隔离）
 }
 for k in entries:
     _make_pdf(os.path.join(TMP, f"{k}.pdf"))
@@ -253,11 +263,14 @@ client._cleanup_pdf_cache()
 
 after = json.load(open(index_path, encoding="utf-8"))
 left = set(after)
-check("脏条目（非 docx + _eword/_ewps）已清除",
-      not any(k.endswith(("_eword", "_ewps")) and after.get(k, {}).get("source_ext") != ".docx"
+check("脏条目（非 Word 格式 + _eword/_ewps）已清除",
+      not any(k.endswith(("_eword", "_ewps"))
+              and after.get(k, {}).get("source_ext") not in (".doc", ".docx")
               for k in left),
       f"剩余={sorted(left)}")
 check("docx 的 _eword 有效条目被保留", "a" * 32 + "_eword" in left, f"剩余={sorted(left)}")
+check("doc 的 _ewps 有效条目被保留（2026-11-25 起 .doc 按引擎隔离）",
+      "d" * 32 + "_ewps" in left, f"剩余={sorted(left)}")
 check("无后缀图片条目与方向后缀条目被保留",
       "b" * 32 in left and "c" * 32 + "_landscape" in left, f"剩余={sorted(left)}")
 check("脏条目的 PDF 文件一并删除",

@@ -279,6 +279,53 @@ check("正文读不出字体名时退回 fontTable（免得不吭声）",
       "仅登记字体QQ" in font_check.fonts_in_docx(_ft_only)[0],
       str(font_check.fonts_in_docx(_ft_only)))
 
+print("④f 2026-11-25 现场：文件把字体名写成了列表（黑体;黑体）")
+# 真实文件（eaf27bdc….docx）：115 处 w:eastAsia="黑体;黑体"。Word 拿它当**一个**字体名去
+# 匹配，永远匹配不上 ⇒ 转换时静默回落宋体（本机实测转出来的 PDF 里只剩 SimSun）。
+# 现在转换前 converter._repair_docx_font_names 会把副本里的名字修成单名（黑体;黑体 → 黑体），
+# 所以「修好后的族名」才是文档实际要用的字体：它本机没装，才是真缺（装上确实能救）；
+# 写坏的原值只用于提示，不进 fonts、也不进 missing。
+_broken = os.path.join(tmp, "broken_names.docx")
+_make_docx(_broken, ["宋体"], ["黑体;黑体", "宋体;宋体", "宋体"])
+_u4, _ok4 = font_check.fonts_in_docx(_broken)
+check("写坏的原值不进「用到的字体」，但修好后的单名要进去",
+      _ok4 and "黑体;黑体" not in _u4 and "黑体" in _u4 and "宋体" in _u4, str(_u4))
+check("半角分号被拆成单个族名", font_check.split_family_list("黑体;黑体") == ["黑体"],
+      str(font_check.split_family_list("黑体;黑体")))
+check("全角分号同样拆", font_check.split_family_list("宋体；黑体") == ["宋体", "黑体"],
+      str(font_check.split_family_list("宋体；黑体")))
+check("没有分隔符的原样返回", font_check.split_family_list("宋体") == ["宋体"])
+check("正常名字不判成写坏", font_check.is_broken_family_name("宋体") is False)
+check("写坏的名字判得出来", font_check.is_broken_family_name("黑体;黑体") is True)
+check("primary_family_name 取第一个族名（不按 _norm 去重）",
+      font_check.primary_family_name("黑体;黑体") == "黑体"
+      and font_check.primary_family_name("宋体;宋体") == "宋体",
+      str(font_check.primary_family_name("宋体;宋体")))
+check("全角分隔时 primary_family_name 同样只取第一个",
+      font_check.primary_family_name("宋体；黑体") == "宋体")
+check("没有分隔符时 primary_family_name 原样返回",
+      font_check.primary_family_name("宋体") == "宋体")
+_repb = font_check.check_file(_broken)
+check("check_file 单独带出 bad_font_names",
+      _repb.get("bad_font_names") == ["黑体;黑体", "宋体;宋体"],
+      str(_repb.get("bad_font_names")))
+check("修好后的族本机都装着 ⇒ 不算缺", _repb.get("missing") == [],
+      str(_repb.get("missing")))
+check("同一份文件里正常用到的宋体照常进 fonts",
+      "宋体" in _repb.get("fonts"), str(_repb.get("fonts")))
+check("名字写坏但整篇没有其它字体 ⇒ 不会退到 fontTable 把模板字体报成缺",
+      font_check.check_file(_broken).get("missing") == [])
+# 修好后的族本机没装 → 照常报缺（装上确实能救，这跟「装黑体;黑体」是两回事）
+_broken2 = os.path.join(tmp, "broken_uninstalled.docx")
+_make_docx(_broken2, ["缺字体AA"], ["缺字体AA;缺字体AA"])
+_repb2 = font_check.check_file(_broken2)
+check("修好后的族本机没装 ⇒ 进 fonts 并照常报 missing",
+      "缺字体AA" in (_repb2.get("fonts") or [])
+      and _repb2.get("missing") == ["缺字体AA"], str(_repb2))
+check("这份文件同时仍列着写坏的原值",
+      _repb2.get("bad_font_names") == ["缺字体AA;缺字体AA"],
+      str(_repb2.get("bad_font_names")))
+
 print("⑤ .pdf 真解析")
 if not font_check.is_installed("Helvetica") and "helvetica" not in font_check._ALWAYS_OK:
     print("  ⏭ 标准字体表异常，跳过")
@@ -300,6 +347,11 @@ check("check_file 同时标明它是「没嵌入」（不是本机没装）",
 check("pdf_nonembedded_fonts 同口径",
       "STSong-Light" in font_check.pdf_nonembedded_fonts(ne_pdf),
       str(font_check.pdf_nonembedded_fonts(ne_pdf)))
+# PDF 不存在「字体名写成列表」这种坏法（PS 名里不会有分号），但键必须一律在：
+# GUI 用 .get 读，别的调用方若直接下标取值，缺键就是 KeyError。
+check("PDF 的 check_file 也带 bad_font_names 键（空列表）",
+      font_check.check_file(ne_pdf).get("bad_font_names") == [],
+      str(font_check.check_file(ne_pdf).get("bad_font_names")))
 
 # 2026-11-22 现场：同一字体在几页各有一份非嵌入资源（xref 不同、名字相同）⇒ 只报一次。
 # 旧代码按 (xref, 名字) 去重，于是「SimSun、SimSun」在弹框/日志/tooltip 里列两遍。
@@ -364,6 +416,21 @@ check("nonembedded_fonts 脏数据同样被过滤",
           {"file_path": ne_pdf, "nonembedded_fonts": ["ok字体", 3, None, ""]}).nonembedded_fonts == ["ok字体"])
 check("默认两个列表互不共享（可变默认值的坑）",
       printer_config.PrintJob(file_path=docx).nonembedded_fonts == [])
+
+# 第三类（2026-11-25）：文件里字体名被写成列表 —— 单独存，持久化要往返得回来。
+_jbad = printer_config.PrintJob(file_path=docx, copies=1,
+                                bad_font_names=["黑体;黑体"], font_checked=True)
+_dbad = _jbad.to_dict()
+check("to_dict 带 bad_font_names", _dbad.get("bad_font_names") == ["黑体;黑体"],
+      str(_dbad.get("bad_font_names")))
+check("from_dict 还原 bad_font_names",
+      printer_config.PrintJob.from_dict(_dbad).bad_font_names == ["黑体;黑体"])
+check("bad_font_names 脏数据同样被过滤",
+      printer_config.PrintJob.from_dict(
+          {"file_path": docx, "bad_font_names": ["黑体;黑体", 3, None, ""]}).bad_font_names
+      == ["黑体;黑体"])
+check("旧配置没有该键 ⇒ 默认空列表（不炸）",
+      printer_config.PrintJob.from_dict({"file_path": docx}).bad_font_names == [])
 
 print("⑨⑩ 打印前闸门（缺字体弹确认 / 自动线不弹）")
 try:
@@ -580,6 +647,24 @@ if _has_gui:
     check("不缺字体时 tooltip 为空（不标黄、不加提示）",
           _Stub()._font_tip_blocks(printer_config.PrintJob(file_path=docx, copies=1)) == [])
 
+    # 2026-11-25 现场（eaf27bdc….docx）：文件把字体名写成了「黑体;黑体」。Word 拿它当**一个**
+    # 名字匹配，永不命中 ⇒ 静默回落宋体。转换前会修副本，所以文案说「打印时自动修正」，
+    # 但仍要单独一段、不能混进「本机没装」。
+    _tip_bad = "\n\n".join(_Stub()._font_tip_blocks(
+        printer_config.PrintJob(file_path=docx, copies=1,
+                                bad_font_names=["黑体;黑体", "宋体;宋体"])))
+    check("只有字体名写坏时，tooltip 有独立一段并照原样点名",
+          "文件里的字体名写坏了" in _tip_bad and "· 黑体;黑体" in _tip_bad, _tip_bad[:260])
+    check("写坏那段不误诊成「本机没装」或「没嵌入字形」",
+          "本机没装这些字体" not in _tip_bad
+          and "没把字体嵌进文件" not in _tip_bad, _tip_bad[:260])
+    check("写坏那段说清打印时会自动修正副本（修成「黑体」再交给 Word）",
+          "自动修正" in _tip_bad and "修成「黑体」" in _tip_bad, _tip_bad[:400])
+    check("写坏那段也说清「装黑体;黑体」这个名字的字体救不了",
+          "装「黑体;黑体」" in _tip_bad and "救不了" in _tip_bad, _tip_bad[:400])
+    check("写坏那段给出路：Word 里全选重选字体后另存 / 让对方重导",
+          "全选" in _tip_bad and "另存" in _tip_bad, _tip_bad[:400])
+
     print("⑪ GUI 接线（源码级断言：这些位置漏一处，功能等于没做）")
     _src = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8", errors="replace").read()
     check("_start_print_worker 有 interactive 参数", "interactive: bool = True" in _src)
@@ -613,6 +698,46 @@ if _has_gui:
     check("闸门与表格行同一口径：未嵌入字体先过 is_installed 才拦",
           "_ne_bad" in _gate_body and "font_check.is_installed(n)" in _gate_body,
           _gate_body[:0] or "见 _font_gate")
+
+    # 2026-11-25 第三类（文件里字体名写成列表）：信号要带、job 要存、行要标黄、
+    # 闸门要放行（拦了也没用，Word 照样按回落字体打出来），详情窗的复制清单**不**列这些名字。
+    check("FontCheckWorker 把 bad_font_names 一起 emit（5 个参数）",
+          "Signal(str, list, str, list, list)" in _src
+          and 'get("bad_font_names")' in _src)
+    check("_on_font_checked 收 bad_names 并回写 job.bad_font_names",
+          "bad_names: list | None = None" in _src
+          and "job.bad_font_names = [str(x) for x in (bad_names or [])" in _src)
+    check("_font_help_names 返回三元组（本机没装 / 没嵌入 / 名字写坏）",
+          "return miss, ne, bad" in _src)
+    check("表格行把「名字写坏」也标黄",
+          "elif _miss or _ne or _bad:" in _src)
+    check("闸门不把「名字写坏」放进拦截清单（只记一行 ℹ 日志）",
+          "_broken" in _gate_body and "不拦打印" in _gate_body)
+    check("详情窗复制清单刻意不含写坏的名字",
+          "miss, ne, _bad" in _src)
+    # 旧版本按回落字体转出来的缓存 PDF 不能拿去打：界面说「自动修正」、纸面仍是宋体。
+    _stale = printer_config.PrintJob(file_path=os.path.join(tmp, "坏名.docx"), copies=1,
+                                     bad_font_names=["黑体;黑体"])
+    _stale.cached_pdf = os.path.join(tmp, "old.pdf")
+    check("写坏名的 docx 会把旧缓存 PDF 引用作废（打印时按修好的副本现转）",
+          gui.drop_stale_pdf_for_broken_fonts(_stale) is True and _stale.cached_pdf == "",
+          repr(_stale.cached_pdf))
+    _fresh = printer_config.PrintJob(file_path=os.path.join(tmp, "坏名.docx"), copies=1,
+                                     bad_font_names=["黑体;黑体"])
+    check("没有缓存引用时什么都不做（返回 False）",
+          gui.drop_stale_pdf_for_broken_fonts(_fresh) is False)
+    _clean = printer_config.PrintJob(file_path=os.path.join(tmp, "正常.docx"), copies=1)
+    _clean.cached_pdf = os.path.join(tmp, "keep.pdf")
+    check("没写坏名字的正常文件：缓存引用原样保留",
+          gui.drop_stale_pdf_for_broken_fonts(_clean) is False
+          and _clean.cached_pdf.endswith("keep.pdf"))
+    _doc = printer_config.PrintJob(file_path=os.path.join(tmp, "坏名.doc"), copies=1,
+                                   bad_font_names=["黑体;黑体"])
+    _doc.cached_pdf = os.path.join(tmp, "old2.pdf")
+    check("只对 .docx 生效（.doc 不做这种修复）",
+          gui.drop_stale_pdf_for_broken_fonts(_doc) is False and _doc.cached_pdf.endswith("old2.pdf"))
+    check("_on_font_checked 与 _font_gate 都接上了作废旧缓存",
+          _src.count("drop_stale_pdf_for_broken_fonts(") >= 3)
 
     # ⑫ selective 的行为级验收：只清"用到变更字体"那几个，其余 cached_pdf 一动不动，
     #    并且**一个 PDF 文件都不删**（删文件 = 预览失效，2026-11-11 现场）。
@@ -650,6 +775,57 @@ if _has_gui:
           _miss.cached_pdf.endswith("miss.pdf"), repr(_miss.cached_pdf))
     check("两个文件的 font_checked 都重置（下次打印前按新指纹重查）",
           _hit.font_checked is False and _miss.font_checked is False)
+
+# ⑬ 转换前自动修字体名（2026-11-25 用户批准「行，那就处理」）：源文件不动，只修副本。
+#    现场 eaf27bdc….docx 里 115 处 `w:eastAsia="黑体;黑体"`，Word 认不出 ⇒ 整篇回落宋体；
+#    修成 `黑体` 再交给 Word 才按原设计渲染。这里只测 docx 字节层面的行为，不调 Word/COM。
+print("⑬ 转换前自动修字体名（只改副本，源文件不动）")
+try:
+    import hashlib  # noqa: E402
+
+    import converter  # noqa: E402
+    _conv_ok = True
+except Exception as _exc:  # noqa: BLE001 —— converter 顶层有惰性 COM，缺依赖时整段跳过
+    _conv_ok = False
+    print(f"  ⏭ import converter 失败，跳过：{_exc}")
+if _conv_ok:
+    def _sha(p: str) -> str:
+        with open(p, "rb") as _f:
+            return hashlib.sha256(_f.read()).hexdigest()
+
+    _cdocx = os.path.join(tmp, "conv_broken.docx")
+    _make_docx(_cdocx, ["宋体"], ["黑体;黑体", "宋体;宋体", "宋体"])
+    _sha_before = _sha(_cdocx)
+    _fixed, _nfix = converter._repair_docx_font_names(_cdocx)
+    check("写成列表的名字被修（计数 ≥1）", _nfix >= 1, str(_nfix))
+    check("返回的是新副本，不是源路径", bool(_fixed) and _fixed != _cdocx, str(_fixed))
+    check("源文件一个字节都没变", _sha(_cdocx) == _sha_before)
+    with zipfile.ZipFile(_fixed) as _z:
+        _cxml = _z.read("word/document.xml").decode("utf-8", "replace")
+        check("副本仍是能正常打开的 docx", _z.testzip() is None)
+    check("副本里不再有「黑体;黑体」", "黑体;黑体" not in _cxml, _cxml[:300])
+    check("副本里换成单名「黑体」", "黑体" in _cxml and "宋体;宋体" not in _cxml)
+    # 没有分隔符的文件：原样返回、不产生临时文件
+    _cplain = os.path.join(tmp, "conv_plain.docx")
+    _make_docx(_cplain, ["宋体"], ["宋体"])
+    _fp2, _n2 = converter._repair_docx_font_names(_cplain)
+    check("没有坏名字 ⇒ 原样返回、计数 0", _fp2 == _cplain and _n2 == 0, f"{_fp2} / {_n2}")
+    # _prepare_office_src 串起来：坏名 ⇒ 返回可直接交给转换器的临时副本
+    _prep, _tmpp = converter._prepare_office_src(_cdocx)
+    check("_prepare_office_src 返回修好的临时副本",
+          bool(_tmpp) and _prep == _tmpp and _tmpp != _cdocx, f"{_prep} / {_tmpp}")
+    with zipfile.ZipFile(_prep) as _z2:
+        _pxml = _z2.read("word/document.xml").decode("utf-8", "replace")
+    check("_prepare_office_src 的产物里已是单名", "黑体;黑体" not in _pxml)
+    check("_prepare_office_src 同样不动源文件", _sha(_cdocx) == _sha_before)
+    _prep2, _tmpp2 = converter._prepare_office_src(_cplain)
+    check("没问题时 _prepare_office_src 原样返回、无临时文件",
+          _prep2 == _cplain and _tmpp2 == "", f"{_prep2} / {_tmpp2}")
+    for _p in (_fixed, _tmpp):
+        try:
+            os.remove(_p)
+        except OSError:
+            pass
 
 print("")
 if FAILED:

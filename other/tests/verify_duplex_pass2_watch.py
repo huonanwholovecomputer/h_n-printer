@@ -334,13 +334,17 @@ check("★ 闸门被钳在自动放行时刻之内（按钮按不动 = 把无人
 
 _dlg9 = gui.ManualDuplexDialog()
 _dlg9.announce("本批第 1 趟开打", sheets=3, estimate_sec=40.0)
-check("★ 闸门只管确认按钮：「▶ 继续打第 2 趟」仍是一出现就可点（硬规矩 12 不变）",
-      _dlg9._btn_go.isEnabled() and _dlg9._btn_go.text().startswith("▶ 继续打第 2 趟"),
-      f"{_dlg9._btn_go.text()} enabled={_dlg9._btn_go.isEnabled()}")
+check("★ 两条锁各管各的：切到第 1 趟后「继续打第 2 趟」按**本批**的放行比例锁着"
+      "（2026-11-25 起不再一出现就可点）",
+      _dlg9._btn_go.isEnabled() is False
+      and _dlg9._btn_go.text().startswith("▶ 继续打第 2 趟")
+      and "放行比例 50%" in _dlg9._btn_go.toolTip(),
+      f"{_dlg9._btn_go.text()} enabled={_dlg9._btn_go.isEnabled()} tip={_dlg9._btn_go.toolTip()}")
 
 _dlg7.announce("本批第 1 趟开打", sheets=3, estimate_sec=40.0)      # 确认态 → 第 1 趟
-check("★ 确认态那条「放行比例」tooltip 不会挂到「继续打第 2 趟」上（换态就清）",
-      _dlg7._btn_go.toolTip() == "" and _dlg7._btn_go.isEnabled(),
+check("★ 确认态那条「放行比例」tooltip 不串到「继续打第 2 趟」上（换态就清，改由本批自己的锁写）",
+      "上一批第 2 趟预计" not in _dlg7._btn_go.toolTip()
+      and "第 1 趟预计 00:40" in _dlg7._btn_go.toolTip(),
       _dlg7._btn_go.toolTip())
 
 _dlg2 = gui.ManualDuplexDialog()
@@ -605,6 +609,9 @@ _cont6, _conf6 = [], []
 _dlg6.continue_requested.connect(lambda: _cont6.append(1))
 _dlg6.prev_pass2_confirmed.connect(lambda: _conf6.append(1))
 _dlg6.announce("本批第 1 趟开打", sheets=3, estimate_sec=40.0)
+# 本条只查"早确认"口径；2026-11-25 起的放行比例锁另有用例（verify_manual_duplex_gui ⑥c），
+# 这里把关掉，否则一点下去先被闸门挡住、看起来像口径变了。
+_dlg6._flip_gate_at = 0.0
 _dlg6._on_go()
 check("第 1 趟态点击照常算「打完了」（早确认口径不变）",
       _cont6 == [1] and _dlg6._mode == "pass2", f"{_cont6} {_dlg6._mode}")
@@ -621,6 +628,7 @@ _dlg6b._on_go()
 check("确认上一个任务只发 prev_pass2_confirmed（绝不发 continue_requested）",
       _conf6b == [1] and not _cont6b, f"{_conf6b} {_cont6b}")
 _dlg6b.announce("本批第 1 趟开打", sheets=3, estimate_sec=40.0)
+_dlg6b._flip_gate_at = 0.0        # 同上：只查尾击保护，放行比例锁单独验
 _dlg6b._on_go()
 check("★ 确认后的双击尾击被吃掉（第 1 趟没出纸就不会被判打完）",
       not _cont6b and _dlg6b._mode == "pass1", f"{_cont6b} {_dlg6b._mode}")

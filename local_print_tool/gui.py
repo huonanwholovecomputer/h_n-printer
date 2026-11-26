@@ -131,7 +131,7 @@ import agent_ops  # 控制接口的 op 实现（建页/加文件/改参数/打�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.7.4"
+APP_VERSION = "4.7.5"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -996,16 +996,54 @@ def _make_resident_tool_window(dlg: "QDialog") -> None:
     dlg.setWindowFlag(Qt.Tool, True)
 
 
+def _fit_resident_window_on_screen(dlg: "QDialog", margin: int = 8) -> bool:
+    """把「够不着」的常驻窗拉回屏幕可用区域；够得着就一个像素都不挪。
+
+    2026-11-24 现场（用户报「攒批窗口怎么没有边框了，我无法移动它」）：攒批列表被摆到
+    y=-31，30px 标题栏整条落在屏幕上方，屏幕上只剩客户区从 y=0 开始显示 —— 看起来就像
+    无边框窗口，而原生窗口**只有标题栏能拖**，于是操作员彻底动不了它。根因在
+    MainWindow._place_resident_window：按主窗口中心摆位时没夹屏幕，主窗口靠上（或比屏幕
+    还高）时算出来的 y 是负数。
+
+    判据只认「标题栏够不着」：标题栏整条在屏幕上/下边缘之外，或整窗与屏幕没有横向交集。
+    够得着就一律不动 —— 操作员故意把窗口停在屏幕边缘是常态，别每次弹窗都给人拽回来。
+    """
+    try:
+        fg = dlg.frameGeometry()
+        if fg.width() <= 0 or fg.height() <= 0:      # 还没显示过，没有真实几何
+            return False
+        scr = QApplication.screenAt(fg.center()) or QApplication.primaryScreen()
+        if scr is None:
+            return False
+        avail = scr.availableGeometry()
+        caption_ok = avail.top() <= fg.top() <= avail.bottom() - 24
+        overlap_x = fg.right() >= avail.left() + 24 and fg.left() <= avail.right() - 24
+        if caption_ok and overlap_x:
+            return False
+        x = min(max(fg.left(), avail.left() + margin),
+                max(avail.left() + margin, avail.right() - margin - fg.width() + 1))
+        y = min(max(fg.top(), avail.top() + margin),
+                max(avail.top() + margin, avail.bottom() - margin - fg.height() + 1))
+        dlg.move(int(x), int(y))
+        logger.info(f"常驻窗越出屏幕可用区，已拉回：{dlg.windowTitle() or type(dlg).__name__} "
+                    f"({fg.left()},{fg.top()}) → ({int(x)},{int(y)})")
+        return True
+    except Exception as e:
+        logger.debug(f"常驻窗拉回屏幕失败（忽略）: {e}")
+        return False
+
+
 class ManualDuplexDialog(QDialog):
     """手动双面**常驻**提示窗（对齐 HP 官方工具：打印一开始就在，而不是打完才弹）。
 
     HP 驱动的手动双面向导从打印开始就常驻在屏幕上，操作员不必等弹窗、也不会被突然弹出的
     窗口打断；我们照做，用状态机切换同一个窗口：
-      ① 批次开始 → 窗口出现：「正在打印第 1 趟」；继续按钮**从窗口出现那刻就可点**
-         （硬规矩 12：点击那一刻 = 第 1 趟结束、计时就地冻结；不按时间闸门自动放行，
-         也不等打印机/worker 回报 flip_required —— 主机型只报「数据送进端口」）。
-         只有「上一个任务还在出纸」（announce_waiting）期间才保持禁用。
-      ② 第 1 趟出纸 → 「可翻纸」：倒计时 + 出纸张数提示（按钮仍可点，状态不变）
+      ① 批次开始 → 窗口出现：「正在打印第 1 趟」；继续按钮**到放行比例才可点**
+         （2026-11-25；此前是"窗口出现那刻就可点"，现场在确认完上一批后误触）。
+         点击那一刻 = 第 1 趟结束、计时就地冻结；到点也不自动发第 2 趟，
+         也不等打印机/worker 回报 flip_required —— 主机型只报「数据送进端口」。
+         「上一个任务还在出纸」（announce_waiting）期间同样禁用。
+      ② 第 1 趟出纸 → 「可翻纸」：倒计时 + 出纸张数提示（到点后按钮可点，状态不变）
       ③ 点了继续 → 「正在打印第 2 趟」（按钮禁用，防重复点）
       ④ 批次结束 → 自动收起
     **关窗 = 跳过**（绝不因为关窗就擅自把第 2 趟打了）。
@@ -1295,8 +1333,9 @@ class ManualDuplexDialog(QDialog):
         """每 0.5 秒刷新；第 1 趟已冻结（_pass1_done）就停在那里，不再继续走。
 
         ★ 2026-11-11（用户第四次定口径，见 `FLIP_GATE_RATIO` 上方注释）：第 2 趟按钮
-        **既不等打印机的完成回报，也不按时间放行** —— 按钮从窗口出现那刻就可点，
-        第 1 趟什么时候算打完由操作员看纸判定。这里只负责刷新计时文案与配色。
+        **不等打印机的完成回报** —— 第 1 趟什么时候算打完由操作员看纸判定。
+        ★ 2026-11-25（用户第六次定口径，现场误触）：光"能点"还不够 —— 没到放行比例那一下
+        是误触，所以这里每跳都调 `_refresh_pass2_gate()` 开关按钮（到点只放开，不自己发）。
         """
         if self._mode in ("remedy", "remedy_pass2"):
             self._remedy_tick()
@@ -1341,6 +1380,8 @@ class ManualDuplexDialog(QDialog):
         # ★ 2026-11-11 起这里**不再**按时间自动放行（原来到点就直接切「可翻纸」）：
         #   第 2 趟什么时候开始只由操作员点按钮决定，见 `announce()` 里的用户口径。
         #   计时器继续走，直到操作员点「继续」才冻结。
+        # ★ 2026-11-25：只**锁按钮**（到放行比例才可点），绝不在这里 emit 第 2 趟。
+        self._refresh_pass2_gate()
 
     def note_pass1_measured(self, seconds: float):
         """记下 worker 报来的**打印实测**（第 1 趟数据全送出去 / 打印队列排空的耗时）。
@@ -1490,26 +1531,45 @@ class ManualDuplexDialog(QDialog):
         self._timer.stop()
         self._close_timer.stop()
         self._mode = "pass1"
+        # ★ 2026-11-26 现场（常驻窗「⏱ 第 1 趟已用 02:57」，可本批开打才 17 秒）：`_t0` **必须**
+        #   在任何"读已用秒数"的步骤之前归零。`_apply_batch_params` 之后的
+        #   `_refresh_pass2_gate()` 会经 `_pass2_gate_wait()` 调 `_pass1_seen()` —— 那一刻
+        #   `_t0` 还是**上一批的时钟**（从上一批 announce 起一直走到现在，没人停过它），
+        #   采样值会被 `_pass1_seen_max` 的单调保护记成**本批**的下限：此后 `_t0` 怎么
+        #   restart 都没用，读数永久停在上一批的时长上（现场 15:56:53 上一批 announce →
+        #   15:59:50 本批 announce = 02:57，还配上「超出 164 秒」红字）；更糟的是它同时把
+        #   放行比例锁顶穿（gate − 177 < 0 ⇒ 第 2 趟按钮一出现就是亮的，2026-11-25 的防误触
+        #   锁当场失效）。所以先 restart（归零）→ 再算闸门/铺文案。
+        self._t0.restart()
         self._apply_batch_params(sheets, estimate_sec, gate_ratio, gate_extra)
         self._status.setText(
             "① 正在送第 1 趟…（程序自己分两趟，中途只需要翻一次纸）—— "
             "纸数够、出齐就点「继续打第 2 趟」：这一趟打没打完由你说了算，程序不等打印队列")
         self._detail.setText(text)
         self._countdown.setText("")
-        # ★ 2026-11-11 用户口径（这一处已经来回改过三次，动它之前先读下面这段注释）：
+        # ★ 2026-11-11 用户口径（这一处已经来回改过多次，动它之前先读下面这段注释）：
         #   「第一趟的打印结束信号应该由我决定，我什么时候按下开始第二趟什么时候就是
         #     第一趟结束了，而不是由系统打印队列决定。」
-        #   ⇒ 按钮**一出现就可点**。时间预估只当参考信息；既不按时间放行（2026-11-09 口径），
-        #     也不等打印机的完成回报 / 打印队列排空（更早的两种口径）。
+        #   ⇒ 第 1 趟何时结束**只认这次点击**；既不等打印机的完成回报（更早的口径），
+        #     也不等打印队列排空（2026-11-09 口径），到点也不许程序自己发第 2 趟。
+        # ★ 2026-11-25 用户现场（第 6 次，误触）：上一批刚点完「确定上一个任务已完成」，
+        #   本批窗口里同一个位置立刻又是一颗亮着的「▶ 继续打第 2 趟」—— 手还停在那儿，
+        #   一下就把本批第 2 趟发出去了（第 1 趟还没出纸）。⇒ 按钮**按放行比例上锁**：
+        #   要到「预估 × gate_ratio（+ 人工翻页准备秒数）」才允许按（`_refresh_pass2_gate`）。
+        #   这只锁"能不能按"，到点也只放开按钮，绝不自己发第 2 趟 —— 上面 2026-11-11 的
+        #   「谁按谁说了算」没有被推翻（见 docs/手动双面.md 版本表）。
         self._btn_go.setText("▶ 继续打第 2 趟（纸出齐就点）")
-        self._btn_go.setEnabled(True)
+        self._flip_gate_at = self.flip_gate_at(self._pass1_est,
+                                              getattr(self, "_gate_ratio", None),
+                                              getattr(self, "_gate_extra", 0.0))
+        self._refresh_pass2_gate()
         self._btn_skip.setText("⏭ 跳过本任务")
         self._btn_skip.setEnabled(True)
         # ★ 第 1 趟计时从**真正开始送纸**这一刻起（不是"窗口出现"那一刻）：上一批次没结束时
-        #   走的是 announce_waiting（不计时），等队列排空才来这里 restart → 从 0 起跑。
+        #   走的是 announce_waiting（不计时），等队列排空才来这里 → 从 0 起跑（`_t0.restart()`
+        #   已经提到本函数开头，见上面那条注释：必须先归零，读数才不会被上一批的时长污染）。
         self._flip_text = text
         self._flip_timeout = 0
-        self._t0.restart()
         self._pass1_tick()
         self._pass1_timer.start(500)
 
@@ -1566,8 +1626,8 @@ class ManualDuplexDialog(QDialog):
     def _prev2_refresh_gate(self, elapsed: float | None = None) -> None:
         """按放行比例开/关「✔ 确定上一个任务已完成」（2026-11-23，防误触）。
 
-        只作用于确认态：`announce()` 里那个「▶ 继续打第 2 趟」仍是窗口一出现就可点
-        （硬规矩 12），那条口径不受这里影响。
+        只作用于确认态：`announce()` 里那个「▶ 继续打第 2 趟」另有自己的放行比例锁
+        （2026-11-25，`_refresh_pass2_gate`），两条锁各管各的按钮。
         """
         if self._mode != "prev2":
             return
@@ -1650,12 +1710,88 @@ class ManualDuplexDialog(QDialog):
             gate = min(gate, cap)
         return gate
 
+    # ── 第 2 趟按钮的「放行比例」锁（2026-11-25 用户现场：确认完上一批后误触）──
+
+    def _pass2_gate_at(self) -> float:
+        """本批第 2 趟按钮的**生效**放行时刻（已钳进 worker 的等翻纸超时之内；0 = 不锁）。
+
+        为什么必须钳：`_flip_gate_at` 是"预估 × 比例 + 翻页准备"，大活（几百张）算出来会
+        超过 worker 的 10 分钟等待上限 —— 那时 worker 已经按「跳过」判半成品（纸白打），
+        按钮才刚亮。宁可提前 30 秒松手：超时前的最后半分钟操作员点下去仍然算数。
+        """
+        gate = float(getattr(self, "_flip_gate_at", 0.0) or 0.0)
+        if gate <= 0:
+            return 0.0
+        cap = float(self._flip_timeout or self.FLIP_WAIT_DEFAULT_SEC) - 30.0
+        if cap > 0:
+            gate = min(gate, cap)
+        return gate
+
+    def _pass2_gate_wait(self) -> float:
+        """「▶ 继续打第 2 趟」距离放行还差几秒（<=0 = 已放行 / 本态不设锁）。
+
+        只对 pass1 / flip / flip_gate 三个态生效：waiting（本批还没送纸）、prev2（显示的是
+        **上一批**的计时）、remedy（补救，纸几小时前就打完了）、pass2/done（已经翻过去了）
+        一概不锁。闸门时刻由 `announce()` 用 `flip_gate_at()` 算好存进 `_flip_gate_at`。
+        """
+        if self._mode not in ("pass1", "flip", "flip_gate"):
+            return 0.0
+        gate = self._pass2_gate_at()
+        if gate <= 0:
+            return 0.0
+        return max(0.0, gate - self._pass1_seen())
+
+    def _refresh_pass2_gate(self) -> None:
+        """按放行比例开/关第 2 趟按钮 + 写「还要多久」提示 —— **到点只放开按钮**。
+
+        2026-11-25 用户口径：没到放行时刻（本机 60%）按钮不许是亮的，否则上一批刚确认完、
+        手还停在那个位置上，一下就把本批第 2 趟发出去了。到点后按钮变可点，但仍然要操作员
+        自己按 —— 绝不在这里 emit continue_requested。
+        """
+        if self._mode not in ("pass1", "flip", "flip_gate"):
+            return
+        wait = self._pass2_gate_wait()
+        want = wait <= 0
+        if self._btn_go.isEnabled() != want:
+            self._btn_go.setEnabled(want)
+        if want:
+            self._btn_go.setToolTip("")
+        else:
+            pct = int(round(float(getattr(self, "_gate_ratio", self.FLIP_GATE_RATIO) or 0.0) * 100))
+            gate = self._pass2_gate_at()
+            self._btn_go.setToolTip(
+                f"放行比例 {pct}%：第 1 趟预计 {format_duration(self._pass1_est)}，"
+                f"要到第 {format_duration(gate)} 才允许按（上一批的纸可能还没出完，防误触）。"
+                "到点也只放开按钮，第 2 趟仍要你自己点。")
+        self._render_pass2_countdown(wait)
+
+    def _render_pass2_countdown(self, wait: float | None = None) -> None:
+        """第 2 趟按钮下面那行提示：锁着写锁、放开后写翻纸超时（两个定时器共用一处）。
+
+        ⚠ 必须由这里统一渲染：`_tick()`（1 秒的翻纸超时）和 `_pass1_tick()`（0.5 秒的
+        第 1 趟计时）都会写这一行，各写各的就会互相冲掉（现场看到"提示一闪一闪"）。
+        """
+        if wait is None:
+            wait = self._pass2_gate_wait()
+        if wait > 0:
+            pct = int(round(float(getattr(self, "_gate_ratio", self.FLIP_GATE_RATIO) or 0.0) * 100))
+            self._countdown.setText(
+                f"🔒 放行比例 {pct}%：还要 {format_duration(int(wait + 0.999))} 才允许按"
+                "「继续打第 2 趟」（第 1 趟还在出纸，防误触）")
+            self._countdown.setStyleSheet("color: #e67e22;")
+            return
+        if self._mode == "flip":
+            self._countdown.setText(
+                f"⏳ 还有 {self._left // 60} 分 {self._left % 60} 秒（超时按跳过处理）")
+            return
+        self._countdown.setText("")
+
     def set_flippable(self, text: str, timeout_sec: int):
         """worker 报告"第 1 趟的数据全送进打印队列了" —— 起跑"10 分钟无人确认=跳过"倒计时。
 
-        ★ 这个回报**既不是放行的必要条件，也不是充分条件**（2026-11-11 口径）：按钮在
-        `announce()` 那一刻就可点，第 1 趟何时结束由操作员点「继续」决定；回报到了只负责
-        把倒计时起跑（也给界面补一句"数据已全部送出"的措辞）。
+        ★ 这个回报**既不是放行的必要条件，也不是充分条件**（2026-11-11 口径）：按钮能不能
+        按只由 `announce()` 算好的放行比例决定（2026-11-25），第 1 趟何时结束由操作员点
+        「继续」决定；回报到了只负责把倒计时起跑（也补一句"数据已全部送出"的措辞）。
         守卫：`flip`（已可翻）/`pass2`（已点继续）/`skipped`/`done` 一律不改状态 ——
         否则迟到的回报会把「③ 正在打印第 2 趟」拉回可翻纸，重复 emit continue_requested
         （第 2 趟会被打两遍）。
@@ -1684,8 +1820,8 @@ class ManualDuplexDialog(QDialog):
                 self._left = max(1, int(self._flip_timeout))
             return
         # 2026-11-11 起没有"闸门"这一态了：worker 说"第 1 趟的数据全送进打印队列了"，
-        # 这里只把"10 分钟无人确认 ⇒ 按跳过处理"的倒计时起跑；按钮在 `announce()` 那一刻
-        # 就已经可点（第 1 趟何时结束由操作员点「继续」决定）。
+        # 这里只把"10 分钟无人确认 ⇒ 按跳过处理"的倒计时起跑；按钮的可点与否只看
+        # `announce()` 按放行比例算好的闸门（2026-11-25），第 1 趟何时结束仍由操作员点击决定。
         self._open_flip_gate()
 
     def _open_flip_gate(self):
@@ -1695,7 +1831,8 @@ class ManualDuplexDialog(QDialog):
         （2026-11-11 口径），冻结在 `_on_go` 里做（用 `_freeze_pass1_at_gate`）。
         2026-11-15 起冻结值就是终值：worker 的实测只做括号标注，不再覆盖它。
         """
-        self._flip_gate_at = 0.0
+        # ⚠ 这里**不清 `_flip_gate_at`**（2026-11-25）：那个闸门是 `announce()` 按放行比例
+        #   算好的，本轮它管的是"第 2 趟按钮什么时候允许按"；回报到了只起跑超时倒计时。
         # ⚠ 计时**不在这里冻结**：第 1 趟什么时候算结束 = 操作员点「继续」那一刻
         #   （2026-11-11 口径）。冻结交给 `_on_go`（用 `_freeze_pass1_at_gate`），
         #   冻结值即终值（2026-11-15），worker 实测只在括号里标注。
@@ -1705,11 +1842,11 @@ class ManualDuplexDialog(QDialog):
         if self._speed_hint:
             self._pass1_hint.setText(
                 f"{self._speed_hint}\n（这台打印机只回报「开始打印」、不回报「打完」："
-                "按钮随时可点，纸出齐没出齐由你看）")
+                "纸出齐没出齐由你看；按钮要到放行比例才解锁，锁着时点不动）")
         self._btn_go.setText("▶ 继续打第 2 趟")
         self._mode = "flip"
         self._detail.setText(self._flip_text)
-        self._btn_go.setEnabled(True)
+        self._refresh_pass2_gate()      # 没到放行比例仍然是灰的（2026-11-25）
         self._left = max(1, int(self._flip_timeout or self.FLIP_WAIT_DEFAULT_SEC))
         self._tick()
         self._timer.start(1000)
@@ -1788,7 +1925,7 @@ class ManualDuplexDialog(QDialog):
         self._pass1.setText("")          # 还没送纸，不给秒数（也不给颜色）
         self._pass1.setStyleSheet("")
         self._btn_go.setText(f"▶ 开始{self._remedy_what}")
-        self._btn_go.setEnabled(True)    # 硬规矩 12：按钮出现那刻就可点，不等任何回报
+        self._btn_go.setEnabled(True)    # 补救没有第 1 趟要等：纸早就打完了，按钮直接可点
         self._btn_skip.setText("⏭ 取消本次补打")
         self._btn_skip.setEnabled(True)
 
@@ -1842,8 +1979,9 @@ class ManualDuplexDialog(QDialog):
             self._countdown.setText("⏳ 长时间无人确认 → 按「跳过本任务」处理")
             self._on_skip()
             return
-        self._countdown.setText(
-            f"⏳ 还有 {self._left // 60} 分 {self._left % 60} 秒（超时按跳过处理）")
+        # 2026-11-25：翻纸超时那一行也走统一渲染 —— 没到放行比例时按钮是锁着的，
+        # 这一行要写"还要多久才解锁"，不能在这里直接把 10 分钟倒计时铺上去。
+        self._render_pass2_countdown()
 
     def _on_go(self):
         if self._mode == "prev2":
@@ -1885,6 +2023,11 @@ class ManualDuplexDialog(QDialog):
         # 「第 1 趟结束」的判据就是这一次点击（2026-11-11 用户口径）——所以 pass1 态
         # （第 1 趟还在送数据/纸还在出）也允许点，点了就立刻往下走第 2 趟。
         if self._mode not in ("pass1", "flip", "flip_gate"):
+            return
+        # 放行比例锁（2026-11-25）：没到点按钮本来就是灰的，这里再挡一道程序化点击/键盘，
+        # 也挡"确认完上一批后那一下顺手点击"（那时新批的第 1 趟还没出纸）。
+        if self._pass2_gate_wait() > 0:
+            self._refresh_pass2_gate()
             return
         # 双击尾击保护（2026-11-22 现场）：确认「✔ 确定上一个任务已完成」之后，announce()
         # 会把同一位置的同一个按钮换成可点的「▶ 继续打第 2 趟」。操作员连点两下时，第二下
@@ -1930,7 +2073,7 @@ class ManualDuplexDialog(QDialog):
 
     def closeEvent(self, ev):
         # 还没点「继续」就关窗 → 视为跳过（不能让关窗把第 2 趟放过去）。
-        # "pass1" 也算：2026-11-11 起按钮在第 1 趟还在出纸时就可点，关窗同样是一次明确的
+        # "pass1" 也算：按钮到放行比例就解锁（第 1 趟可能还在出纸），关窗同样是一次明确的
         # "我不打第 2 趟了"表态，必须记跳过（否则 worker 会一直等到 10 分钟超时）。
         # ⚠ "prev2"（等上一个任务第 2 趟出完）**不算跳过**：这时本批一个字节都还没送进
         #   打印机，关窗只表示"别再问我了"。worker 仍按到期（预估 + 宽限）自动放行，
@@ -3205,8 +3348,9 @@ class PrintSpeedDialog(QDialog):
       · 第 1 趟耗时模型：启动/预热（秒）、每张纸（秒）—— 0 = 该分量用自动学习值；
       · 完成回报门槛：放行比例（%）、人工翻页准备时间（秒）
         门槛 = 第 1 趟预估 × 比例 + 翻页准备时间
-        （2026-11-13：这两个数**不再决定第 2 趟何时能点** —— 按钮一直可点、只认操作员点击。
-         它们现在只用来判断打印机那句「打完了」可不可信：早于门槛的完成回报按假信号忽略，
+        （2026-11-25 起这两个数**又决定第 2 趟按钮何时解锁** —— 现场：确认完上一批后按钮
+         立刻亮着，手还停在那个位置，顺手就把本批第 2 趟发出去了。到点只放开按钮，绝不自动发。
+         另外它们仍用来判断打印机那句「打完了」可不可信：早于门槛的完成回报按假信号忽略，
          既不冻结计时也不写进学习样本。）
       · 窗口底部还有一块**只读结果区**：生效模型、自动学习值、按当前参数推算的典型张数、
         完成回报门槛、最近一次实测 —— 用户不用去翻日志就知道这些数字算出了什么。
@@ -4092,8 +4236,9 @@ class FontCheckWorker(QThread):
     任何异常都吞掉并当作"查不出"（`missing=[]`）：查字体绝不能变成打印的前置故障。
     """
 
-    # (file_path, 本机缺的字体名列表, 查的时候的系统字体指纹, PDF 里没嵌入字形的字体名)
-    checked = Signal(str, list, str, list)
+    # (file_path, 本机缺的字体名列表, 查的时候的系统字体指纹, PDF 里没嵌入字形的字体名,
+    #  文件里被写成列表的字体名 —— `黑体;黑体` 这种 Word 认不出的名字)
+    checked = Signal(str, list, str, list, list)
 
     def __init__(self, file_paths: list[str], fingerprint: str, parent=None):
         super().__init__(parent)
@@ -4111,16 +4256,20 @@ class FontCheckWorker(QThread):
                 return
             missing: list = []
             nonembedded: list = []
+            bad_names: list = []
             try:
                 _rep = font_check.check_file(p)
                 missing = list(_rep.get("missing") or [])
                 nonembedded = list(_rep.get("nonembedded") or [])
+                # 写坏的字体名（`黑体;黑体`）—— 不属于"没装"，装这个名字的字体救不了；
+                # 但是转换前 converter 会在副本上修成单名，所以修好后的族名会照常算进 missing。
+                bad_names = list(_rep.get("bad_font_names") or [])
             except Exception:
                 logger.debug("字体检查失败: %s", p, exc_info=True)
             if self._cancelled:
                 return
             try:
-                self.checked.emit(p, missing, self._fp, nonembedded)
+                self.checked.emit(p, missing, self._fp, nonembedded, bad_names)
             except RuntimeError:
                 return          # 窗口已销毁
 
@@ -4142,12 +4291,46 @@ FONT_NOTE_BUILTIN_GLYPH = "西文不做字形替换，打印用内置等价字�
 
 
 def _font_help_names(job) -> tuple:
-    """(本机没装的名字, PDF 里没嵌入字形的名字)。同名只留一次（旧配置里存过重复）。"""
+    """(本机没装的名字, PDF 里没嵌入字形的名字, 文件里写坏的名字)。
+
+    同名只留一次（旧配置里存过重复）。第三类 `黑体;黑体` 是**文件自己写坏**的：
+    Word 拿它当一个字体名去匹配，永不命中 ⇒ 静默回落默认字体；装「黑体;黑体」这个名字
+    的字体救不了（不存在这个名字）。转换前 converter 会在副本上把它修成「黑体」，
+    所以第一类里会同时出现修好后的族名 —— 那个是文档真正要用、缺了才该装的。
+    """
     miss = list(dict.fromkeys(
         str(x) for x in (getattr(job, "missing_fonts", []) or []) if str(x).strip()))
     ne = list(dict.fromkeys(
         str(x) for x in (getattr(job, "nonembedded_fonts", []) or []) if str(x).strip()))
-    return miss, ne
+    bad = list(dict.fromkeys(
+        str(x) for x in (getattr(job, "bad_font_names", []) or []) if str(x).strip()))
+    return miss, ne, bad
+
+
+def drop_stale_pdf_for_broken_fonts(job) -> bool:
+    """文件字体名写坏了 ⇒ 旧版本转出来的缓存 PDF 用的是「回落字体」那一份，不能再用。
+
+    2026-11-25：升级前 `黑体;黑体` 会被 Word 当不存在的名字、整篇回落宋体，那份 PDF 已经进了
+    `pdf_cache`；升级后如果还命中它，界面说「打印时会自动修正」，纸面却仍是宋体。
+    这里只清**内存引用**、不删文件：PrintWorker 见 `cached_pdf` 为空会按修好的副本现转
+    （`→ 正在转换为 PDF...`），转完写回的就是修好的那份 ⇒ 下一次自然命中正确缓存。
+    只对 `.docx` 生效（.doc 是二进制、不做这种修复，见 converter）。
+
+    返回 True = 确实清掉了一份旧引用（调用方据此记日志）。
+    """
+    try:
+        if not [x for x in (getattr(job, "bad_font_names", []) or []) if str(x).strip()]:
+            return False
+        if not getattr(job, "cached_pdf", ""):
+            return False
+        _fp = str(getattr(job, "file_path", "") or "")
+        if os.path.splitext(_fp)[1].lower() != ".docx":
+            return False
+        job.cached_pdf = ""
+        return True
+    except Exception:
+        logger.debug("作废旧缓存（字体名写坏）失败", exc_info=True)
+        return False
 
 
 def font_help_text(jobs) -> str:
@@ -4155,8 +4338,8 @@ def font_help_text(jobs) -> str:
     jobs = list(jobs or [])
     body: list = []
     for job in jobs:
-        miss, ne = _font_help_names(job)
-        if not miss and not ne:
+        miss, ne, bad = _font_help_names(job)
+        if not miss and not ne and not bad:
             continue
         label = os.path.basename(getattr(job, "file_path", "") or "") or "（未知文件）"
         body.append("■ " + label)
@@ -4173,31 +4356,54 @@ def font_help_text(jobs) -> str:
                     body.append("    · " + n + "    ← 本机已装 ✓ " + FONT_NOTE_SYSTEM_GLYPH)
                 else:
                     body.append("    · " + n + "    ← 本机已装 ✓ " + FONT_NOTE_BUILTIN_GLYPH)
+        if bad:
+            # 2026-11-25 现场：文件里写的是「黑体;黑体」，以前被当成缺字体，让用户去装
+            # 「黑体;黑体」这个字体 —— 装多少遍也没用，告警永远清不掉。
+            # 2026-11-25 追加：转换前会在副本上把它修成单名再交给 Word，纸面不再回落；
+            # 源文件仍是坏的（别的软件打开仍可能整篇变宋体），所以还要照原样列出来。
+            body.append("  文件里的字体名写坏了（打印时会自动修正副本，源文件仍是坏的）：")
+            for n in bad:
+                body.append("    · " + n)
         body.append("")
     _n_tip = sum(1 for j in jobs if any(_font_help_names(j)))
+    # 三类各自有没有：抬头分支与下面「怎么救」都按它判（写在前面，空列表时也不会未定义）
+    _has_miss = any(_font_help_names(j)[0] for j in jobs)
+    _has_ne = any(_font_help_names(j)[1] for j in jobs)
+    _has_bad = any(_font_help_names(j)[2] for j in jobs)
     lines = ["共 %d 个文件有字体提示。" % _n_tip, ""]
     if _n_tip:
         # 2026-11-18 现场：用户装好 SimSun 后仍看见清单里列着 SimSun，以为「装了还是没装」。
         # 两类必须当场分开说：① 本机没装（装了就好）② 文件自己没嵌字形（装不装都改不了）。
         # 只有 ① 真的存在时才把两条都摆出来 —— 西文那类本来就没有「装了没装」的问题，
         # 清单下面只挂一条「本机没装」会把用户又绕回「是不是装错了」。
-        _has_miss = any(_font_help_names(j)[0] for j in jobs)
         if _has_miss:
-            lines += ["这两类不要混：",
+            lines += ["这三类不要混：" if _has_bad else "这两类不要混：",
                       "  ① 本机没装 —— 装了就修好，表格里的 ⚠ 会消失；",
                       "  ② PDF 生成时没嵌字形 —— 文件里只写了字体名、没带字形，"
-                      "装不装都改不了这一条；打印时中文用「系统字形」、西文用「内置兜底字形」。",
-                      ""]
-        else:
+                      "装不装都改不了这一条；打印时中文用「系统字形」、西文用「内置兜底字形」。"]
+            if _has_bad:
+                lines += ["  ③ 文件里的字体名写坏了 —— 名字被写成了一串（如 黑体;黑体），"
+                          "Word 认不出这种名字；打印时本工具会自动修正副本再转换（源文件仍是坏的），"
+                          "装「黑体;黑体」这个字体救不了。"]
+            lines += [""]
+        elif _has_ne:
             lines += ["这一类不是「本机没装」：文件生成时就没带字形，装不装字体都改不了这一条 —— "
-                      "打印时中文用「系统字形」、西文用「内置兜底字形」。",
+                      "打印时中文用「系统字形」、西文用「内置兜底字形」。"]
+            if _has_bad:
+                lines += ["另外，文件里的字体名被写成了一串（如 黑体;黑体）：Word 认不出这种名字，"
+                          "打印时本工具会自动修正副本再转换，源文件仍是坏的。"]
+            lines += [""]
+        elif _has_bad:
+            lines += ["这一类不是「本机没装」：文件里的字体名被写成了一串（如 黑体;黑体）—— "
+                      "Word 认不出这种名字；打印时本工具会自动把副本里的名字修正再转换，"
+                      "源文件仍是坏的。装「黑体;黑体」这个字体救不了（不存在这个名字）。",
                       ""]
     lines += body or ["（这些文件当前没有字体提示）", ""]
     # 「怎么补字体」只在真的还有要补的字体时才给：本机没装的，或中文/日韩字形本机也缺的。
     # 2026-11-18 现场：Times/Arial 全装齐了，清单下面仍跟着这四步，用户以为要自己动手替换。
     _need: list = []
     for j in jobs:
-        _miss_n, _ne_n = _font_help_names(j)
+        _miss_n, _ne_n, _bad_n = _font_help_names(j)
         _need += _miss_n
         _need += [n for n in _ne_n
                   if font_check.uses_system_glyphs(n) and not font_check.is_installed(n)]
@@ -4212,11 +4418,28 @@ def font_help_text(jobs) -> str:
             "4) 装完这里会自动按新字体重判（想再判一遍就点「✅ 已装好，重新检查」）。",
             "",
         ]
-    elif _n_tip:
+    elif _n_tip and not _has_bad:
         lines += [
             "要补的字体：没有。",
             "上面这些本机都装了 —— 中文用系统字形打印，西文用内置等价字形，"
             "直接打就行，不用再装一遍字体。",
+            "",
+        ]
+    if _has_bad:
+        # 2026-11-25 现场：整篇 docx 的字体名都是「黑体;黑体」这种，Word 全量回落宋体。
+        # 2026-11-25 追加：converter._prepare_office_src 在转换前会把副本里的名字修成单名，
+        # 所以这里的主语从「你必须自己去 Word 里改」改成「打印已经替你改好了，源文件仍是坏的」。
+        lines += [
+            "字体名写坏了怎么办",
+            "· 打印不受影响：转换前本工具会在临时副本上把这些名字修成单名"
+            "（黑体;黑体 → 黑体）再交给 Word，纸面按正确字体渲染；你的源文件不会被改动。",
+            "· 但这种名字是别的软件生成 docx 时写坏的：正常 Word 只写单个字体名（「黑体」），"
+            "不会写成「黑体;黑体」。别的软件/别的电脑打开这份文件时，仍会整篇回落默认字体 —— "
+            "本机实测不修直接用 Word 转，整篇都变成了宋体。",
+            "· 「⧉ 复制字体名」不会列出这些写坏的名字（不存在这个名字的字体，装了也匹配不上）；"
+            "真正要装的是上面「本机没装」里那些，修好之后它们才是文档实际要用的字体。",
+            "· 想把源文件也彻底修好：打开这份 docx → 全选（Ctrl+A）→ 在字体框里重选一次字体 → "
+            "另存；或让对方用 Word 重新导出。",
             "",
         ]
     lines += [
@@ -4279,7 +4502,8 @@ class FontHelpDialog(QDialog):
     def _all_names(self) -> list:
         out: list = []
         for job in self._jobs:
-            miss, ne = _font_help_names(job)
+            miss, ne, _bad = _font_help_names(job)
+            # 写坏的名字（`黑体;黑体`）刻意不进复制清单：搜出来也没有「对得上名字」的字体可装
             for n in list(miss) + list(ne):
                 if n not in out:
                     out.append(n)
@@ -4314,6 +4538,8 @@ class FontHelpDialog(QDialog):
                 job.missing_fonts = [str(x) for x in (rep.get("missing") or []) if str(x).strip()]
                 job.nonembedded_fonts = [str(x) for x in (rep.get("nonembedded") or [])
                                          if str(x).strip()]
+                job.bad_font_names = [str(x) for x in (rep.get("bad_font_names") or [])
+                                      if str(x).strip()]
                 job.font_checked = True
                 job.font_fp = fp
             except Exception:
@@ -4377,15 +4603,21 @@ class FontHelpDialog(QDialog):
             _left = self._refresh_reports()
             _left_missing = sorted({n for j in _left for n in _font_help_names(j)[0]})
             _left_ne = sorted({n for j in _left for n in _font_help_names(j)[1]})
+            _left_bad = sorted({n for j in _left for n in _font_help_names(j)[2]})
             if _left_missing:
                 msg.append("重判结果：仍缺 " + "、".join(_left_missing)
                            + "（本机还是没装到这几个，或者是改名的冒牌字体）")
-            else:
+            elif not _left_bad:
                 msg.append("重判结果：这批文件不再缺字体了 ✓")
             if _left_ne:
                 msg.append("仍会列在「PDF 生成时没嵌进字形」里的：" + "、".join(_left_ne)
                            + " —— 那是文件本身没带字形，装不装都改不了；"
                              "本机装了就用系统字形打印，纸面跟原件一致。")
+            if _left_bad:
+                msg.append("仍会列在「文件里的字体名写坏了」里的：" + "、".join(_left_bad)
+                           + " —— 那是文件自己写坏的名字，装字体改不了；"
+                             "打印时会自动修正副本再转换，源文件仍是坏的；"
+                             "要改只能在 Word 里全选重设一次字体后另存。")
         self.status.setText(msg[0])
         self.view.appendPlainText("")
         self.view.appendPlainText("── 安装结果 ──")
@@ -4875,7 +5107,7 @@ class PrintWorker(QThread):
             # 出纸核对没通过（队列没排空/卡纸/缺纸）：纸数本身不确定，先让人数清
             text = f"⚠ {warn}\n\n" + text
         # ⚠ 这里绝不能重置 `_flip_continue`、也不能 clear 事件：翻纸窗的「▶ 继续打第 2 趟」
-        # 按时间闸门（硬规矩 12）在这个函数**之前**就已经可点 —— 操作员的回答会比它先到。
+        # 早在放行比例解锁那一刻就可点（2026-11-25 起先灰后亮）—— 操作员的回答会比它先到。
         # 2026-11-10 现场：14:54:13 点了「继续」，本函数立刻把回答抹成 False，而事件已被
         # set ⇒ wait() 秒返回、按「跳过」处理：纸刚出槽就被判成半成品（日志里
         # 「⏸ 等待人工翻纸」紧接「⚠ 本批是半成品」）。
@@ -7591,8 +7823,9 @@ class ConvertWorker(QThread):
                 # ⚠ 云端来源默认在上一行就被挡住（S1-04）：走 else 分支交给
                 #   converter.convert(from_cloud=True) ⇒ LibreOffice，绝不给 Word/WPS 机会。
                 #   只有「管理员自打 + 管理员上传」才会带 allow_cloud_com 进来。
-                # 直接以 MD5 命名存入 pdf_cache（docx 缓存 key 含引擎后缀，防止 WPS 文档
-                # 被 Word 引擎转换的错误 PDF 被复用；若无 MD5 则用临时文件）
+                # 直接以 MD5 命名存入 pdf_cache（`.doc` / `.docx` 缓存 key 含引擎后缀：防止
+                # WPS 文档（含 WPS 生成的 .doc 页脚文本框页码）被 Word 引擎转换的错误 PDF 被复用；
+                # 若无 MD5 则用临时文件）
                 if self._source_md5:
                     # 引擎后缀判定统一走 cache_engine_for（与读侧/索引侧同一口径）
                     _eng_key = cache_engine_for(self._file_path, self._engine)
@@ -7740,9 +7973,11 @@ class StageFilesWorker(QThread):
 
     def run(self) -> None:
         try:
-            from converter import _read_docx_last_editor, get_available_engines
+            # .doc / .docx 都要看「谁生成的」再选引擎：WPS 生成的 .doc 页码是页脚文本框，
+            # Word 渲染会丢后面的位数（2026-11-25 现场：12/13 → 1），必须走 WPS。
+            from converter import _read_office_last_editor, get_available_engines
         except Exception:                  # 引擎探测不可用 ⇒ 一律按 word（与旧行为一致）
-            _read_docx_last_editor = None
+            _read_office_last_editor = None
             get_available_engines = None
         available = None
         engines_probed = False
@@ -7804,7 +8039,7 @@ class StageFilesWorker(QThread):
                         available = get_available_engines() or {}
                         engines_probed = True
                     try:
-                        editor = _read_docx_last_editor(work_path) if ext == ".docx" else None
+                        editor = _read_office_last_editor(work_path) if _read_office_last_editor else None
                     except Exception:
                         editor = None
                     preferred = "wps" if editor == "wps" else "word"
@@ -9411,6 +9646,7 @@ class MainWindow(QMainWindow):
                     _job.font_fp = ""
                     _job.missing_fonts = []
                     _job.nonembedded_fonts = []
+                    _job.bad_font_names = []
         except Exception:
             logger.debug("清空 cached_pdf 失败", exc_info=True)
         return True
@@ -13538,9 +13774,11 @@ class MainWindow(QMainWindow):
     def _font_tip_blocks(self, job) -> list:
         """行 tooltip 里"字体"那几段（纯字符串、不碰控件 ⇒ 验收可以直接跑）。
 
-        两种"缺"分开写，各自给「原因 + 后果 + 怎么办」：
+        三类"缺"分开写，各自给「原因 + 后果 + 怎么办」：
         · 本机没装   → 装字体能救（装上再右键「🔄 重新转换」，提示就没了）
         · PDF 没嵌入 → 装字体救不了（字形不在文件里，只能让生成方重导带字形的 PDF）
+        · 名字写坏了 → 装「这个名字」的字体救不了；但转换前会在副本上修成单名，
+                       纸面按修好后的字体渲染，源文件仍是坏的
         2026-11-01 现场反馈：原来一句话把两者混成"没嵌入这些字体"，用户既不知道
         该去装字体还是该找生成方，也不知道装字体到底有没有用。
         2026-11-02 现场：装了字体、把文件重新添加一遍提示照旧（转换缓存与字体指纹都命中）
@@ -13550,6 +13788,8 @@ class MainWindow(QMainWindow):
             str(x) for x in (getattr(job, "missing_fonts", []) or []) if str(x).strip()))
         _ne = list(dict.fromkeys(
             str(x) for x in (getattr(job, "nonembedded_fonts", []) or []) if str(x).strip()))
+        _bad = list(dict.fromkeys(
+            str(x) for x in (getattr(job, "bad_font_names", []) or []) if str(x).strip()))
         blocks = []
         if _ne:
             # 2026-11-18 现场：装好 SimSun 后 tooltip 照旧说「没装 ⇒ 用内置字形代替」，
@@ -13598,6 +13838,23 @@ class MainWindow(QMainWindow):
                   "装上后在那里面点「已装好，重新检查」，或右键 → 🔄 重新转换。\n"
                   "注意：几十 KB 的字体多半是从 PDF 里抽出来的子集（只含那份文件用到的字），"
                   "或干脆是别的字体改名冒充的 —— 装上也救不了别的文件。")
+        if _bad:
+            # 第三类（2026-11-25）：名字本身就被写坏了，装「黑体;黑体」这个字体永远救不了 ——
+            # 必须跟「本机没装」分开说，否则用户会照着名字去搜这个不存在的字体，装完告警还挂着。
+            # 2026-11-25 追加：转换前 converter 会在副本上修成单名，纸面不再回落；源文件仍坏的。
+            blocks.append(
+                "⚠ 文件里的字体名写坏了（打印时会自动修正副本）：\n"
+                + "\n".join(f"· {n}" for n in _bad[:8])
+                + ("\n…" if len(_bad) > 8 else "")
+                + "\n这是生成 docx 的软件写进去的：正常 Word 只写单个字体名（「黑体」），"
+                  "不会写成「黑体;黑体」。\n"
+                  "打印时本工具会先在副本上把它修成「黑体」再交给 Word，纸面不受影响；"
+                  "源文件本身仍是坏的，别的软件打开可能整篇回落默认字体"
+                  "（本机实测不修直接用 Word 转 ⇒ 整篇宋体）。\n"
+                  "装「黑体;黑体」这个名字的字体救不了（不存在这个名字）；要装的是修好后的「黑体」，"
+                  "本机没装时请按上面「本机没装」那条补。\n"
+                  "想彻底修好源文件：打开这份 docx → 全选（Ctrl+A）→ 字体框里重选一次字体 → 另存，"
+                  "再重新加进来；或让对方用 Word 重新导出。")
         return blocks
 
     def _queue_font_checks(self, jobs: list, tab_key: str = "") -> None:
@@ -13647,6 +13904,7 @@ class MainWindow(QMainWindow):
                 job.font_checked = True
                 job.missing_fonts = []
                 job.nonembedded_fonts = []
+                job.bad_font_names = []
                 job.font_fp = fp
                 continue
             if getattr(job, "font_checked", False) and getattr(job, "font_fp", "") == fp:
@@ -13684,17 +13942,23 @@ class MainWindow(QMainWindow):
         w.start()
 
     def _on_font_checked(self, file_path: str, missing: list, fp: str,
-                         nonembedded: list | None = None) -> None:
+                         nonembedded: list | None = None,
+                         bad_names: list | None = None) -> None:
         """后台查完一份 → 回写任务对象，**只重画受影响的那一行**（整表重建会丢选区）。
 
         `nonembedded`：PDF 里没有字形数据的字体 —— 这时"缺"不是本机没装，而是文件没嵌入，
         打印时只能被替换（查看器有东方字体包所以屏幕上正常）。日志要分开说，别让人误以为
         装了字体就能解决。
+        `bad_names`：文件里字体名被写成列表（`黑体;黑体`）—— Word 认不出、回落默认字体；
+        转换前 converter 会在副本上修成单名，所以纸面不受影响，但装「黑体;黑体」这个名字的
+        字体救不了。只提示、不拦截（2026-11-25）。
         """
         try:
             # 注意：这里不能拿 missing ∩ nonembedded 当"未嵌入"清单 —— 字体装上了 missing 就空了，
             # 可"文件没嵌入"这件事照样成立（2026-11-01 现场：STSong 已装，PDF 仍未嵌入）。
             _ne_names = [str(x) for x in (nonembedded or []) if str(x).strip()]
+            _bad_names = [str(x) for x in (bad_names or []) if str(x).strip()]
+            _dropped: list = []      # 因字体名写坏而作废旧缓存 PDF 引用的文件（下面记日志）
             hits = []
             for key, tab in (self._config.tabs or {}).items():
                 for idx, job in enumerate(getattr(tab, "jobs", None) or []):
@@ -13704,6 +13968,10 @@ class MainWindow(QMainWindow):
                     # （装字体也救不了）—— tooltip 要按这两条分别说话，混在一起就有歧义。
                     job.missing_fonts = [str(x) for x in (missing or []) if str(x).strip()]
                     job.nonembedded_fonts = [str(x) for x in (nonembedded or []) if str(x).strip()]
+                    job.bad_font_names = [str(x) for x in (bad_names or []) if str(x).strip()]
+                    # 旧版本按「回落字体」转出来的缓存 PDF 不能再用（见 drop_stale_pdf_…）
+                    if drop_stale_pdf_for_broken_fonts(job):
+                        _dropped.append(job)
                     job.font_checked = True
                     job.font_fp = fp or ""
                     if key == self._current_tab:
@@ -13725,6 +13993,15 @@ class MainWindow(QMainWindow):
                 _more = f" 等 {len(_miss_only)} 种" if len(_miss_only) > 5 else ""
                 self._log(f"🖋 {_name} 用到本机没有的字体：{_names}{_more}"
                           "（转换/打印会被相近字体替换，装上字体后重新添加文件即可）")
+            if _bad_names:
+                _names = "、".join(_bad_names[:5])
+                _more = f" 等 {len(_bad_names)} 种" if len(_bad_names) > 5 else ""
+                self._log(f"🖋 {_name} 文件里的字体名写坏了：{_names}{_more}"
+                          "（Word 认不出这种名字；打印时会自动修正副本，源文件仍是坏的，"
+                          "只提示不拦打印。要改就在 Word 里全选重设字体后另存）")
+            for _job in _dropped:
+                self._log(f"♻ {os.path.basename(_job.file_path)} 的缓存 PDF 是旧字体名写坏时"
+                          "转出来的（整篇回落字体），已作废 —— 下次打印会按修正后的副本重转")
         except Exception:
             logger.debug("字体检出回写失败", exc_info=True)
 
@@ -13809,6 +14086,7 @@ class MainWindow(QMainWindow):
         # [(显示名, 要提醒的字体名列表, 是不是 PDF, 其中没嵌入的字体名小写集合)]
         entries: list = []
         _settled: list = []     # 没带字形但本机装着：不拦，放行时只记一行日志
+        _broken: list = []      # 字体名写坏了（装这个名字的字体救不了）⇒ 只记日志，不拦
         for job in (flat_jobs or []):
             path = getattr(job, "file_path", "") or ""
             if not path:
@@ -13818,8 +14096,16 @@ class MainWindow(QMainWindow):
             if need:
                 try:
                     if font_check.checkable(path):
-                        job.missing_fonts = list(
-                            font_check.check_file(path).get("missing") or [])
+                        _rep = font_check.check_file(path)
+                        job.missing_fonts = list(_rep.get("missing") or [])
+                        # 写坏的字体名也要顺手回写（它不属于「缺」，但详情窗/行 tooltip 要显示）
+                        job.bad_font_names = [str(x) for x in (_rep.get("bad_font_names") or [])
+                                              if str(x).strip()]
+                        # 旧版本按回落字体转出来的缓存 PDF 不能拿去打（否则界面说「自动修正」、
+                        # 纸面仍是宋体）⇒ 清掉引用，PrintWorker 会按修好的副本现转一次。
+                        if drop_stale_pdf_for_broken_fonts(job):
+                            self._log(f"♻ {job.display_name or os.path.basename(path)} 的缓存 PDF "
+                                      "是旧字体名写坏时转的，已作废，本次会按修正后的副本重转")
                 except Exception:
                     logger.debug("打印前字体检查失败: %s", path, exc_info=True)
                 job.font_checked = True
@@ -13845,13 +14131,23 @@ class MainWindow(QMainWindow):
                 str(x).strip() for x in (getattr(job, "missing_fonts", []) or [])
                 if str(x).strip()))
             _ne_bad = [n for n in _ne_names if not font_check.is_installed(n)]
+            _bad_names = [str(x).strip() for x in (getattr(job, "bad_font_names", []) or [])
+                          if str(x).strip()]
             _show = list(dict.fromkeys(_missing_fonts + _ne_bad))
             if not _show:
                 if _ne_names:
                     _settled.append(job.display_name or os.path.basename(path))
+                if _bad_names:
+                    # 名字被写坏 ⇒ Word 认不出。转换前会修副本，拦下来也没意义
+                    # （拦了 Word 照样能打），所以只记一行日志，不进 entries。
+                    _broken.append(job.display_name or os.path.basename(path))
                 continue
             # 用 list 而不是按显示名做 key：同名文件（两个「作业(1).docx」）不许互相顶掉
             entries.append((job.display_name or os.path.basename(path), _show, _is_pdf, _ne))
+        for _name in _broken:
+            self._log("ℹ " + str(_name) + "：文件里的字体名写坏了（如 黑体;黑体），"
+                      "Word 认不出；打印时会自动修正副本，不拦打印。"
+                      "要改就在 Word 里全选重设字体后另存。")
         if not entries:
             for _name in _settled:
                 self._log("ℹ " + str(_name) + "：PDF 没把字体嵌进文件，但本机装着"
@@ -13935,8 +14231,9 @@ class MainWindow(QMainWindow):
         name_item.setToolTip(_tip)
         _miss = list(getattr(job, "missing_fonts", []) or [])        # 本机没装：装上就能救
         _ne = list(getattr(job, "nonembedded_fonts", []) or [])      # 文件没嵌入：装字体救不了
+        _bad = list(getattr(job, "bad_font_names", []) or [])        # 名字写坏了：装这个名字也救不了
         try:
-            _ne_all_ok = bool(_ne) and not _miss and all(
+            _ne_all_ok = bool(_ne) and not _miss and not _bad and all(
                 font_check.is_installed(str(n)) for n in _ne if str(n).strip())
         except Exception:
             _ne_all_ok = False
@@ -13946,11 +14243,13 @@ class MainWindow(QMainWindow):
             # 文件名照常显示（不加标记，免得又像"缺字体"），说明只留在 tooltip 里。
             name_item.setText(display)
             name_item.setToolTip(_tip + "\n\n" + "\n\n".join(self._font_tip_blocks(job)))
-        elif _miss or _ne:
+        elif _miss or _ne or _bad:
             # 只提示、不拦：真正的拦截放在打印前（_font_gate 弹一次确认）—— 行上标黄是为了
             # 让操作员在点「开始打印」之前就看见，而不是打完才发现字形不对。
-            # 这里**不读文件**（每行都查会拖慢整表重画）：结论全部来自后台线程回写的两个字段。
-            # 文案见 _font_tip_blocks：两种"缺"分两段写，各自说清「怎么办」。
+            # 这里**不读文件**（每行都查会拖慢整表重画）：结论全部来自后台线程回写的字段。
+            # 文案见 _font_tip_blocks：三类"缺"分段写，各自说清「怎么办」。
+            # 2026-11-25：_bad（`黑体;黑体` 这种写坏的名字）也要标黄 —— 转换前虽会修副本，
+            # 但源文件仍是坏的、别处打开会回落默认字体，操作员得在开打前知道。
             name_item.setText(f"⚠️ {display}")
             name_item.setToolTip(_tip + "\n\n" + "\n\n".join(self._font_tip_blocks(job)))
             _bg, _fg = self._font_theme_colors()
@@ -15383,9 +15682,11 @@ class MainWindow(QMainWindow):
 
         判定方式：按**新引擎**重算一次缓存文件名 ——
         · 与旧 `cached_pdf` 同名 ⇒ 新引擎的下一次缓存查询会直接命中这份旧产物，必须删文件
-          （`.doc`、LibreOffice、图片、表格都是"一份源文件一个 key"，不带引擎身份）；
-        · 不同名 ⇒ `.docx` 的 `_eword`/`_ewps` 分引擎缓存。只清引用、留文件：切回原引擎
-          时还能直接命中，不必再开一次 Word/WPS。
+          （LibreOffice、图片、表格是"一份源文件一个 key"，不带引擎身份）；
+        · 不同名 ⇒ `.doc` / `.docx` 的 `_eword`/`_ewps` 分引擎缓存。只清引用、留文件：切回
+          原引擎时还能直接命中，不必再开一次 Word/WPS。
+        （2026-11-25 前 `.doc` 属于上面那类"不带引擎身份"的；现在它也按引擎隔离 ——
+        WPS 生成的 .doc 页码是页脚文本框，Word 渲染会丢数字。）
         算不出 key（没有 MD5 / 路径异常）时按"会命中"处理 —— 宁可多转一次，也不能把旧引擎
         的排版当成新引擎的产物打出去。
         """
@@ -15518,7 +15819,8 @@ class MainWindow(QMainWindow):
             # 下载好的字体文件也要能直接装 —— 手动装字体是最容易出岔子的一步（UAC/HKCU）。
             _fh_rows = [r for r in rows if r < len(_jobs_now)
                         and (getattr(_jobs_now[r], "missing_fonts", None)
-                             or getattr(_jobs_now[r], "nonembedded_fonts", None))]
+                             or getattr(_jobs_now[r], "nonembedded_fonts", None)
+                             or getattr(_jobs_now[r], "bad_font_names", None))]
             font_help_action = menu.addAction(
                 f"🖋 字体缺失详情（{len(_fh_rows)} 个文件）" if len(_fh_rows) > 1
                 else "🖋 字体缺失详情…")
@@ -15855,6 +16157,7 @@ class MainWindow(QMainWindow):
                 blank_tail_optout=bool(getattr(job, 'blank_tail_optout', False)),
                 missing_fonts=list(getattr(job, 'missing_fonts', []) or []),
                 nonembedded_fonts=list(getattr(job, 'nonembedded_fonts', []) or []),
+                bad_font_names=list(getattr(job, 'bad_font_names', []) or []),
                 font_checked=bool(getattr(job, 'font_checked', False)),
                 # 字体指纹照抄：换了系统字体后指纹对不上会自动重查（见 font_check.py）
                 font_fp=getattr(job, 'font_fp', ''),
@@ -17543,6 +17846,7 @@ class MainWindow(QMainWindow):
             job.font_fp = ""
             job.missing_fonts = []
             job.nonembedded_fonts = []
+            job.bad_font_names = []
             try:
                 self._fill_table_row(row, job)   # 先把 ⚠ 擦掉，重查出来会再亮
             except Exception:
@@ -20087,6 +20391,7 @@ class MainWindow(QMainWindow):
             else:
                 dlg.show()
             self._place_resident_window(dlg)
+            _fit_resident_window_on_screen(dlg)      # 已被拖到够不着的位置 ⇒ 下次显示拉回来
             dlg.raise_()
             dlg.activateWindow()
             QApplication.alert(self, 0)          # 任务栏闪烁，叫回操作员
@@ -20101,6 +20406,10 @@ class MainWindow(QMainWindow):
         脱离 owner 后系统不再按父窗口帮我们摆位，不摆的话它会落在屏幕左上角/系统默认位置，
         看起来像「程序乱弹窗」。主窗口收在托盘里（不可见）时不动它 —— 没有可参照的中心，
         硬摆反而会把它抖到别的屏幕上。
+
+        ⚠ 摆完必须夹进屏幕（_fit_resident_window_on_screen）：主窗口靠上/比屏幕还高时，
+        中心减半个窗高算出来的 y 是负数，标题栏会被推到屏幕外 —— 窗口看着像无边框，而且
+        拖不动（原生窗口只有标题栏能拖）。2026-11-24 现场就是这么来的。
         """
         if getattr(dlg, "_hn_placed", False):
             return
@@ -20111,6 +20420,7 @@ class MainWindow(QMainWindow):
             fg = dlg.frameGeometry()
             dlg.move(owner_geo.center().x() - fg.width() // 2,
                      owner_geo.center().y() - fg.height() // 2)
+            _fit_resident_window_on_screen(dlg)
             dlg._hn_placed = True
         except Exception:
             pass
@@ -21666,6 +21976,7 @@ class MainWindow(QMainWindow):
             else:
                 dlg.show()
             self._place_resident_window(dlg)
+            _fit_resident_window_on_screen(dlg)      # 已被拖到够不着的位置 ⇒ 下次显示拉回来
             if activate:
                 dlg.raise_()
                 dlg.activateWindow()
@@ -26851,23 +27162,25 @@ class MainWindow(QMainWindow):
         engine = "word"
         cache_engine = ""
         if ext in (".doc", ".docx") and task.local_path:
-            from converter import _read_docx_last_editor, get_available_engines
+            from converter import _read_office_last_editor, get_available_engines
             available = get_available_engines()
-            editor = _read_docx_last_editor(task.local_path) if ext == ".docx" else None
+            # .doc 也按作者程序选引擎（WPS 生成的页脚文本框页码，Word 会丢数字）
+            editor = _read_office_last_editor(task.local_path)
             preferred = "wps" if editor == "wps" else "word"
             for eng in ([preferred] + [e for e in ["word","wps","libreoffice"] if e != preferred]):
                 if available.get(eng, False): engine = eng; break
-            # 引擎后缀判定统一走 cache_engine_for（仅 .docx + word/wps 才加后缀）
+            # 引擎后缀判定统一走 cache_engine_for（.doc / .docx + word/wps 才加后缀）
             cache_engine = cache_engine_for(task.file_name, engine)
 
-        # 1. 检查 PDF 缓存（MD5 索引；图片按方向、docx 按转换引擎分开缓存）
+        # 1. 检查 PDF 缓存（MD5 索引；图片按方向、Word 文档按转换引擎分开缓存）
         #
         # ⚠ 2026-10-28 修的真实缺陷（现场 HN20261028-0002 撞上）：放行 COM 的文件**不能**采纳
-        #   一份"引擎身份不明"的缓存 —— 页数分析路径恒用 LibreOffice 转换，且历史上会把
-        #   `.doc` 的产物写进打印缓存（`.doc` 的 `cache_engine_for()` 恒返回 ""，不带引擎后缀），
-        #   于是打印侧算出的 key 与它完全相同 ⇒ 永远命中那份 LO PDF ⇒ 管理员例外对 `.doc`
-        #   结构性失效（勾了自打也不会走 Word/WPS）。现在：分析路径不再写 Office 缓存，
-        #   且放行 COM + 无引擎后缀时**忽略缓存、重新转换**（见 _start_convert_worker）。
+        #   一份"引擎身份不明"的缓存 —— 页数分析路径恒用 LibreOffice 转换，历史上会把
+        #   `.doc` 的产物写进打印缓存（当时 `.doc` 的 `cache_engine_for()` 恒返回 ""，
+        #   不带引擎后缀），于是打印侧算出的 key 与它完全相同 ⇒ 永远命中那份 LO PDF ⇒
+        #   管理员例外对 `.doc` 结构性失效（勾了自打也不会走 Word/WPS）。2026-11-25 起
+        #   `.doc` 也按引擎隔离（`cache_engine_for` 返回 `_eword`/`_ewps`），这个洞被结构性地
+        #   堵上：下面那个闸门只剩"算不出引擎身份"的窄情形才触发。
         _com_allowed = cloud_word_com_allowed(getattr(task, 'uploader_is_admin', False))
         _cache_identity_known = bool(cache_engine)
         _skip_cache_for_com = (_com_allowed and ext in (".doc", ".docx")

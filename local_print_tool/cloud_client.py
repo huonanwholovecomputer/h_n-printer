@@ -184,15 +184,21 @@ def order_status_label_cn(status) -> str:
 
 
 _CACHE_ENGINE_SUFFIXABLE = ("word", "wps")
+# 哪些扩展名的 PDF 产物随引擎变化、缓存 key 必须带引擎身份。
+# 2026-11-25 把 `.doc` 也纳入：WPS 生成的 `.doc` 页码是页脚文本框，Word 渲染会把
+# 「12/13」打成一个「1」（实测同一份 `计科2504朱佳琳.doc`：WPS 版 12/13、Word 版 1/1）
+# ⇒ `.doc` 的渲染**不是**与引擎无关，必须像 `.docx` 一样按引擎隔离，否则改了引擎
+# （或识别出作者是 WPS）之后仍会命中旧 Word 产物。
+_CACHE_ENGINE_ISOLATED_EXTS = (".doc", ".docx")
 
 
 def cache_engine_for(source_ext_or_path: str, engine: str) -> str:
     """缓存 key 的引擎后缀判定 —— 写侧 / 读侧 / 打印侧的**唯一**口径。
 
-    规则：**仅 `.docx` 且引擎 ∈ {word, wps}** 才返回引擎名（key 里加 `_e{engine}`），
-    其余一律返回 ""。理由：docx 的渲染结果随引擎变化（WPS 特殊布局被 Word 渲染会出错），
-    必须按引擎隔离缓存；而非 docx 文件的渲染与引擎无关，加后缀只会让同一个文件在写侧与
-    读侧算出不同的键。
+    规则：**`.doc` / `.docx` 且引擎 ∈ {word, wps}** 才返回引擎名（key 里加 `_e{engine}`），
+    其余一律返回 ""。理由：这两种格式的渲染结果随引擎变化（docx 的 WPS 特殊布局、
+    `.doc` 的 WPS 页脚文本框页码都会被 Word 渲染错），必须按引擎隔离缓存；
+    图片/PDF/TXT 的渲染与引擎无关，加后缀只会让同一个文件在写侧与读侧算出不同的键。
 
     这个函数存在的意义就是**杜绝判定漂移**：原先三处各写各的 ——
     写侧 `gui.py::_start_convert_worker` 只看 `job.engine`，读侧与打印侧却还看扩展名，
@@ -201,11 +207,16 @@ def cache_engine_for(source_ext_or_path: str, engine: str) -> str:
     （每次都要重新转换），云端下载的（无后缀）却能命中 —— 正好解释"云端不反复转换、
     本地拖入才反复转换"的分裂现象。
 
+    ⚠ 2026-11-25 起 `.doc` 也带后缀：升级前按纯 MD5 落盘的 `.doc` 缓存不再命中
+    （那正是"引擎身份不明"的旧产物），下次会按识别出的引擎重转一次，旧文件由保留期
+    清理回收。这比继续复用一份不知道谁转的 PDF 划算。
+
     参数可传路径或裸扩展名（`".docx"` / `"a.docx"` / `"D:/x/a.docx"` 均可）。
     """
     s = str(source_ext_or_path or "")
     ext = s.lower() if s.startswith(".") else os.path.splitext(s)[1].lower()
-    return engine if (ext == ".docx" and engine in _CACHE_ENGINE_SUFFIXABLE) else ""
+    return engine if (ext in _CACHE_ENGINE_ISOLATED_EXTS
+                      and engine in _CACHE_ENGINE_SUFFIXABLE) else ""
 
 
 def pdf_cache_key(source_md5: str, image_orientation: str = "", engine: str = "") -> str:
@@ -2133,11 +2144,11 @@ class CloudClient(QObject):
             return
 
         # 若后端已提供 source_md5 且本地 PDF 缓存已命中，跳过下载（图片按方向后缀分开缓存）。
-        # docx 除外：转换引擎取决于文档内容（last editor），未下载无法确定 → 一律下载后判断，
-        # 避免命中旧引擎（如 Word 渲染 WPS 特殊布局）的错误缓存。
+        # `.doc` / `.docx` 除外：转换引擎取决于文档内容（作者程序），未下载无法确定 → 一律
+        # 下载后判断，避免命中旧引擎（如 Word 渲染 WPS 页脚文本框页码）的错误缓存。
         if task.source_md5:
             _dl_ext = os.path.splitext(task.file_name)[1].lower()
-            if _dl_ext != ".docx":
+            if _dl_ext not in _CACHE_ENGINE_ISOLATED_EXTS:
                 cached_pdf, cached_meta = self._get_cached_pdf(task.source_md5, task.image_orientation)
                 if cached_pdf:
                     # D5 第 9 条：共享缓存会被保留期清理/放弃订单删掉 ⇒ 先复制成任务自持的
@@ -2437,15 +2448,15 @@ class CloudClient(QObject):
     def _infer_cache_engine(path: str, ext: str) -> str:
         """页数分析路径推断缓存用的引擎后缀（与 GUI 侧 cache_engine_for 同一规则）。
 
-        仅 `.docx` 才可能非空：读 docx 的 last editor → 优先同名引擎，取其可用者。
-        非 docx、读不出 editor、或 word/wps 都不可用 → 返回 ""（等于不按引擎隔离，
-        与 GUI 侧 engine="libreoffice" 时的结果一致）。
+        仅 `.doc` / `.docx` 才可能非空：读作者程序（.docx 看 last editor，.doc 扫
+        作者标记）→ 优先同名引擎，取其可用者。其余格式、读不出作者、或 word/wps 都不可用
+        → 返回 ""（等于不按引擎隔离，与 GUI 侧 engine="libreoffice" 时的结果一致）。
         """
-        if ext != ".docx" or not path:
+        if ext not in _CACHE_ENGINE_ISOLATED_EXTS or not path:
             return ""
         try:
-            from converter import _read_docx_last_editor, get_available_engines
-            editor = _read_docx_last_editor(path)
+            from converter import _read_office_last_editor, get_available_engines
+            editor = _read_office_last_editor(path)
             available = get_available_engines()
             preferred = "wps" if editor == "wps" else "word"
             for eng in [preferred] + [e for e in _CACHE_ENGINE_SUFFIXABLE if e != preferred]:
@@ -2456,7 +2467,7 @@ class CloudClient(QObject):
         return ""
 
     def _materialize_cached_file(self, task, cached_pdf: str, cached_meta: dict | None) -> str | None:
-        """把缓存命中的**共享** PDF 复制成**任务自持**的暂存文件；成功返回副本路径并保持
+        r"""把缓存命中的**共享** PDF 复制成**任务自持**的暂存文件；成功返回副本路径并保持
         `staging.reserve`（调用方挂到 `task.local_path` 后必须 `staging.unreserve`），
         失败返回 None 让调用方回退共享缓存本体。
 
@@ -2578,17 +2589,21 @@ class CloudClient(QObject):
         self._schedule_cache_cleanup()
 
     def _purge_stale_engine_entries(self, index: dict) -> int:
-        """清理「非 docx 却带了 _eword/_ewps 引擎后缀」的历史脏条目（🔴-A7 的产物）。
+        """清理「渲染与引擎无关的格式却带了 _eword/_ewps 引擎后缀」的历史脏条目（🔴-A7 的产物）。
 
-        这些条目是写侧判定漂移时写下的：读侧只对 .docx 加引擎后缀 ⇒ 永远查不到它们，
+        这些条目是写侧判定漂移时写下的：读侧只对 Word 格式加引擎后缀 ⇒ 永远查不到它们，
         纯占空间。与保留时长无关（命中即删），故不放在过期循环里。
+
+        ⚠ 2026-11-25：`.doc` 也成了「按引擎隔离」的格式（见 `cache_engine_for`），
+        它的 `_eword`/`_ewps` 条目是**正常**的，不能当脏数据删。
         """
         removed = 0
         for key, meta in list(index.items()):
             if not isinstance(meta, dict):
                 continue
             src_ext = str(meta.get("source_ext", "")).lower()
-            if src_ext and src_ext != ".docx" and key.endswith(("_eword", "_ewps")):
+            if (src_ext and src_ext not in _CACHE_ENGINE_ISOLATED_EXTS
+                    and key.endswith(("_eword", "_ewps"))):
                 pdf_path = os.path.join(self._cache_dir, f"{key}.pdf")
                 try:
                     if os.path.isfile(pdf_path):
@@ -2677,10 +2692,13 @@ class CloudClient(QObject):
         文件打印时走 Word/WPS，分析若仍用 LibreOffice，回报的页数就可能与实际排出来的不符（页数是
         文件级事实，计费与页数展示直接采用）。缺字段（旧后端）一律 False ⇒ 仍强制 LO。"""
         ext = os.path.splitext(file_name)[1].lower()
-        # `.doc` 的缓存 key 不带引擎身份（`cache_engine_for()` 恒返回 ""）：放行 COM 时打印侧会
-        # 刻意忽略这种"身份不明"的缓存重新转换（gui `_skip_cache_for_com`），分析侧必须同一口径 ——
-        # 否则会拿旧版 LibreOffice 产物的页数去回报。`.docx` 的 key 带引擎后缀，可正常命中。
-        _skip_cache_for_com = (bool(allow_cloud_com) and ext == ".doc")
+        # `.doc` / `.docx` 的缓存 key 带引擎身份（`cache_engine_for`）。分析侧要**先下载**才能
+        # 按内容推断引擎（`_infer_cache_engine`），所以：
+        #   ① 下载前的"按云端 MD5 免下载"捷径对这两类一律不走（`.docx` 里写的内容决定引擎，
+        #      光有 MD5/文件名判断不了）；
+        #   ② 下载后若仍推断不出引擎（`_eng` 为空），算出来的键与打印侧必然不同 ⇒ 跳过既有
+        #      缓存、按平台默认重转一次，绝不拿身份不明的旧产物页数去回报。
+        _cache_engine = ""
         temp_dl: str = ""
         temp_pdf: str | None = None
         # 新一轮分析开始：清掉可能残留的取消标记（取消后同一 file_id 可能被重新发起）
@@ -2691,9 +2709,9 @@ class CloudClient(QObject):
 
         try:
             # 0. 后端已带 MD5 → 先查 PDF 缓存，命中则跳过下载（本地按云端 MD5 直接命中）
-            #    docx 除外：转换引擎取决于文档内容（last editor），未下载无法确定 ⇒ 一律
-            #    下载后判断（与 _download_file_inner 同一设计，避免命中错引擎的缓存）。
-            if source_md5 and ext != ".docx" and not _skip_cache_for_com:
+            #    `.doc` / `.docx` 除外：转换引擎取决于文档内容（作者程序），未下载无法确定 ⇒
+            #    一律下载后判断（与 _download_file_inner 同一设计，避免命中错引擎的缓存）。
+            if source_md5 and ext not in _CACHE_ENGINE_ISOLATED_EXTS:
                 cached_pdf, cached_meta = self._get_cached_pdf(source_md5)
                 if cached_pdf and cached_meta:
                     from pdf_printer import get_pdf_info
@@ -2720,16 +2738,17 @@ class CloudClient(QObject):
             # 2. 计算源文件 MD5（后端未带 MD5 时的兜底），查缓存
             if not source_md5:
                 source_md5 = self._compute_md5_file(temp_dl)
-            # docx 的缓存按引擎隔离（与 GUI 侧同一口径 cache_engine_for）：此处从文件内容
-            # 推断引擎，非 docx / 推断不出则 ""。原先一律按无后缀查 ⇒ 永远命中不了打印侧
-            # 写的 _e{engine} 条目（每次分析都白跑一次完整转换）。
-            if _skip_cache_for_com:
+            # `.doc` / `.docx` 的缓存按引擎隔离（与 GUI 侧同一口径 cache_engine_for）：
+            # 此处从文件内容推断引擎（作者程序 → word/wps），与打印侧算出的键对齐。
+            # 推断不出（`_eng` 为空）而分析侧被放行 COM 时：跳过既有缓存重转，避免拿到
+            # 身份不明的产物（例如 WPS 生成的 .doc 命中 Word 转出来的、页码丢字的 PDF）。
+            _cache_engine = self._infer_cache_engine(temp_dl, ext)
+            if bool(allow_cloud_com) and ext in _CACHE_ENGINE_ISOLATED_EXTS and not _cache_engine:
                 self.status_message.emit(
-                    f"  → 上传者=管理员：跳过无引擎身份的既有缓存，重新转换 {file_name}")
+                    f"  → 上传者=管理员：推断不出缓存引擎身份，跳过既有缓存，重新转换 {file_name}")
                 cached_pdf, cached_meta = "", {}
             else:
-                _eng = self._infer_cache_engine(temp_dl, ext)
-                cached_pdf, cached_meta = self._get_cached_pdf(source_md5, "", _eng)
+                cached_pdf, cached_meta = self._get_cached_pdf(source_md5, "", _cache_engine)
 
             if cached_pdf and cached_meta:
                 # 缓存命中：直接统计页数

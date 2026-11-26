@@ -376,9 +376,15 @@ def _p_analysis_com(src):
 
 
 def _p_analysis_cache_guard(src):
-    """放行 COM 时 `.doc` 不采纳无引擎身份的既有缓存（与打印侧 _skip_cache_for_com 同口径）。"""
-    return ('_skip_cache_for_com = (bool(allow_cloud_com) and ext == ".doc")' in src
-            and 'if source_md5 and ext != ".docx" and not _skip_cache_for_com:' in src)
+    """放行 COM 时 `.doc` / `.docx` 不采纳「引擎身份不明」的既有缓存。
+
+    2026-11-25：`.doc` 也纳入隔离（WPS 生成的 .doc 页码是页脚文本框，Word 渲染会丢数字），
+    分析侧改为**下载后按内容推断引擎**再查缓存；推断不出且放行 COM ⇒ 跳过重转。
+    """
+    return ('if source_md5 and ext not in _CACHE_ENGINE_ISOLATED_EXTS:' in src
+            and '_cache_engine = self._infer_cache_engine(temp_dl, ext)' in src
+            and 'bool(allow_cloud_com) and ext in _CACHE_ENGINE_ISOLATED_EXTS and not _cache_engine' in src
+            and 'self._get_cached_pdf(source_md5, "", _cache_engine)' in src)
 
 
 # 日志去重（取消 / 收到任务 / 下载完成）不在本脚本，见 tests/verify_cloud_log_dedup.py
@@ -463,9 +469,9 @@ _mut = cc_src.replace("from_cloud=True, allow_cloud_com=bool(allow_cloud_com))",
 check("B10 分析侧不传 allow_cloud_com（退回\"页数分析永远走 LO\"）→ 判据变红",
       _mut != cc_src and not _p_analysis_com(_mut))
 
-_mut = cc_src.replace('_skip_cache_for_com = (bool(allow_cloud_com) and ext == ".doc")',
-                      '_skip_cache_for_com = False')
-check("B11 分析侧不跳过 .doc 无身份缓存（回报 LO 的页数）→ 判据变红",
+_mut = cc_src.replace('bool(allow_cloud_com) and ext in _CACHE_ENGINE_ISOLATED_EXTS and not _cache_engine',
+                      'bool(allow_cloud_com) and False and not _cache_engine')
+check("B11 分析侧不跳过「引擎身份不明」的缓存（回报错引擎的页数）→ 判据变红",
       _mut != cc_src and not _p_analysis_cache_guard(_mut))
 
 _mut = mp_wxml.replace('<text class="device-state',

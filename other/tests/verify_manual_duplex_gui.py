@@ -1106,7 +1106,8 @@ dlg.continue_requested.connect(lambda: evts.append("go"))
 dlg.skip_requested.connect(lambda: evts.append("skip"))
 
 dlg.announce("第 1 趟（现在打）：1 3 5\n第 2 趟（翻纸后打）：空白 4 2")
-check("① 批次开始：窗口立起来（常驻），按钮**当刻就可点**（第 1 趟打没打完由操作员说了算）",
+check("① 批次开始：窗口立起来（常驻），拿不到速度预估时按钮当刻就可点"
+      "（有预估则要到放行比例才解锁，见 ⑥c）",
       "正在送第 1 趟" in dlg._status.text() and dlg._btn_go.isEnabled() is True
       and "由你说了算" in dlg._status.text()
       and "纸出齐就点" in dlg._btn_go.text()
@@ -1188,6 +1189,119 @@ _app.processEvents()
 check("空格只会按**聚焦的那个**按钮（不会再落到「跳过」上）",
       _kev == ["go"] and _dlgk._mode == "pass2", f"{_kev} {_dlgk._mode}")
 _dlgk.hide()
+
+# ── 2026-11-25 现场（用户报「确认完上一批后误触第 2 趟」）：按钮按放行比例上锁 ──────
+print("\n=== ⑥c 第 2 趟按钮的放行比例锁（2026-11-25）===")
+_gsrc = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
+_dlgg = gui.ManualDuplexDialog()
+_ggev = []
+_dlgg.continue_requested.connect(lambda: _ggev.append("go"))
+_dlgg.announce("本批第 1 趟开打", sheets=6, estimate_sec=40.0,
+               gate_ratio=0.6, gate_extra=5.0)
+_gate = 40.0 * 0.6 + 5.0          # 29s：档案里的 60% 放行比例 + 人工翻页准备 5s
+check("★ 批次开始：没到放行比例（40s × 60% + 5s = 29s）「继续打第 2 趟」是灰的",
+      _dlgg._btn_go.isEnabled() is False and abs(_dlgg._flip_gate_at - _gate) < 1e-6,
+      f"gate={_dlgg._flip_gate_at}")
+check("★ 灰着的时候也交代了为什么 + 还要多久（别让人以为坏了）",
+      "放行比例 60%" in _dlgg._countdown.text()
+      and "还要 00:29" in _dlgg._countdown.text()
+      and "放行比例 60%" in _dlgg._btn_go.toolTip(), _dlgg._countdown.text())
+_dlgg._pass1_seen = lambda: 9.0   # 现场那一幕：第 1 趟才走了 9 秒（截图 00:09/00:40）
+_dlgg._pass1_tick()
+check("★ 现场复刻：第 1 趟 9 秒时按钮仍是灰的（旧版这时就亮着，手一停就误触）",
+      _dlgg._btn_go.isEnabled() is False, f"enabled={_dlgg._btn_go.isEnabled()}")
+_dlgg._on_go()
+check("★ 锁着时点击不算数：不发第 2 趟（程序化点击 / 键盘也挡得住）",
+      _ggev == [] and _dlgg._mode == "pass1", f"{_ggev} {_dlgg._mode}")
+_dlgg._pass1_seen = lambda: 28.9
+_dlgg._pass1_tick()
+check("差 0.1 秒也还是灰的（界值不许提前松手）", _dlgg._btn_go.isEnabled() is False)
+_dlgg._pass1_seen = lambda: 29.0
+_dlgg._pass1_tick()
+check("★ 到点自动放开按钮、锁提示消失，但**不**自己发第 2 趟",
+      _dlgg._btn_go.isEnabled() is True and _dlgg._countdown.text() == ""
+      and _ggev == [], f"{_ggev} {_dlgg._countdown.text()!r}")
+_dlgg._on_go()
+check("放开后仍只认操作员点击：这一下才真进第 2 趟，冻结值 = 点击那一刻",
+      _ggev == ["go"] and _dlgg._mode == "pass2"
+      and abs(float(_dlgg._pass1_final) - 29.0) < 1e-6,
+      f"{_ggev} {_dlgg._mode} {_dlgg._pass1_final}")
+_dlgg._close_timer.stop()
+_dlgg._pass1_timer.stop()
+_dlgg._timer.stop()
+
+_dlgn = gui.ManualDuplexDialog()
+_dlgn.announce("x", sheets=6, estimate_sec=40.0, gate_ratio=0.6, gate_extra=5.0)
+_dlgn.set_flippable("出纸槽里应有 6 张纸", 600)   # worker 提前回报也不许提前解锁
+check("★ worker 说「数据全送进打印队列」不等于解锁（它只起跑 10 分钟超时倒计时）",
+      _dlgn._mode == "flip" and _dlgn._btn_go.isEnabled() is False,
+      f"{_dlgn._mode} enabled={_dlgn._btn_go.isEnabled()}")
+_dlgn._timer.stop()
+_dlgn._pass1_timer.stop()
+
+_dlgu = gui.ManualDuplexDialog()
+_dlgu.announce("x", sheets=1, estimate_sec=0.0)   # 还没学到速度 ⇒ 没有预估
+check("拿不到预估时不锁（回退：宁可能点，不许把人卡住）",
+      _dlgu._btn_go.isEnabled() is True)
+_dlgu._pass1_timer.stop()
+
+check("★ 源码口径：announce() 里用 _refresh_pass2_gate() 而不是 setEnabled(True)",
+      "_flip_gate_at = self.flip_gate_at(self._pass1_est" in _gsrc
+      and "_refresh_pass2_gate()\n        self._btn_skip.setText(" in _gsrc
+      and "self._btn_go.setEnabled(True)" not in _gsrc.split(
+          "def announce(self", 1)[1].split("def _prev2_elapsed", 1)[0])
+
+# ── 2026-11-26 现场（常驻窗「第 1 趟已用 02:57」，可本批开打才 17 秒）：换批次必须从 0 起跑 ──
+print("\n=== ⑥d 换批次：第 1 趟计时必须从 0 起跑（上一批的时钟不许漏进来）===")
+
+
+class _FakeElapsedTimer:
+    """只会走、只会被 restart 归零的秒表（QElapsedTimer 没法设值，验收要摆出"上一批已走 177 秒"）。
+
+    现场时序：上一批 15:56:53 announce → 15:59:50 本批 announce ⇒ 本批 announce 那一刻
+    `_t0` 已经走了 177 秒（02:57）—— 它从上一批 announce 起就没人停过。
+    """
+
+    def __init__(self):
+        self._ms = 0
+        self._valid = False
+
+    def restart(self):
+        self._ms = 0
+        self._valid = True
+        return 0
+
+    def start(self):
+        return self.restart()
+
+    def invalidate(self):
+        self._valid = False
+
+    def isValid(self):
+        return self._valid
+
+    def elapsed(self):
+        return self._ms if self._valid else 0
+
+
+_dlgr = gui.ManualDuplexDialog()
+_dlgr._t0 = _FakeElapsedTimer()
+_dlgr._t0.restart()
+_dlgr._t0._ms = 177000           # 上一批的时钟已经走了 02:57（现场 15:56:53 → 15:59:50）
+_dlgr.announce("本批第 1 趟开打", sheets=1, estimate_sec=12.6,
+               gate_ratio=0.6, gate_extra=0.0)
+_dlgr._pass1_tick()
+check("★ 换批次后第 1 趟从 00:00 起算（旧版把上一批的 02:57 顶成新下限，"
+      "还写「超出 164 秒」红字）",
+      "已用 00:00" in _dlgr._pass1.text() and "02:57" not in _dlgr._pass1.text(),
+      _dlgr._pass1.text())
+check("★ 换批次后第 2 趟按钮重新上锁（旧版被上一批的时长顶穿：gate 7.56 − 177 < 0 ⇒ "
+      "一出现就是亮的）",
+      _dlgr._btn_go.isEnabled() is False,
+      f"enabled={_dlgr._btn_go.isEnabled()} wait={_dlgr._pass2_gate_wait():.2f} "
+      f"gate={_dlgr._flip_gate_at:.2f}")
+_dlgr._pass1_timer.stop()
+_dlgr._close_timer.stop()
 
 # ============================================================
 # ⑧ 翻纸间隙的并发保护（第 1 趟打完 → 操作员确认之间，别的任务不能插进来）
@@ -1501,8 +1615,9 @@ check("★ 颜色阈值：在预估内(+30s 宽容带)绿 / 超出 30 秒黄 / �
 # ── ★ 第 2 趟放行 = 操作员点击（2026-11-11 现场，用户第四次定口径）─────────────
 # 用户原话：「第一趟的打印结束信号应该由我决定，我什么时候按下开始第二趟什么时候就是
 # 第一趟结束了，而不是由系统打印队列决定。」
-# ⇒ ① 「继续打第 2 趟」在窗口出现那一刻就可点：不等时间闸门、不等打印机的完成回报、
-#      也不等 spooler 排空；
+# ⇒ ① 「继续打第 2 趟」不等打印机的完成回报、也不等 spooler 排空；
+#      2026-11-25 用户现场（确认完上一批后误触）追加：按钮**按放行比例上锁**
+#      （预估 × gate_ratio + 人工翻页准备秒数），到点只放开按钮，仍然不发第 2 趟；
 #    ② 点下去那一刻 = 第 1 趟结束（计时就地冻结），worker 报来的权威实测到了还能覆盖；
 #    ③ worker 的 flip_required（= 第 1 趟数据全送进打印队列）只负责把"10 分钟无人确认
 #      按跳过处理"的倒计时起跑。
@@ -1522,13 +1637,24 @@ _ann_evts = []
 _dlg_ann.continue_requested.connect(lambda: _ann_evts.append("go"))
 _dlg_ann.set_speed_hint("启动 ≈8s + 每张 ≈5.6s · 基于最近 2 次实测")
 _dlg_ann.announce("操作员放行", sheets=8, estimate_sec=51.0)
-check("★ 第 1 趟窗口一出现「继续打第 2 趟」就可点（不等闸门、不等回报）",
-      _dlg_ann._mode == "pass1" and _dlg_ann._btn_go.isEnabled()
-      and "纸出齐就点" in _dlg_ann._btn_go.text(),
-      f"{_dlg_ann._mode} | {_dlg_ann._btn_go.text()}")
+check("★ 第 1 趟窗口一出现，按钮**按放行比例锁着**（2026-11-25；此前是一出现就可点）",
+      _dlg_ann._mode == "pass1" and _dlg_ann._btn_go.isEnabled() is False
+      and "纸出齐就点" in _dlg_ann._btn_go.text()
+      and "放行比例 50%" in _dlg_ann._countdown.text(),
+      f"{_dlg_ann._mode} | {_dlg_ann._btn_go.text()} | {_dlg_ann._countdown.text()}")
 check("★ 状态栏说清「这一趟打没打完由你说了算」（不再写「正在打印第 1 趟」然后灰着）",
       "由你说了算" in _dlg_ann._status.text() and "不等打印队列" in _dlg_ann._status.text(),
       _dlg_ann._status.text())
+# 闸门界值：51s × 50% = 25.5s
+_dlg_ann._elapsed_sec = lambda: 25.0
+_dlg_ann._pass1_tick()
+check("★ 差 0.5 秒也还锁着（界值不许提前松手）",
+      _dlg_ann._btn_go.isEnabled() is False and _ann_evts == [])
+_dlg_ann._elapsed_sec = lambda: 25.5
+_dlg_ann._pass1_tick()
+check("★ 到放行点自动解锁，但绝不自动发第 2 趟（没点就还在 pass1）",
+      _dlg_ann._btn_go.isEnabled() is True and _dlg_ann._mode == "pass1"
+      and _ann_evts == [], f"{_dlg_ann._mode} {_ann_evts}")
 # 时间再久也不自己放行：tick 走过预估、走过 10 分钟，仍然只是"等操作员"
 _dlg_ann._elapsed_sec = lambda: 600.0
 _dlg_ann._pass1_tick()
@@ -1590,15 +1716,21 @@ _rep_evts = []
 _dlg_rep.continue_requested.connect(lambda: _rep_evts.append("go"))
 _dlg_rep.announce("回报先到", sheets=16, estimate_sec=43.0)
 _dlg_rep.set_flippable("翻纸说明", 600)
-check("★ 回报先到 → 只把「10 分钟无人确认」倒计时起跑（按钮照旧可点）",
-      _dlg_rep._mode == "flip" and _dlg_rep._btn_go.isEnabled()
-      and _dlg_rep._left == 599 and "超时按跳过处理" in _dlg_rep._countdown.text(),
-      f"{_dlg_rep._mode} | _left={_dlg_rep._left}")
+check("★ 回报先到 → 只把「10 分钟无人确认」倒计时起跑（按钮仍按放行比例锁着）",
+      _dlg_rep._mode == "flip" and _dlg_rep._btn_go.isEnabled() is False
+      and _dlg_rep._left == 599 and "放行比例 50%" in _dlg_rep._countdown.text(),
+      f"{_dlg_rep._mode} | _left={_dlg_rep._left} | {_dlg_rep._countdown.text()}")
 check("回报到了也**不**冻结计时（第 1 趟何时结束仍由操作员点击决定）",
       not _dlg_rep._pass1_done and _dlg_rep._pass1_timer.isActive(),
       _dlg_rep._pass1.text())
 _dlg_rep._on_go()
-check("★ 回报先到 + 操作员点击 → 第 2 趟（只 emit 一次）",
+check("★ 锁着时点击不算数：回报到了也不等于能翻纸（第 1 趟还在出纸）",
+      _rep_evts == [] and _dlg_rep._mode == "flip" and not _dlg_rep._pass1_done,
+      f"{_dlg_rep._mode} {_rep_evts}")
+_dlg_rep._elapsed_sec = lambda: 21.5          # 43s × 50% = 21.5s，到放行点
+_dlg_rep._pass1_tick()
+_dlg_rep._on_go()
+check("★ 回报先到 + 到点后操作员点击 → 第 2 趟（只 emit 一次）",
       _dlg_rep._mode == "pass2" and _rep_evts == ["go"] and _dlg_rep._pass1_done,
       f"{_dlg_rep._mode} {_rep_evts}")
 
@@ -1618,9 +1750,10 @@ _dlg_big.announce("超大批次", sheets=400, estimate_sec=1200.0)
 check("★ 闸门换算钳在 worker 等待上限内（600s）—— 只剩提前回报判定在用",
       abs(_dlg_big._flip_gate_for_now() - 600.0) < 0.01,
       f"{_dlg_big._flip_gate_for_now()}")
-check("★ 超大批次也不用等：窗口一出现按钮就可点",
-      _dlg_big._mode == "pass1" and _dlg_big._btn_go.isEnabled(),
-      _dlg_big._mode)
+check("★ 超大批次同样要等到放行点，且钳在 worker 超时之前（上限 600s → 570s 松手）",
+      _dlg_big._mode == "pass1" and _dlg_big._btn_go.isEnabled() is False
+      and abs(_dlg_big._pass2_gate_at() - 570.0) < 0.01,
+      f"{_dlg_big._mode} {_dlg_big._pass2_gate_at()}")
 
 # 第 1 趟还没点继续就关窗 / 点跳过 = 跳过本任务（绝不能"关一下窗就把第 2 趟打了"）
 _dlg_gate = gui.ManualDuplexDialog()

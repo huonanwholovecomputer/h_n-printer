@@ -186,9 +186,11 @@ check("★ A2 起跑后给出预计（预计 00:42）", "预计 00:42" in _t, _t
 check("★ A2 起跑后第 1 趟计时器在跑", dlg._pass1_timer.isActive() is True)
 check("★ A2 起跑后已用秒数是真时钟（< 1 秒），不是把等待时长算进来",
       dlg._elapsed_sec() < 1.0, f"{dlg._elapsed_sec():.2f}s")
-check("★ A2 起跑后按钮立刻可点（2026-11-11 起：这一趟打没打完由操作员说了算）",
-      dlg._btn_go.isEnabled() is True and "纸出齐就点" in dlg._btn_go.text(),
-      dlg._btn_go.text())
+check("★ A2 起跑后按钮按**本批**放行比例锁着（2026-11-25 起：42s×50% ⇒ 21s 才放开，"
+      "防「确认完上一批」后误触本批第 2 趟；2026-11-11 的『打没打完由操作员说了算』不变）",
+      dlg._btn_go.isEnabled() is False and "纸出齐就点" in dlg._btn_go.text()
+      and abs(dlg._pass2_gate_at() - 21.0) < 0.01,
+      f"{dlg._btn_go.text()} gate={dlg._pass2_gate_at()}")
 dlg.finish("done")
 dlg.hide()
 
