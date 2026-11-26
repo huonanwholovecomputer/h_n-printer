@@ -377,6 +377,9 @@ input[type=range]:focus, input[type=range]:focus-visible { outline: none; box-sh
 .st-lock { border: none; background: transparent; cursor: pointer; font-size: .78rem; line-height: 1; padding: 0 2px; vertical-align: -1px; opacity: .85; }
 .st-lock:hover { opacity: 1; transform: scale(1.12); }
 .st-lock.on { filter: drop-shadow(0 0 4px rgba(79,110,247,.55)); opacity: 1; }
+/* v7.33：用纸统计的废纸格 —— 与订单明细「状态」列同一套锁：默认锁定、只读、点格子或点 🔒 解锁。
+   锁定态的格子**不隐藏数字**（看得到历史人工值），只是不能改；cursor:pointer 是"点我解锁"的暗示。 */
+.inp-waste.locked { background: var(--panel2, rgba(127,127,127,.08)); color: var(--muted); cursor: pointer; }
 .st-edit { display: inline-flex; align-items: center; gap: 2px; border-radius: 999px; }
 .st-edit.can { cursor: pointer; padding-right: 2px; outline: 1px dashed rgba(79,110,247,.55); outline-offset: 2px; }
 .st-edit.can:hover { background: rgba(79,110,247,.12); }
@@ -1310,11 +1313,11 @@ function mergeStores(localStore, cloudStore) {
 /* ==================== 全局状态 ==================== */
 /* 版本号唯一来源：关于页标题 + 版本说明的最末条目都从它取。发版时只改这一处，
    别再在 renderAbout 里写死字面量（2026-11-16 现场：标题还停在 v7.10，日志已到 v7.25）。 */
-var APP_VER = 'v7.31';
+var APP_VER = 'v7.33';
 var STORE = migrateConfig(null);
 var currentKey = currentMonthKey();
 var currentTab = 'dash';
-var unlocked = { score: false, expense: false, income: false, settings: false, auth: false, transfer: false, orderstatus: false, orderprinter: false };
+var unlocked = { score: false, expense: false, income: false, settings: false, auth: false, transfer: false, orderstatus: false, orderprinter: false, waste: false };
 
 /* ==================== 数据模型 / 迁移 ==================== */
 function migrateConfig(data) {
@@ -2087,6 +2090,7 @@ var FINANCE_SESSION = '';
 var FINANCE_SESSION_EXP = 0;
 var _financeSessionTimer = null;
 var _pendingSave = false;             // 没会话时被挡下的保存：解锁后自动补做
+var _pendingSaveNotified = false;     // v7.32：「被挡下」的提示只弹一次，解锁成功时重置
 var _afterUnlockQueue = [];           // 同上，任意"解锁后补做"的写动作
 var _integrityState = '';             // 数据完整性状态（服务端 /api/local/data 下发）
 var _integrityReadOnly = false;
@@ -2096,6 +2100,7 @@ function _clearFinanceSession(silent) {
   FINANCE_SESSION_EXP = 0;
   if (_financeSessionTimer) { clearTimeout(_financeSessionTimer); _financeSessionTimer = null; }
   PASSWORD_KEYS.forEach(function (k) { unlocked[k] = false; });
+  unlocked.waste = false;        // v7.33：废纸格是「随采购支出密码解锁」的别名锁，不占密码模块
   if (!silent) {
     try { toast('🔒 解锁会话已结束（30 分钟），请重新输入密码'); } catch (e) {}
   }
@@ -2112,10 +2117,14 @@ function _setFinanceSession(token, ttl, modules) {
     }, secs * 1000);
   }
   (modules || []).forEach(function (k) { if (k in unlocked) unlocked[k] = true; });
+  /* v7.33：服务端会话里只有 expense，没有 waste —— 废纸格与采购支出共用同一个密码
+     （废纸张数决定 A4 纸摊销，本来就是采购支出那笔钱），所以解锁了 expense 就一并放开它。 */
+  if (unlocked.expense) unlocked.waste = true;
 }
 function _runAfterUnlock() {
   var q = _afterUnlockQueue.slice();
   _afterUnlockQueue = [];
+  _pendingSaveNotified = false;      // 新会话：下次被挡下要能再提示一次
   q.forEach(function (fn) { try { fn(); } catch (e) {} });
   if (_pendingSave) { _pendingSave = false; try { save(); } catch (e) {} }
 }
@@ -3046,6 +3055,14 @@ function _doSave(force) {
      首次部署迁移、离线暂存重放这类"自动保存"会走到这里，先记下来，解锁成功后自动补做。 */
   if (!FINANCE_SESSION) {
     _pendingSave = true;
+    /* v7.32：以前这里**彻底静默** —— 而「收支清算」页不需要解锁就能看，废纸 / 记账格也照样能填，
+       于是用户填完只觉得「没保存」，却拿不到任何提示（现场就是这个体验）。写被挡下时必须说出来；
+       同一句只提示一次（每次防抖保存都弹会盖住别的 toast），解锁成功时重置。
+       解锁后 _runAfterUnlock 会把这次保存补做，这句只是告知「现在关页会丢」。 */
+    if (!_pendingSaveNotified) {
+      _pendingSaveNotified = true;
+      try { toast('🔒 改动已记录在本页，但需要解锁后才能写入云端（现在关页会丢）', 'error'); } catch (e) {}
+    }
     _afterUnlock(function () { _doSave(force); });
     return;
   }
@@ -3198,11 +3215,12 @@ function openChoice(title, bodyHtml, buttons) {
 /* ==================== 密码解锁（S1-05：服务端校验 + 会话） ==================== */
 function getPassword(key) { return (STORE.config.passwords || {})[key] || ''; }
 function isUnlocked(key) { return !!unlocked[key]; }
-function requestPassword(key, label) {
+function requestPassword(key, label, hint) {
   return openModal({
     title: '🔒 解锁' + label,
     body: '<p style="margin:0 0 12px;color:var(--muted);font-size:.88rem">输入「' + label + '」密码以继续编辑'
-      + '<br><span style="font-size:.8rem">（密码由本机服务端校验，解锁后 30 分钟内有效）</span></p>',
+      + '<br><span style="font-size:.8rem">（密码由本机服务端校验，解锁后 30 分钟内有效）</span>'
+      + (hint ? '<br><span style="font-size:.8rem">' + esc(hint) + '</span>' : '') + '</p>',
     input: { type: 'password', id: 'financeUnlockPwd', placeholder: '请输入密码' },
     confirmText: '解锁', cancelText: '取消'
   }).then(function (pwd) {
@@ -8003,7 +8021,7 @@ function paperStatsSectionHTML(r, m) {
   var u = r.usage || usageOfMonth(key) || null;
   var ustate = usageStateOfMonth(key);
   var normalBy = (u && u.sheetsByMember) || {};
-  var h = '<div class="section" id="paperStatsSection"><h2>🧻 用纸统计 <span class="hint">（每人「正常出纸 + 废纸」；废纸留空 = 按本月失败订单自动预估，填 0 = 明确没有废纸）</span></h2>';
+  var h = '<div class="section" id="paperStatsSection"><h2>🧻 用纸统计' + _wasteLockHTML() + ' <span class="hint">（每人「正常出纸 + 废纸」；废纸留空 = 按本月失败订单自动预估，填 0 = 明确没有废纸；编辑需密码）</span></h2>';
   if (ustate === 'loading' || (r.amort && r.amort.state === 'loading')) {
     h += '<div style="color:var(--muted);font-size:.85rem;margin-bottom:8px"><span class="loading-spin"></span>本月出纸张数统计中…</div>';
   } else if (!u) {
@@ -8017,14 +8035,28 @@ function paperStatsSectionHTML(r, m) {
     var est = wasteEstimateOf(u, mem.id);
     var waste = (manual === null) ? est : manual;
     tn += normal; tw += waste;
-    h += '<tr><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
+    /* v7.32：`data-mid` + oninput + onblur 三件套 —— 见 updWastePaper / _wasteFocusSnapshot 的注释。
+       oninput 保证「边打边存」（重画不会把这格正在输入的字吞掉）；onblur 只负责收尾重算摊销；
+       data-mid 是重画后「找回同一个成员那一格」的唯一依据（行序会随成员增删变）。
+       这里刻意用 type="text" + inputmode="numeric" 而不是 type="number"：number 型**不支持
+       selection API**（selectionStart 恒 null、setSelectionRange 抛 InvalidStateError，且程序
+       设 value 后光标停在最前面），重画还原焦点后就变成「输 375 得到 537」；数字键位由
+       inputmode 负责，合法性由 updWastePaper 校验（不合法标红 + 提示，不清用户输入）。 */
+    h += '<tr data-wmid="' + esc(mem.id) + '"><td style="font-weight:700;color:' + sanitizeColor(MC(mem.id)) + '">' + esc(mem.name) + '</td>';
     h += '<td>' + fmtInt(normal) + ' 张</td>';
-    h += '<td><input type="number" min="0" step="1" class="inp-waste" style="width:76px" '
+    /* v7.33：锁定态 = 只读 + 点一下就弹密码框（与订单明细"锁定态不给编辑入口"不同：
+       这里点格子本身就是入口 —— 用户抱怨过"提示要解锁却找不到地方输密码"）。 */
+    var _wl = _wasteLocked();
+    h += '<td><input type="text" inputmode="numeric" autocomplete="off" spellcheck="false" class="inp-waste' + (_wl ? ' locked' : '') + '" data-mid="' + esc(mem.id) + '" style="width:76px" '
       + 'value="' + (manual === null ? '' : manual) + '" placeholder="' + fmtInt(est) + '" '
-      + 'title="留空 = 按本月失败订单自动预估（' + fmtInt(est) + ' 张）；填 0 = 明确没有废纸" '
-      + 'onchange="updWastePaper(\'' + mem.id + '\', this.value)"></td>';
-    h += '<td style="font-weight:700">正常 ' + fmtInt(normal) + ' + 废 ' + fmtInt(waste) + ' 张</td>';
-    h += '<td>' + (manual === null ? '<span class="tag b">预估</span>' : '<span class="tag g">人工</span>') + '</td></tr>';
+      + (_wl
+          ? 'readonly title="🔒 已锁定：点这里（或标题右侧的 🔒）输入密码后可编辑" onclick="wasteAskUnlock()" '
+          : 'title="留空 = 按本月失败订单自动预估（' + fmtInt(est) + ' 张）；填 0 = 明确没有废纸" ')
+      + 'oninput="updWastePaper(\'' + mem.id + '\', this.value, this)" '
+      + 'onchange="updWastePaper(\'' + mem.id + '\', this.value, this)" '
+      + 'onblur="_wasteFlushSoon()"></td>';
+    h += '<td class="js-wsum" style="font-weight:700">正常 ' + fmtInt(normal) + ' + 废 ' + fmtInt(waste) + ' 张</td>';
+    h += '<td class="js-wover">' + (manual === null ? '<span class="tag b">预估</span>' : '<span class="tag g">人工</span>') + '</td></tr>';
   });
   /* 未归属：删除过成员 / 订单没绑定成员 —— 纸真的废了，但摊不到任何人头上 */
   var orphanWaste = 0, known = {};
@@ -8044,15 +8076,15 @@ function paperStatsSectionHTML(r, m) {
        旧写法只在灰行显示、不进合计 ⇒ 合计 < 实际计入量，和摊销口径对不上。 */
     tn += orphanNormal;
   }
-  h += '<tr class="tfoot"><td>合计</td><td>' + fmtInt(tn) + ' 张</td><td>' + fmtInt(tw) + ' 张</td><td>正常 '
+  h += '<tr class="tfoot"><td>合计</td><td>' + fmtInt(tn) + ' 张</td><td class="js-wtw">' + fmtInt(tw) + ' 张</td><td class="js-wfoot">正常 '
     + fmtInt(tn) + ' + 废 ' + fmtInt(tw) + ' 张</td><td></td></tr>';
   h += '</tbody></table></div>';
   var _manualCnt = getMembers().filter(function (mem) { return wasteManualOf(key, mem.id) !== null; }).length;
   h += '<div style="margin-top:8px;font-size:.8rem;color:var(--muted)">'
     + '「废纸」= 本月<b>没产出纸</b>的订单（失败 / 放弃打印 / 已取消）本该用掉的纸张数，按订单归属的成员计；'
     + '留空自动取这个预估，填了就按人工值（<b>0 与留空不同</b>：0 表示确认没有废纸）。'
-    + '本月合计 <b>' + fmtInt(tn + tw) + ' 张</b>（正常 ' + fmtInt(tn) + ' + 废 ' + fmtInt(tw) + '）计入本月用纸量，A4 纸摊销按这个量算。'
-    + (_manualCnt > 0 ? ' 其中 ' + _manualCnt + ' 人填了人工值。' : '')
+    + '<span class="js-wmemo">本月合计 <b>' + fmtInt(tn + tw) + ' 张</b>（正常 ' + fmtInt(tn) + ' + 废 ' + fmtInt(tw) + '）计入本月用纸量，A4 纸摊销按这个量算。'
+    + (_manualCnt > 0 ? ' 其中 ' + _manualCnt + ' 人填了人工值。' : '') + '</span>'
     + '<br>「按用量分摊」里 A4 纸那笔钱按<b>出纸张数</b>摊、硒鼓 / 其它采购按<b>出纸页数</b>摊；'
      + '废纸计入本月用纸量、改变 A4 纸摊销金额，但废纸本身<b>不进</b>任何人的分摊权重。'
     + '</div>';
@@ -8192,6 +8224,9 @@ function consumableAmortSectionHTML(r, m) {
 /* ==================== TAB: 收支清算 ==================== */
 function renderDash() {
   var el = $('#tab-dash');
+  /* v7.32：下面那次 el.innerHTML 会整块换掉 DOM，正在输入的废纸格会连同刚敲的字一起消失
+     （浏览器不给被移除的 input 补发 change）。所以重画前先把它落库并快照，画完还原焦点。 */
+  var _wSnap = _wasteFocusSnapshot();
   var keys = allMonthKeys();
   if (!keys.includes(currentKey)) currentKey = keys[keys.length - 1] || currentMonthKey();
   var m = monthFromRecords(currentKey);
@@ -8305,6 +8340,8 @@ function renderDash() {
     countUp(node, target, { dec: 2, fmt: function (n) { return prefix + (n / 100).toFixed(2); } });
   });
   playSettledEntrance(ustate, r.amort ? r.amort.state : 'none');
+  /* v7.32：把焦点、原文、光标还给刚才那格废纸（folds/KPI 都不碰它，放最后最安全） */
+  _wasteFocusRestore(_wSnap);
 }
 
 /* v7.11（B3）：收支清算「KPI 四卡」区块 —— 从 renderDash 里拆出来的纯块函数。
@@ -9473,31 +9510,204 @@ function updExpPrinter(id, val) {
   if (pid) r.printer_id = pid; else delete r.printer_id;
   save(); renderEntry();
 }
+/* ── v7.33：废纸格的锁（照「订单明细 → 状态」那把 🔒 做，2026-11-26 用户要求） ──────
+   现场：v7.32 加了「未解锁时保存会被挡下」的提示，但页面上**找不到解锁入口** ——
+   提示说"需要解锁"，却没有任何地方能输密码。这次照订单明细的既有做法补齐：
+     · 区块标题右侧一个 🔒（同一个 .st-lock 样式、同一个点击手感、同一套提示语结构）；
+     · 点它、或点锁定态的格子 → requestPassword() 弹密码框 → 成功即变 🔓 并能编辑；
+     · 再点一次回到 🔒（防误触），语义与 toggleOrderStatusLock 完全一致。
+   密码**不新开模块**：废纸张数直接决定 A4 纸摊销（采购支出里那笔耗材钱），
+   所以复用 expense 那一个密码 —— 新增一个密码模块会让每个人额外弹一次「首次设置密码」，
+   而它管的本来就是同一笔账。unlocked.waste 只是 expense 的别名，随会话一起失效。 */
+function _wasteLocked() { return !unlocked.waste; }
+/* 标题右侧的 🔒/🔓（与 _orderStatusLockHTML 同款）。本地模式也要锁：本地写盘同样要财务会话 */
+function _wasteLockHTML() {
+  var on = !!unlocked.waste;
+  return ' <button type="button" class="st-lock' + (on ? ' on' : '') + '"'
+    + ' title="' + (on ? '废纸张数已解锁，点击锁定（防误触）'
+                      : '废纸张数已锁定；点击输入密码解锁后，可逐人填写废纸张数') + '"'
+    + ' onclick="event.stopPropagation();toggleWasteLock()">' + (on ? '🔓' : '🔒') + '</button>';
+}
+/* 解锁入口（点格子 / 点 🔒 都走这里）：密码对了才放开编辑，错了原地不动 */
+function wasteAskUnlock() {
+  if (unlocked.waste) return;
+  requestPassword('expense', MODULE_NAMES.expense,
+    '废纸张数与「采购支出」共用同一个密码：它直接决定 A4 纸摊销金额（同属耗材那笔钱）。'
+  ).then(function (ok) {
+    if (!ok) return;
+    unlocked.waste = true;
+    toast('🔓 废纸张数已解锁', 'success');
+    renderDash();
+  });
+}
+function toggleWasteLock() {
+  if (unlocked.waste) {
+    unlocked.waste = false;
+    toast('🔒 废纸张数已锁定');
+    renderDash();
+    return;
+  }
+  wasteAskUnlock();
+}
+
+/* ── v7.32：废纸格的「边打边存」与重画保护 ──────────────────────────────────
+   现场（2026-11）：用户填的废纸张数会「被覆盖掉 / 根本没传回云端」。根因是这一整块
+   「🧻 用纸统计」由 renderDash() 用 el.innerHTML 整块重建，而废纸格从前只在 change（失焦）
+   才落库 —— 输入到一半时只要来一次重画（本月用量取回来、长期耗材补取完成、或上一次编辑
+   自己触发的 renderDash），这个 input 就被换掉了，而浏览器**不会**给被移除的元素补发
+   change ⇒ 刚敲的数字既没进 STORE 也没 save()，看起来就是"白填"。
+   现在三层保护：
+     ① oninput 即落库（合法就写 STORE + save()，非法只标红不落库）—— 打一个字存一个字；
+     ② 落库后就地刷新这一行（合计 / 来源），**不整页重画** ⇒ 光标和焦点都不丢；
+     ③ 万一非重画不可（用量回调），重画前 _wasteFocusSnapshot() 顺手把没落库的值补记，
+        画完 _wasteFocusRestore() 按 data-mid 还原焦点与光标；真正的整页重算推迟到
+        失焦之后由 _wasteFlushSoon() 做（那时才作废用量缓存、重取、重算 A4 纸摊销）。 */
+var _wasteFlushTimer = null;
+var _wasteDirty = false;
+
+/* 焦点是否还在某个废纸格里（在的话绝不整页重画） */
+function _wasteEditing() {
+  try {
+    var el = document.activeElement;
+    return !!(el && el.classList && el.classList.contains('inp-waste'));
+  } catch (e) { return false; }
+}
+
+/* 按成员 ID 找那一行 —— 行序会随成员增删变，只认 data-wmid，不认下标 */
+function _wasteRowOf(mid) {
+  try {
+    var rows = document.querySelectorAll('#paperStatsSection tr[data-wmid]');
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].getAttribute('data-wmid') === String(mid)) return rows[i];
+    }
+  } catch (e) {}
+  return null;
+}
+
+/* 非法输入的视觉标记：只标红，**不清掉用户敲的字**（替他清 = 替他改数据） */
+function _wasteMarkBad(el, bad) {
+  if (!el || !el.style) return;
+  try {
+    el.style.borderColor = bad ? 'var(--red, #d33)' : '';
+    el.style.boxShadow = bad ? '0 0 0 2px rgba(221,51,51,.18)' : '';
+    el.setAttribute('aria-invalid', bad ? 'true' : 'false');
+  } catch (e) {}
+}
+
+/* 就地刷新「这一行」的合计列与来源标签（不重画整块，免得抢焦点）。
+   用量还没取回来（u 为 null）时正常张数不完整 ⇒ 跳过，等那次重画自己算。 */
+function _wasteRefreshRow(mid) {
+  var row = _wasteRowOf(mid);
+  if (!row) return;
+  var u = usageOfMonth(currentKey) || null;
+  var normal = Math.max(0, Math.round(+((((u && u.sheetsByMember) || {})[mid]) || 0)));
+  var manual = wasteManualOf(currentKey, mid);
+  var est = wasteEstimateOf(u, mid);
+  var waste = (manual === null) ? est : manual;
+  try {
+    var sum = row.querySelector('.js-wsum');
+    if (sum) sum.textContent = '正常 ' + fmtInt(normal) + ' + 废 ' + fmtInt(waste) + ' 张';
+    var over = row.querySelector('.js-wover');
+    if (over) over.innerHTML = (manual === null ? '<span class="tag b">预估</span>' : '<span class="tag g">人工</span>');
+  } catch (e) {}
+}
+
+/* 失焦后的收尾：这时才作废用量缓存 + 整页重画（A4 纸摊销、合计行、脚注都跟着变）。
+   若用户又点回某个废纸格，顺延 —— 绝不打断正在输入的焦点。 */
+function _wasteFlushSoon(delay) {
+  if (typeof setTimeout !== 'function') return;
+  if (!_wasteDirty) return;
+  if (_wasteFlushTimer) clearTimeout(_wasteFlushTimer);
+  _wasteFlushTimer = setTimeout(function () {
+    _wasteFlushTimer = null;
+    if (!_wasteDirty) return;
+    if (_wasteEditing()) { _wasteFlushSoon(400); return; }
+    _wasteDirty = false;
+    if (currentTab !== 'dash' || !$('#paperStatsSection')) return;   // 已切走：回来时 renderCurrent 会算
+    invalidateUsage(currentKey);
+    renderDash();
+  }, delay || 150);
+}
+
+/* 整页重画前的快照：读出正在编辑的废纸格（**先落库** —— 重画一换 DOM 就再也读不到了），
+   记住成员 / 原文 / 光标位置。不是废纸格返回 null。 */
+function _wasteFocusSnapshot() {
+  try {
+    var el = document.activeElement;
+    if (!el || !el.classList || !el.classList.contains('inp-waste')) return null;
+    if (_wasteLocked()) return null;          // v7.33：锁定态只读，没有"未落库的输入"可补记
+    var mid = el.getAttribute('data-mid') || '';
+    if (!mid) return null;
+    var val = el.value;
+    var sel = null;
+    try { if (typeof el.selectionStart === 'number') sel = [el.selectionStart, el.selectionEnd]; } catch (e0) {}
+    var ok = updWastePaper(mid, val, el);    // 合法即落库；非法只标红，不动 STORE
+    return { mid: mid, value: val, sel: sel, ok: ok };
+  } catch (e) { return null; }
+}
+
+/* 重画后把焦点、原文与光标还回去。值仍用用户**刚敲的原文**（他可能正打到一半，
+   比如要把 "0" 改成 "05"），校验留给下一次 input / 失焦。 */
+function _wasteFocusRestore(snap) {
+  if (!snap) return;
+  try {
+    var row = _wasteRowOf(snap.mid);
+    var inp = row ? row.querySelector('input.inp-waste') : null;
+    if (!inp) return;
+    inp.value = snap.value;
+    if (!snap.ok) _wasteMarkBad(inp, true);
+    inp.focus();
+    if (snap.sel) {
+      try { inp.setSelectionRange(snap.sel[0], snap.sel[1]); } catch (e2) {}
+    } else {
+      /* <input type="number"> 不支持 selection API（selectionStart 是 null、setSelectionRange 抛
+         InvalidStateError）⇒ 重设一次 value 把光标顶到末尾：重画后接着敲是「往后追加」，
+         而不是插到数字最前面（现场就会出现「输 375 变成 537」）。 */
+      try { var _v = inp.value; inp.value = _v; } catch (e3) {}
+    }
+  } catch (e) {}
+}
+
 /* v7.10：用纸统计里每人「废纸(张)」格。
-   留空 = 删掉这一格（回落到自动预估）；填 0 = 明确没有废纸；非法输入（负数/文字）不落库并恢复原值。 */
-function updWastePaper(memberId, raw) {
+   留空 = 删掉这一格（回落到自动预估）；填 0 = 明确没有废纸；非法输入（负数/文字）不落库、只标红。
+   返回值 = 这次有没有真的改动 STORE（重画快照用它决定要不要补记 / 补算）。 */
+function updWastePaper(memberId, raw, el) {
+  /* v7.33：默认锁定 —— 没解锁时**先弹密码框**（这就是"解锁入口在哪"的答案），
+     不落库、不提示"被覆盖"，用户输对密码后自然可以接着填。 */
+  if (_wasteLocked()) { wasteAskUnlock(); return false; }
   var mid = safeId(memberId);
-  if (!mid) return;
+  if (!mid) return false;
   var cfg = STORE.config = STORE.config || {};
   var bag = cfg.waste_paper = cfg.waste_paper || {};
-  var mon = bag[currentKey] = bag[currentKey] || {};
+  var mon = bag[currentKey];
+  var prev = (mon && Object.prototype.hasOwnProperty.call(mon, mid)) ? mon[mid] : null;
   var txt = (raw === null || raw === undefined) ? '' : String(raw).trim();
   if (txt === '') {
+    _wasteMarkBad(el, false);
+    if (prev === null) return false;          // 本来就是空：不用写库，也不用作废用量
     delete mon[mid];
     if (!Object.keys(mon).length) delete bag[currentKey];
-    save(); invalidateUsage(currentKey); renderDash();
-    return;
+    save();
+    _wasteDirty = true;
+    _wasteRefreshRow(mid);
+    return true;
   }
   if (!/^\d+$/.test(txt)) {
+    _wasteMarkBad(el, true);
     toast('废纸张数要填非负整数（留空 = 按失败订单自动预估）', 'error');
-    renderDash();          // 不落库：重绘把那格恢复成有效值
-    return;
+    return false;
   }
-  mon[mid] = Math.round(+txt);
+  _wasteMarkBad(el, false);
+  var n = Math.round(+txt);
+  if (prev === n) return false;               // 数字没变（补空格 / 挪光标）：不重复写库
+  var mon2 = bag[currentKey] = bag[currentKey] || {};
+  mon2[mid] = n;
   save();
-  /* 废纸计入本月用纸量 ⇒ 用量缓存必须失效重算（A4纸摊销跟着变） */
-  invalidateUsage(currentKey);
-  renderDash();
+  /* 废纸计入本月用纸量 ⇒ 用量缓存待作废、A4 纸摊销待重算 —— 但**不在这里整页重画**：
+     重画会抢走正在输入的焦点。真正的重算由失焦后的 _wasteFlushSoon() 做。 */
+  _wasteDirty = true;
+  _wasteRefreshRow(mid);
+  return true;
 }
 function delExp(id) { STORE.records.expenses = STORE.records.expenses.filter(function (x) { return x.id !== id; }); save(); renderEntry(); }
 function addInc() {
@@ -10257,7 +10467,7 @@ function resetData() {
       if (!ok) return;
       STORE = migrateConfig(null);
       currentKey = currentMonthKey();
-      unlocked = { score: false, expense: false, income: false, settings: false, auth: false, transfer: false, orderstatus: false, orderprinter: false };
+      unlocked = { score: false, expense: false, income: false, settings: false, auth: false, transfer: false, orderstatus: false, orderprinter: false, waste: false };
       // S1-05：重置等于退出登录态（服务端会话一并作废，别留后台可写 token）
       if (FINANCE_SESSION) {
         fetch('/api/local/finance_auth/logout', { method: 'POST', headers: apiHeaders() }).catch(function () {});
@@ -11943,6 +12153,22 @@ function renderAbout() {
     '③ 点图片外那块深色区域直接关闭（拖动过程中的松手不算点击，不会看一半被关掉）；' +
     '左右翻页按钮和底部缩略图挪到了图片层外面，放大后也不会被图片边缘裁掉。' +
     '④ 换页、关闭、重开都会回到初始大小，不会带着上页的缩放糊在下一张。</p>' +
+    '<p style="margin-top:10px">v7.32：<b>手填的废纸张数不会再丢，两台设备同时改账会弹冲突框</b> —— ' +
+    '① 现场反馈：废纸数量填进去，回头再看又变回去了（或者根本没传回云端）。原因是这一格' +
+    '<b>只在失焦时</b>才落库，而「用纸统计」整块随时会被重画（本月用量取回、摊销补取、上一次编辑之后），' +
+    '正在输入的那一格被换掉时浏览器<b>不会补发 change</b>，刚敲的字当场消失。现在改成<b>边打边存</b>' +
+    '（合法数字立刻写进本月废纸值），重画前后还会把焦点、光标和值一起还原，中途被打断也能接着敲。' +
+    '② 页面没解锁时保存原本是<b>静着不动</b>的，现在会明确提示「改动只在本页，关掉会丢」，' +
+    '解锁后自动补传。③ 云端配置的修订号以前被本机代理吃掉了，多端冲突检测从来没生效过 —— ' +
+    '两台设备同时改账就是后保存的那份整份覆盖先保存的，且毫无提示；现在修好了，' +
+    '真撞上时会弹「以云端为准 / 以本机为准」让你自己选（选云端会放弃本机未保存的改动）。</p>' +
+    '<p style="margin-top:10px">v7.33：<b>废纸张数旁边有了一把可以自己开关的 🔒</b> —— ' +
+    'v7.32 那句「需要解锁后才能写入云端」发出去之后，现场回了一句「我并没有看到在哪里能够解锁」：' +
+    '「收支清算」整页不用解锁就能看，废纸格又是全页唯一没有锁守卫的可编辑格，页面上确实没有解锁入口。' +
+    '现在照订单明细「状态」列那把锁的做法补上：<b>「🧻 用纸统计」标题右侧</b>一枚 🔒，' +
+    '锁定态格子是只读的、<b>点格子本身也会弹密码框</b>；解锁后那枚锁变成 🔓，再点一下可以随手锁回去防误触。' +
+    '用的是<b>「采购支出」那一个密码</b>，不另开密码 —— 废纸张数本来就决定 A4 纸摊销金额（同属耗材那笔钱），' +
+    '再开一个模块只会让每次开页都弹一次「首次设置密码」。解锁后 30 分钟内有效，和其他敏感模块一样。</p>' +
     '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
     '</div>' +
     '</div>');

@@ -2,16 +2,19 @@
  *
  * 为什么必须真浏览器：这两条需求的落点都是「渲染出来的表格 + 可编辑的输入框 + 保存链路」：
  *   ① 「所属打印机」列只有在有耗材行时才出现（表头/列数/单元格文案是渲染结果）；
- *   ② 废纸格是 contenteditable 之外的 <input>，改完要经 onchange → updWastePaper → save()
+ *   ② 废纸格是 contenteditable 之外的 <input>，改完要经 oninput/onchange → updWastePaper → save()
  *      → POST /api/proxy/finance/config 真正落库，再重绘成「正常 N + 废 M 张」；
  *   ③ 切换月份要看对应月的人工值（不是内存里的旧值）；
- *   ④ 非法输入必须不落库、弹错、恢复有效值。
+ *   ④ 非法输入必须不落库、弹错、恢复有效值；
+ *   ⑤ v7.32：真键盘边打边存 + 「输入到一半被 renderDash() 整块重画」时值和光标都不能丢
+ *      （现场报「填了被覆盖 / 没传回云端」，B12–B17 就是这条路径）。
  * 这些都只有真渲染 + 真请求能回答。
  *
  * 做法：起本地 HTTP 服务（静态文件来自 local_print_tool/finance/，/api/** 全部打桩，
  * 绝不发外网请求），Playwright 打开 settlement.html，按场景逐条断言：
  *   A 基线：用纸统计 / 长期耗材摊销 两个区块的数字、废纸预估与人工值、接口带了 status；
  *   B 编辑废纸：改 → 落库 → 重绘；清空 → 删格；填 0 → 与留空不同；非法输入 → 不落库；
+ *     B*（v7.32）真键盘：边打边存 → 输入中被 renderDash() 重画 → 值与光标都在 → 接着敲 → 失焦收尾；
  *   C 采购支出表：「所属打印机」列只在耗材行出现，硒鼓行是下拉且选中了台账里的机器；
  *   D 切换月份：11 月读 11 月的人工值/预估，切回 10 月值复原。
  *
@@ -329,6 +332,78 @@ chk('A15 没有发外网请求', externalReq.length === 0, JSON.stringify(extern
 
 await page.screenshot({ path: path.join(OUT_DIR, 'A_基线_用纸统计与摊销_' + STAMP + '.png'), fullPage: true });
 
+/* ── v7.33：废纸格按「订单明细状态列那把 🔒」的规矩上锁 ──────────────────────
+   现场（2026-11-26 12:47）用户拍下那条「🔒 需要解锁后才能写入云端」的提示，
+   回了一句「我并没有看到在哪里能够解锁」。原因：废纸格是全页唯一没有锁守卫的
+   可编辑格，页面上也确实没有任何解锁入口。v7.33 照订单明细的做法补上：
+   标题右侧一枚 .st-lock 的 🔒，锁定态格子 readonly、点一下就地弹密码框。 */
+console.log('\n════ A*. v7.33 废纸格的锁 ════');
+/* 桩后端给了「采购支出」会话 ⇒ unlocked.waste 一开始就是 true（这正是会话恢复别名
+   那条逻辑生效的表现）。要量锁定态，先手动回到未解锁，等一下再放开。 */
+await page.evaluate(() => { window.unlocked.waste = false; window.renderDash(); });
+await page.waitForTimeout(300);
+const lockState = () => page.evaluate(() => {
+  const h2 = document.querySelector('#paperStatsSection h2');
+  const btn = h2 && h2.querySelector('.st-lock');
+  const inp = document.querySelector('#paperStatsSection tr[data-wmid="ma"] input.inp-waste');
+  return {
+    hasBtn: !!btn,
+    btnText: btn ? btn.textContent.trim() : null,
+    btnOn: btn ? btn.className.indexOf('on') >= 0 : null,
+    btnClick: btn ? (btn.getAttribute('onclick') || '') : '',
+    inpReadonly: inp ? inp.readOnly : null,
+    inpClass: inp ? inp.className : null,
+    inpClick: inp ? (inp.getAttribute('onclick') || '') : '',
+  };
+});
+let lk = await lockState();
+chk('A16 v7.33 锁定态：废纸格带 locked 类且 readOnly = true（不再让人一头写进虚空）',
+    lk.inpReadonly === true && /locked/.test(lk.inpClass || ''), JSON.stringify(lk));
+chk('A17 v7.33 「用纸统计」标题右侧有那把锁（.st-lock，初始是 🔒 未解锁）',
+    lk.hasBtn === true && lk.btnText === '🔒' && lk.btnOn === false && /toggleWasteLock\(\)/.test(lk.btnClick),
+    JSON.stringify(lk));
+chk('A18 v7.33 锁定态格子点一下就弹密码框（onclick = wasteAskUnlock，用户要的「在哪解锁」就是这里）',
+    /wasteAskUnlock\(\)/.test(lk.inpClick), JSON.stringify(lk));
+
+const nPostsLock = posts.length;
+const stBeforeLock = await page.evaluate(() => JSON.stringify(window.STORE.config.waste_paper || {}));
+/* 用 DOM click 而不是鼠标坐标：这一格常被上方吸顶的分区标题挡住，真指针点不到，
+   但用户真正触发的是 onclick 那一句，等价。 */
+await page.evaluate(() => document.querySelector('#paperStatsSection tr[data-wmid="ma"] input.inp-waste').click());
+await page.waitForTimeout(300);
+const lockModal = await page.evaluate(() => {
+  const m = document.querySelector('#modalRoot .modal-backdrop');
+  return {
+    open: !!m,
+    title: m ? (m.querySelector('h3') || {}).textContent || '' : '',
+    body: m ? m.textContent : '',
+    canCancel: m ? !!m.querySelector('[data-act="cancel"]') : false,
+  };
+});
+chk('A19 v7.33 弹的是「解锁采购支出」（复用采购支出那个密码，不新开密码模块）',
+    lockModal.open === true && lockModal.title.indexOf('解锁采购支出') >= 0, JSON.stringify(lockModal).slice(0, 300));
+chk('A20 v7.33 弹窗里写明为什么共用这个密码（废纸张数直接决定 A4 纸摊销金额）',
+    lockModal.body.indexOf('与「采购支出」共用同一个密码') >= 0, lockModal.body.slice(0, 260));
+if (lockModal.canCancel) {
+  await page.evaluate(() => document.querySelector('#modalRoot .modal-backdrop [data-act="cancel"]').click());
+} else {
+  await page.keyboard.press('Escape');
+}
+await page.waitForTimeout(600);
+const stAfterLock = await page.evaluate(() => JSON.stringify(window.STORE.config.waste_paper || {}));
+chk('A21 v7.33 点「取消」不发任何写请求、也不改 STORE（锁是真的锁，不是只长得像）',
+    posts.length === nPostsLock && stAfterLock === stBeforeLock,
+    JSON.stringify({ posts: posts.length, before: nPostsLock, same: stAfterLock === stBeforeLock }));
+
+/* 解锁（真密码在桩后端里，这里直接放开标志位，等价于解锁成功后的状态） */
+await page.evaluate(() => { window.unlocked.waste = true; window.renderDash(); });
+await page.waitForTimeout(400);
+lk = await lockState();
+chk('A22 v7.33 解锁后：格子 readOnly = false、锁变 🔓（.st-lock.on）',
+    lk.inpReadonly === false && lk.btnOn === true && lk.btnText === '🔓' && !/locked/.test(lk.inpClass || ''),
+    JSON.stringify(lk));
+chk('A23 v7.33 锁定期间没有 JS 报错', pageErrors.length === 0, JSON.stringify(pageErrors));
+
 /* ══════════════════════════════════════════════════════════════
    B. 编辑废纸：落库 / 清空 / 填 0 / 非法输入
    ══════════════════════════════════════════════════════════════ */
@@ -363,8 +438,10 @@ chk('B7 填 0 后合计「正常 3 + 废 0 张」、来源「人工」',
     z2.value === '0' && z2.total === '正常 3 + 废 0 张' && z2.src === '人工', JSON.stringify(z2));
 
 const nPosts1 = posts.length;
-/* 非法输入走**函数直调**：<input type="number"> 会把 'abc' 直接吞成空串（浏览器行为），
-   那样测到的是「清空」而不是「校验」，落不到 updWastePaper 的校验分支上。 */
+/* 非法输入走**函数直调**：要测的是 updWastePaper 的校验分支本身（弹错 + 标红 + 不落库），
+   而不是「浏览器替我们把字母吃掉了」。v7.32 起这一格是 type="text" + inputmode="numeric"
+   （type="number" 不支持 selection API，重画还原焦点会把光标放到数字最前面），
+   所以这里直调函数，模拟「oninput 把 abc 递进来」那一刻。 */
 await page.evaluate(() => window.updWastePaper('ma', 'abc'));
 await page.waitForTimeout(600);
 snap = await dashSnap();
@@ -381,6 +458,52 @@ chk('B10 负数同样不落库，值仍是 0',
 chk('B11 编辑过程中始终没有 JS 报错', pageErrors.length === 0, JSON.stringify(pageErrors));
 
 await page.screenshot({ path: path.join(OUT_DIR, 'B_废纸落库后_' + STAMP + '.png'), fullPage: true });
+
+/* ── v7.32：真键盘 + 「输入过程中被重画」这条现场路径 ────────────────────────
+   现场报的是「填了被覆盖 / 根本没传回云端」。根因：整块用纸统计由 renderDash() 的
+   innerHTML 重建，而废纸格从前只在 change（失焦）落库 —— 输入到一半来一次重画
+   （用量取回、耗材补取、上一次编辑触发的重画），input 被换掉，浏览器不给被移除的
+   元素补发 change ⇒ 刚敲的字当场消失、也没进 STORE。上面的 B1–B10 都用
+   `inp.value = v; dispatchEvent(change)` 直调，**绕过了这条路径**，所以一直是绿的。
+   下面用真键盘输入 + 主动 renderDash() 复现它。 */
+console.log('\n════ B*. v7.32 输入中重画不丢值（真键盘） ════');
+const WASTE_INP = '#paperStatsSection tr[data-wmid="ma"] input.inp-waste';
+const stWaste = () => page.evaluate(() => (window.STORE.config.waste_paper['2026-10'] || {}).ma);
+
+await page.focus(WASTE_INP);
+await page.keyboard.press('Control+A');
+await page.keyboard.type('37');
+chk('B12 真键盘输入（还没失焦）就已即时落库：STORE.waste_paper[2026-10].ma = 37',
+    (await stWaste()) === 37, await stWaste());
+
+/* 模拟「异步回调抢重画」：正在输入的这一格必须原样活下来 */
+await page.evaluate(() => window.renderDash());
+await page.waitForTimeout(250);
+const keep = await page.evaluate(() => {
+  const a = document.activeElement;
+  const row = document.querySelector('#paperStatsSection tr[data-wmid="ma"] input.inp-waste');
+  return {
+    rowVal: row ? row.value : null,
+    activeMid: a && a.getAttribute ? a.getAttribute('data-mid') : null,
+    activeVal: a && a.value,
+    stored: (window.STORE.config.waste_paper['2026-10'] || {}).ma,
+  };
+});
+chk('B13 输入中被 renderDash() 整块重画后，那一格的值还是 37（不再被吞）',
+    keep.rowVal === '37', JSON.stringify(keep));
+chk('B14 重画后焦点与光标仍在同一格（data-mid=ma，能接着敲）',
+    keep.activeMid === 'ma' && keep.activeVal === '37', JSON.stringify(keep));
+
+await page.keyboard.type('5');
+chk('B15 重画后能接着敲：375 立即落库（光标位置也是对的）',
+    (await stWaste()) === 375, await stWaste());
+
+/* 失焦 → 收尾重算（作废用量缓存 + 整页重画）；值必须还是最后一次输入 */
+await page.keyboard.press('Tab');
+await page.waitForTimeout(1600);
+chk('B16 失焦收尾重算后仍以最后一次输入为准：POST 里是 375',
+    wasteOf('2026-10', 'ma') === 375, JSON.stringify(wasteOf('2026-10', 'ma')));
+chk('B17 v7.32 全程没有 JS 报错', pageErrors.length === 0, JSON.stringify(pageErrors));
 
 /* ══════════════════════════════════════════════════════════════
    C. 采购支出表：「所属打印机」列

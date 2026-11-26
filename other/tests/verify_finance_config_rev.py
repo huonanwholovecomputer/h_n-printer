@@ -14,7 +14,9 @@
   ② 首存 → 1；再存 → 2；再存 → 3（**单调递增**，不能被 upsert 重置回 1）；
   ③ GET 回的 server_version 与最后一次 POST 一致，data 原样往返；
   ④ 并发语义：另一台设备在读到 v1 之后保存两次，第三台设备读到的仍是递增序列；
-  ⑤ 源码判据：迁移建列、保存用 `COALESCE(finance_config.rev, 0) + 1`、两条路由都返回 server_version。
+  ⑤ 源码判据：迁移建列、保存用 `COALESCE(finance_config.rev, 0) + 1`、两条路由都返回 server_version；
+  ⑥ v7.32 源码判据：本机代理白名单透传 server_version（不透传 = 后端白干，前端冲突检测仍是死代码）、
+     页面确实拿它算 conflict。
 
 用法：python other/tests/verify_finance_config_rev.py
 exit 0 = 全部通过。
@@ -24,6 +26,16 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _sec_harness as H  # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _read(rel):
+    try:
+        with open(os.path.join(ROOT, rel), encoding='utf-8') as fh:
+            return fh.read()
+    except OSError:
+        return ''
 
 PROBE = r'''
 import json
@@ -99,6 +111,20 @@ def main():
     H.chk("★ 读取路由也返回 server_version（前端 _loadFromServer 依赖它）",
           'SELECT data, COALESCE(rev, 0) AS rev FROM finance_config' in code
           and '"server_version": int(row["rev"] or 0)' in code)
+
+    # ── v7.32：本机代理不能把这枚修订号吃掉 ────────────────────────────────
+    # 后端早就返回 server_version，但页面走的是 /api/proxy/finance/config，而
+    # stats_server._extract_proxy_body 是白名单 ⇒ 不透传就等于后端从没实现过：
+    # 前端 typeof sv === 'number' 恒 false、conflict 永远不成立、整本静默覆盖。
+    pxy = _read(os.path.join('local_print_tool', 'stats_server.py'))
+    page = _read(os.path.join('local_print_tool', 'finance', 'settlement.html'))
+    H.chk("★ v7.32 本机代理透传 server_version（GET / POST 共用同一条白名单）",
+          'if "server_version" in data:' in pxy
+          and 'out["server_version"] = data["server_version"]' in pxy,
+          'local_print_tool/stats_server.py::_extract_proxy_body')
+    H.chk("★ v7.32 页面确实用 server_version 判并发冲突（否则冲突框仍是死代码）",
+          "typeof sv === 'number'" in page and 'conflict = sv > clientVersion + 1' in page,
+          'local_print_tool/finance/settlement.html::_saveToServer')
 
     H.finish()
 

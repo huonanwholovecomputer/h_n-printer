@@ -1560,7 +1560,11 @@ def _extract_proxy_body(resp) -> dict:
     （/api/admin/order_user 的回执——页面要用新昵称刷新那一格、并在 tooltip 里显示标记人）。
     v7.19 追加 owner_name / previous_owner_name：本地来源订单没有云端账号，回执只能给
     展示所属人（页面据此刷新「用户」列、空着就退回本地 pick，不至于显示成 undefined）。
-    一律「响应当中有才透传」，不存在时不填空值（语义同上面几个）。"""
+    一律「响应当中有才透传」，不存在时不填空值（语义同上面几个）。
+    v7.32 追加 server_version（/api/finance/config 的修订号）：此前被这份白名单剥掉，
+    前端 `typeof sv === 'number'` 恒 false ⇒ `conflict = sv > client_version + 1` 永远不成立、
+    冲突确认框（_handleSaveConflict）是死代码；两台设备同时改账就是「后保存的整份静默覆盖
+    先保存的」，人工填的废纸 / 记账格跟着消失。这是**只读**标量，透传不引入新写入面。"""
     try:
         data = resp.json()
     except Exception:
@@ -1600,6 +1604,9 @@ def _extract_proxy_body(resp) -> dict:
                "manual_user_by", "manual_user_at"):
         if _k in data:
             out[_k] = data[_k]
+    # v7.32 云端配置修订号（/api/finance/config 的保存 / 读取回执）—— 前端靠它判并发冲突
+    if "server_version" in data:
+        out["server_version"] = data["server_version"]
     return out
 
 

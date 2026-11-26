@@ -272,7 +272,7 @@ def static_html():
     chk("updatePassword → POST /api/local/finance_auth/password（不再在前端算哈希）",
         re.search(r"function updatePassword\(key\)[\s\S]{0,900}?'/api/local/finance_auth/password'", html) is not None)
     chk("requestPassword 走 financeUnlock（本地不再比对哈希）",
-        re.search(r"function requestPassword\(key, label\)[\s\S]{0,1200}?financeUnlock\(key, pwd\)", html) is not None)
+        re.search(r"function requestPassword\(key, label(?:, hint)?\)[\s\S]{0,1200}?financeUnlock\(key, pwd\)", html) is not None)
     chk("needs_setup → 提示并打开强制改密框（不是「密码错误」了事）",
         re.search(r"if \(r\.needsSetup\)\s*\{[\s\S]{0,400}?openFinanceSetupModal\(\)", html) is not None)
     # v7.6：`needs_setup`（这个模块还没有密码）与 `default_password`（用户敲了已被停用的
@@ -365,7 +365,7 @@ def static_html():
 
     print("\n-- B4 写操作没有会话就不发 / 失效就回锁 --")
     chk("_doSave 在无会话时不发写请求（避免必 403 的噪音与假成功）",
-        re.search(r"if \(!FINANCE_SESSION\) \{\s*\n\s*_pendingSave = true;\s*\n\s*_afterUnlock", html) is not None)
+        re.search(r"if \(!FINANCE_SESSION\) \{\s*\n\s*_pendingSave = true;[\s\S]{0,900}?_afterUnlock", html) is not None)
     chk("解锁成功后自动补做被挡下的保存（_runAfterUnlock）",
         "_runAfterUnlock()" in html and re.search(r"if \(r\.ok\) \{[\s\S]{0,400}?_runAfterUnlock\(\);", html) is not None)
     chk("写接口返回 finance_session_* → 清会话 + 回锁 + 提示（_writeAuthProblem）",

@@ -19,6 +19,7 @@
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -48,6 +49,89 @@ def check(name, cond, detail=''):
 with open(HTML, encoding='utf-8') as fh:
     src = fh.read()
 
+
+def js_func(name, text=None):
+    """取某个函数定义的源码切片（按花括号配对；取不到返回 ''）"""
+    text = src if text is None else text
+    at = text.find('function ' + name + '(')
+    if at < 0:
+        return ''
+    i = text.find('{', at)
+    depth = 0
+    for j in range(i, len(text)):
+        if text[j] == '{':
+            depth += 1
+        elif text[j] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[at:j + 1]
+    return ''
+
+
+def stats_server_body(func_name='_extract_proxy_body'):
+    """本机代理 stats_server.py 里某个函数的源码切片"""
+    p = os.path.join(HERE, '..', '..', 'local_print_tool', 'stats_server.py')
+    try:
+        with open(p, encoding='utf-8') as fh:
+            s = fh.read()
+    except OSError:
+        return ''
+    at = s.find('def ' + func_name + '(')
+    if at < 0:
+        return ''
+    nxt = s.find('\ndef ', at + 1)
+    return s[at:nxt if nxt > 0 else len(s)]
+
+
+def proxy_passes_server_version(text=None):
+    """本机代理是否把云端回执里的 server_version 透传给页面（v7.32 冲突检测的前提）"""
+    body = stats_server_body() if text is None else text
+    return 'out["server_version"] = data["server_version"]' in body
+
+
+def waste_wiring(text=None):
+    """v7.32「废纸不再被重画吞掉」的四条接线判据（静态；变异自证也复用它）"""
+    text = src if text is None else text
+    snap_at = text.find('var _wSnap = _wasteFocusSnapshot();')
+    calc_at = text.find('var r = calcMonthWithUsage(currentKey);', snap_at) if snap_at >= 0 else -1
+    restore_at = text.find('_wasteFocusRestore(_wSnap);', snap_at) if snap_at >= 0 else -1
+    return {
+        # ① 输入即落库：oninput + onblur 都在
+        'oninput': ('oninput="updWastePaper(' in text
+                    and 'onblur="_wasteFlushSoon()"' in text),
+        # ② 每格带成员 ID（重画后按 data-mid 找回）
+        'data_mid': 'data-mid="\' + esc(mem.id) + \'"' in text and 'class="inp-waste' in text,
+        # ③ 重画前先快照（且必须早于 calcMonthWithUsage —— 废纸值影响用量）
+        'snapshot_before_calc': snap_at >= 0 and calc_at > snap_at and calc_at - snap_at < 400,
+        # ④ 重画后还原焦点
+        'restore_after_render': restore_at > snap_at,
+        # ⑤ updWastePaper 自己不再同步重画（那正是抢焦点的来源）
+        'no_sync_render': 'renderDash' not in js_func('updWastePaper', text),
+        # ⑥ 快照里先落库，否则重画一换 DOM 就丢了
+        'snapshot_commits': 'var ok = updWastePaper(mid, val, el);' in js_func('_wasteFocusSnapshot', text),
+    }
+
+def waste_lock_wiring(text=None):
+    """v7.33「废纸格的锁」的五条接线判据（静态；变异自证复用）"""
+    text = src if text is None else text
+    return {
+        # ① 标题右侧那枚 🔒（.st-lock，与订单明细「状态」列同一个控件同一个点击手感）
+        'lock_btn': ("<h2>🧻 用纸统计' + _wasteLockHTML() + " in text
+                     and "' <button type=\"button\" class=\"st-lock' + (on ? ' on' : '')" in text
+                     and 'event.stopPropagation();toggleWasteLock()' in text),
+        # ② 锁定态只读，点格子就是解锁入口（用户："提示要解锁，可我没看到在哪解锁"）
+        'locked_readonly': ('readonly title="🔒 已锁定：点这里' in text
+                            and 'onclick="wasteAskUnlock()"' in text),
+        # ③ 写入口自己再查一次锁（绕过 readonly / 旧缓存直接调也不许落库）
+        'write_guard': 'if (_wasteLocked()) { wasteAskUnlock(); return false; }' in text,
+        # ④ 复用「采购支出」那个密码，不新开密码模块（否则每次加载都弹「首次设置密码」）
+        'reuse_expense': "requestPassword('expense', MODULE_NAMES.expense," in text,
+        # ⑤ 会话失效时一起回锁；会话恢复（expense 已解锁）时一起放开
+        'session_alias': ('unlocked.waste = false;' in text
+                          and 'if (unlocked.expense) unlocked.waste = true;' in text),
+    }
+
+
 # ══════════════════════════════════════════════════════════════
 # A. 静态接线
 # ══════════════════════════════════════════════════════════════
@@ -55,12 +139,20 @@ section('A. 静态接线（页面源码里必须存在的实现片段）')
 
 check('有「用纸统计」区块渲染函数 paperStatsSectionHTML',
       'function paperStatsSectionHTML(r, m) {' in src)
-check('用纸统计区块标题 = 🧻 用纸统计',
-      "<h2>🧻 用纸统计 <span" in src)
-check('每人一格可编辑「废纸」并回调 updWastePaper(memberId, value)',
-      'onchange="updWastePaper(\\\'' in src and '\\\', this.value)"></td>' in src)
-check('合计列显示成「正常 N + 废 M 张」（用户原话 xx+xx张）',
-      "'<td style=\"font-weight:700\">正常 ' + fmtInt(normal) + ' + 废 ' + fmtInt(waste) + ' 张</td>'" in src)
+check('用纸统计区块标题 = 🧻 用纸统计（v7.33 起标题右侧还挂 _wasteLockHTML() 那枚 🔒）',
+      "<h2>🧻 用纸统计" in src and '_wasteLockHTML() + ' in src)
+check('每人一格可编辑「废纸」并回调 updWastePaper(memberId, value, el)',
+      'oninput="updWastePaper(' in src and "', this.value, this)\" " in src
+      and 'onblur="_wasteFlushSoon()"></td>' in src)
+check('废纸格带 data-mid（重画后靠它找回同一个成员那一格）',
+      'data-mid="\' + esc(mem.id) + \'"' in src and 'class="inp-waste' in src)
+check('废纸格失焦后收尾（onblur = _wasteFlushSoon，重算 A4 纸摊销）',
+      'onblur="_wasteFlushSoon()"' in src)
+check('合计列带就地刷新标记 js-wsum（v7.32：逐格输入时只换这一格，不整页重画抢焦点；'
+      '「正常 N + 废 M 张」的文案本身由 W6 实测渲染字符串钉住）',
+      'class="js-wsum"' in src and '"js-wover"' in src)
+check('脚注带就地刷新标记 js-wmemo / js-wtw / js-wfoot（同上，中文文案交给 W6）',
+      'class="js-wmemo"' in src and 'class="js-wtw"' in src and 'class="js-wfoot"' in src)
 check('废纸格留空时 placeholder = 预估张数（留空看得到预估）',
       "'\" placeholder=\"' + fmtInt(est) + '\" '" in src)
 check('废纸来源标注区分「人工 / 预估」',
@@ -71,6 +163,24 @@ check('用纸统计有「未归属」行（成员被删 / 订单没绑成员时�
 # 已经不存在了 —— 顺序判据改成看两个折叠块的先后（paper 必须排在 amort 之前）。
 check('用纸统计在「长期耗材摊销」之前渲染',
       src.index("h += secFold('paper',") < src.index("h += secFold('amort',"))
+
+# ── v7.33：废纸格的锁（照订单明细「状态」列那把 🔒 做） ──────────────────
+_WL = waste_lock_wiring()
+check('★ v7.33 ①「用纸统计」标题右侧有 .st-lock 的 🔒/🔓（与订单明细状态列同一个控件、同一句提示结构）',
+      _WL['lock_btn'])
+check('★ v7.33 ② 锁定态格子 = readonly + 点一下弹密码框（用户："提示要解锁，可我没看到在哪解锁"）',
+      _WL['locked_readonly'])
+check('★ v7.33 ③ 写入口自己先查锁（绕过 readonly / 控制台直调也不落库）',
+      _WL['write_guard'])
+check('★ v7.33 ④ 复用「采购支出」密码，不新开密码模块（新模块会让每次加载都弹「首次设置密码」）',
+      _WL['reuse_expense'])
+check('★ v7.33 ⑤ 会话到期一起回锁；expense 已解锁时会话恢复即一并放开',
+      _WL['session_alias'])
+check('★ v7.33 ⑥ PASSWORD_KEYS 里没有 waste（后端 FINANCE_MODULES 不认识它 ⇒ 不能当密码模块用）',
+      "'waste'" not in re.search(r"var PASSWORD_KEYS = \[([^\]]*)\]", src).group(1))
+check('★ v7.33 ⑦ 解锁弹窗支持补充说明行（hint 参数；说明"与采购支出共用密码"）',
+      'function requestPassword(key, label, hint) {' in src
+      and "requestPassword('expense', MODULE_NAMES.expense," in src)
 
 check('废纸人工值读的是 config.waste_paper（按月 × 成员）',
       'var bag = (STORE.config && STORE.config.waste_paper) || {};' in src and 'var mon = bag[key];' in src)
@@ -104,7 +214,26 @@ check('updWastePaper：留空 = 删除该格（并清理空月份）',
 check('updWastePaper：非负整数校验（负数 / 文字不落库）',
       "if (!/^\\d+$/.test(txt)) {" in src and "toast('废纸张数要填非负整数（留空 = 按失败订单自动预估）', 'error');" in src)
 check('updWastePaper：落库后作废用量缓存（A4纸摊销跟着变）',
-      'mon[mid] = Math.round(+txt);' in src and 'invalidateUsage(currentKey);' in src)
+      'mon2[mid] = n;' in js_func('updWastePaper')
+      and 'invalidateUsage(currentKey);' in js_func('_wasteFlushSoon'))
+
+# ── v7.32：现场「填了被覆盖 / 没传回云端」的四道闸 ──────────────────────────
+# 现场：用纸统计整块由 renderDash() 的 innerHTML 重建，废纸格从前只在 change（失焦）落库。
+# 输入到一半时来一次重画（用量取回 / 耗材补取 / 上一次编辑自己触发）就把 input 换掉，
+# 浏览器不给被移除的元素补发 change ⇒ 刚敲的数字既没进 STORE 也没 save。
+_w = waste_wiring()
+check('★ v7.32 ① 废纸格 oninput 即时落库（不再只等失焦）且失焦后收尾重算', _w['oninput'])
+check('★ v7.32 ② 每格带 data-mid（重画后按成员找回那一格，不认行下标）', _w['data_mid'])
+check('★ v7.32 ③ renderDash 重画前先快照，且早于 calcMonthWithUsage（废纸值影响用量）',
+      _w['snapshot_before_calc'])
+check('★ v7.32 ④ renderDash 画完按快照还原焦点与光标', _w['restore_after_render'])
+check('★ v7.32 ⑤ updWastePaper 自己不再同步 renderDash（那正是抢焦点的来源）', _w['no_sync_render'])
+check('★ v7.32 ⑥ 快照里先把没落库的值写进 STORE（重画一换 DOM 就读不到了）', _w['snapshot_commits'])
+check('★ v7.32 ⑦ 本机代理透传 server_version（否则前端冲突检测是死代码、整本静默覆盖）',
+      proxy_passes_server_version(),
+      'stats_server._extract_proxy_body')
+check('★ v7.32 ⑧ 没解锁时保存被挡下要出声（不再静默丢写入）',
+      '_pendingSaveNotified' in js_func('_doSave') and '需要解锁后才能写入云端' in js_func('_doSave'))
 check('migrateConfig 归一 waste_paper（脏数据不变成算不清的纸）',
       'if (!c.waste_paper || typeof c.waste_paper !== \'object\' || Array.isArray(c.waste_paper)) c.waste_paper = {};' in src)
 check('mergeStores 合并 waste_paper（月 × 成员并集）',
@@ -159,11 +288,22 @@ function wasteSandbox(src) {
   snippet += "\nvar __M = [];";
   snippet += "\nfunction getMembers() { return __M; }";
   snippet += "\nfunction getMember(id) { for (var i = 0; i < __M.length; i++) { if (__M[i].id === id) return __M[i]; } return null; }";
-  snippet += "\nvar __TOASTS = [], __SAVES = 0, __INVAL = 0, __RENDERS = 0;";
+  snippet += "\nvar __TOASTS = [], __SAVES = 0, __INVAL = 0, __RENDERS = 0, __FLUSH = 0;";
   snippet += "\nfunction toast(m, k) { __TOASTS.push([String(m), String(k || '')]); }";
   snippet += "\nfunction save() { __SAVES++; }";
   snippet += "\nfunction invalidateUsage() { __INVAL++; }";
   snippet += "\nfunction renderDash() { __RENDERS++; }";
+  /* v7.32：这三个是 DOM 侧的就地刷新 / 焦点保护，Node 里没有 DOM ⇒ 只留接线桩，
+     用来断言「updWastePaper 不再同步重画、且编辑后确实请求了推迟重算」。 */
+  snippet += "\nfunction _wasteMarkBad() {}";
+  snippet += "\nfunction _wasteRefreshRow() {}";
+  snippet += "\nfunction _wasteFlushSoon() { __FLUSH++; }";
+  /* v7.33：废纸格的锁 —— Node 里没有弹窗，requestPassword 只做计数桩；
+     unlocked.waste 默认为真（多数用例测的是"填了会不会存"），锁相关的用例自己翻成 false。 */
+  snippet += "\nvar __ASK = 0;";
+  snippet += "\nvar unlocked = { waste: true, expense: true };";
+  snippet += "\nvar MODULE_NAMES = { expense: '采购支出' };";
+  snippet += "\nfunction requestPassword() { __ASK++; return { then: function () {} }; }";
   snippet += "\nvar currentKey = '2026-10';";
   snippet += "\nfunction _fmtDate(d) { return String(d == null ? '' : d).slice(0, 10); }";
   snippet += "\nfunction _orderMemberKey(o) {";
@@ -185,6 +325,7 @@ function wasteSandbox(src) {
        它在「数据模型切片」之外，不补进来 Node 侧会以 `_orderNormalUsage is not defined` 崩。 */
     '_orderNormalUsage',
     'wasteManualOf', 'wasteEstimateOf', 'wasteSheetsOf', '_applyWasteToUsage',
+    '_wasteLocked', '_wasteLockHTML', 'wasteAskUnlock',
     'paperStatsSectionHTML', 'updWastePaper', 'consumableAmort'];
   const missing = [];
   for (const name of need) {
@@ -315,38 +456,67 @@ function runCases() {
     html.indexOf('value="12"') >= 0 && html.indexOf('placeholder="40"') >= 0);
   P('W6 李四填了 0 ⇒ value="0"（不是留空）且来源标「人工」',
     html.indexOf('value="0"') >= 0 && html.indexOf('<span class="tag g">人工</span>') >= 0);
-  P('W6 废纸格回调带上成员 ID（引号字符串，防注入）',
-    html.indexOf("updWastePaper('ma', this.value)") >= 0);
+  P('W6 废纸格回调带上成员 ID（引号字符串，防注入）与元素本身（标红用）',
+    html.indexOf("updWastePaper('ma', this.value, this)") >= 0);
   P('W6 合计行 = 正常 100 + 废 19 张',
     html.indexOf('正常 100 + 废 19 张') >= 0);
   P('W6 未归属行把 7 张孤废纸显式列出来（不静默吞掉）',
     html.indexOf('未归属') >= 0 && html.indexOf('>7 张<') >= 0);
+  P('W6 v7.33 解锁态：标题右侧是 🔓，且带 toggleWasteLock 点击（与订单明细同一个 .st-lock）',
+    html.indexOf('class="st-lock on"') >= 0 && html.indexOf('🔓') >= 0
+    && html.indexOf('toggleWasteLock()') >= 0);
+  P('W6 v7.33 解锁态的格子不带 readonly（能直接编辑）',
+    html.indexOf('readonly') < 0);
 
-  /* ═════ W7：updWastePaper 的输入校验与落库 ═════ */
+  /* ═════ W6b：v7.33 锁定态 —— 只读 + 点格子就弹密码框，且一个字节都不落库 ═════ */
+  sb.unlocked.waste = false;
+  sb.__TOASTS.length = 0;
+  sb.__ASK = 0;
+  const nSaveL = sb.__SAVES;
+  const htmlL = sb.paperStatsSectionHTML({ usage: u4, amort: null }, m);
+  P('W6b 锁定态：格子是 inp-waste locked + readonly（看得到历史值，改不了）',
+    htmlL.indexOf('class="inp-waste locked"') >= 0 && htmlL.indexOf('readonly') >= 0);
+  P('W6b 锁定态：点格子 = 解锁入口（onclick=wasteAskUnlock()，这就是"上哪输密码"的答案）',
+    htmlL.indexOf('onclick="wasteAskUnlock()"') >= 0);
+  P('W6b 锁定态：标题右侧是 🔒 且提示"点击输入密码解锁"',
+    htmlL.indexOf('>🔒</button>') >= 0 && htmlL.indexOf('点击输入密码解锁后') >= 0);
+  const rLocked = sb.updWastePaper('ma', '9');
+  P('W6b 锁定态直接调写入口（在控制台 / 旧缓存里绕过 readonly）：不落库、不保存，只弹解锁框',
+    rLocked === false && sb.__SAVES === nSaveL && sb.__ASK === 1
+    && (sb.STORE.config.waste_paper['2026-10'] || {}).ma !== 9,
+    'ask=' + sb.__ASK + ' saves=' + sb.__SAVES);
+  sb.unlocked.waste = true;
+
+  /* ═════ W7：updWastePaper 的输入校验与落库（v7.32：边打边存，不再同步重画） ═════ */
   sb.STORE.config.waste_paper = {};
   sb.__TOASTS.length = 0;
-  const nSave0 = sb.__SAVES, nRend0 = sb.__RENDERS, nInv0 = sb.__INVAL;
-  sb.updWastePaper('ma', 'abc');
-  P('W7 文字输入：不落库、弹错、重绘恢复原值',
-    sb.__TOASTS.length === 1 && sb.__TOASTS[0][1] === 'error'
-    && sb.__SAVES === nSave0 && sb.__RENDERS === nRend0 + 1
+  const nSave0 = sb.__SAVES, nRend0 = sb.__RENDERS;
+  const rBad = sb.updWastePaper('ma', 'abc');
+  P('W7 文字输入：不落库、不写库、弹错（用户敲的字留在框里，不替他清）',
+    rBad === false && sb.__TOASTS.length === 1 && sb.__TOASTS[0][1] === 'error'
+    && sb.__SAVES === nSave0 && sb.__RENDERS === nRend0
     && !(sb.STORE.config.waste_paper['2026-10'] || {}).ma,
     JSON.stringify(sb.__TOASTS));
-  sb.updWastePaper('ma', '-3');
+  const rNeg = sb.updWastePaper('ma', '-3');
   P('W7 负数输入：同样不落库、弹错',
-    sb.__TOASTS.length === 2 && sb.__SAVES === nSave0
-    && !(sb.STORE.config.waste_paper['2026-10'] || {}).ma);
+    rNeg === false && sb.__TOASTS.length === 2 && sb.__SAVES === nSave0);
+  P('W7 v7.32 编辑废纸不再同步 renderDash（重画会抢走正在输入的焦点 ⇒ 值被吞）',
+    sb.__RENDERS === nRend0, 'renders=' + sb.__RENDERS);
   sb.updWastePaper('ma', '12');
-  P('W7 合法输入：写入 waste_paper[月][成员]、保存、并作废用量缓存',
-    sb.STORE.config.waste_paper['2026-10'].ma === 12 && sb.__SAVES === nSave0 + 1
-    && sb.__INVAL === nInv0 + 1,
+  P('W7 合法输入：立刻写进 waste_paper[月][成员] 并保存（不等失焦）',
+    sb.STORE.config.waste_paper['2026-10'].ma === 12 && sb.__SAVES === nSave0 + 1,
     JSON.stringify(sb.STORE.config.waste_paper));
+  const nSave1 = sb.__SAVES;
+  sb.updWastePaper('ma', '12');
+  P('W7 同值重复提交不重复写库（挪光标 / 前后空格不会把保存打满）', sb.__SAVES === nSave1);
   sb.updWastePaper('ma', '0');
   P('W7 填 0 也会落库（明确没有废纸，区别于留空）',
     sb.STORE.config.waste_paper['2026-10'].ma === 0, JSON.stringify(sb.STORE.config.waste_paper));
+  const nSave2 = sb.__SAVES;
   sb.updWastePaper('ma', '  ');
   P('W7 留空 = 删除该格；月份空了连月份键一起删',
     !sb.STORE.config.waste_paper['2026-10'], JSON.stringify(sb.STORE.config.waste_paper));
+  P('W7 删除也要真的落盘一次', sb.__SAVES === nSave2 + 1);
 
   /* ═════ W8：换月读对应月的人工值 ═════ */
   sb.STORE.config.waste_paper = { '2026-10': { ma: 12 }, '2026-11': { ma: 3 } };
@@ -440,6 +610,85 @@ with tempfile.TemporaryDirectory() as tmpdir:
         check(f'变异 {idx}「{title}」后新脚本转红（exit={mr.returncode}，红在 {len(hit)} 条预期断言上）',
               mr.returncode == 1 and len(hit) == len(expect_red),
               '红的断言：' + ' | '.join(fails[:4]))
+
+# ══════════════════════════════════════════════════════════════
+# D. 变异自证（v7.32：重画保护 / 代理透传，改坏必须转红）
+# ══════════════════════════════════════════════════════════════
+section('D. 变异自证（v7.32 重画保护 / 代理透传，改坏必须转红在对应判据上）')
+
+WIRING_MUTANTS = [
+    ('重画前不拍快照（回到「输入中被 innerHTML 换掉就丢值」的老路）',
+     'var _wSnap = _wasteFocusSnapshot();',
+     'var _wSnap = null;',
+     'snapshot_before_calc'),
+    ('画完不还原焦点（值还在，但光标没了 ⇒ 接着敲就落到 body 上）',
+     '_wasteFocusRestore(_wSnap);',
+     'void _wSnap;',
+     'restore_after_render'),
+    ('废纸格退回「只认 onchange」（现场那条路：失焦前被重画就丢）',
+     'oninput="updWastePaper(',
+     'onchange-only="updWastePaper(',
+     'oninput'),
+    ('废纸格不带 data-mid（重画后按行下标找，成员一增删就串行）',
+     'data-mid="\' + esc(mem.id) + \'"',
+     'data-row="\' + esc(mem.id) + \'"',
+     'data_mid'),
+    ('快照只读不落库（重画一换 DOM，刚敲的字仍然丢）',
+     'var ok = updWastePaper(mid, val, el);',
+     'var ok = false;',
+     'snapshot_commits'),
+    ('updWastePaper 里又塞回同步 renderDash（抢走正在输入的焦点）',
+     '  _wasteDirty = true;\n  _wasteRefreshRow(mid);\n  return true;\n}',
+     '  renderDash();\n  _wasteDirty = true;\n  _wasteRefreshRow(mid);\n  return true;\n}',
+     'no_sync_render'),
+]
+
+for _idx, (_title, _old, _new, _key) in enumerate(WIRING_MUTANTS, 1):
+    if _old not in src:
+        check(f'v7.32 变异 {_idx}「{_title}」的锚点仍存在', False,
+              '锚点没找到（源码改动后要同步更新本脚本）')
+        continue
+    _got = waste_wiring(src.replace(_old, _new, 1))
+    check(f'v7.32 变异 {_idx}「{_title}」后判据 {_key} 转红', _got.get(_key) is False, str(_got))
+
+_pxy = stats_server_body()
+check('v7.32 变异 7：代理白名单删掉 server_version 后判据转红',
+      proxy_passes_server_version(_pxy)
+      and not proxy_passes_server_version(_pxy.replace('out["server_version"] = data["server_version"]', '', 1)),
+      'stats_server._extract_proxy_body')
+
+# ── v7.33：锁的变异自证（每条都要把对应判据打红，否则判据就是摆设） ──────────
+LOCK_MUTANTS = [
+    ('标题上不再挂 🔒（回到 v7.32：提示要解锁、页面上却没有入口）',
+     "<h2>🧻 用纸统计' + _wasteLockHTML() +",
+     "<h2>🧻 用纸统计' +",
+     'lock_btn'),
+    ('锁定态还给 readonly 但不给点击入口（看得见锁、找不到门）',
+     'readonly title="🔒 已锁定：点这里（或标题右侧的 🔒）输入密码后可编辑" onclick="wasteAskUnlock()" ',
+     'readonly ',
+     'locked_readonly'),
+    ('写入口不查锁（绕过 readonly 直接调就能改账）',
+     'if (_wasteLocked()) { wasteAskUnlock(); return false; }',
+     'if (false) { }',
+     'write_guard'),
+    ('解锁改去要一个不存在的 waste 密码模块（后端不认 ⇒ 解锁永远失败）',
+     "requestPassword('expense', MODULE_NAMES.expense,",
+     "requestPassword('waste', MODULE_NAMES.expense,",
+     'reuse_expense'),
+    ('会话恢复时不放开废纸锁（解锁了采购支出，废纸格仍然点不动）',
+     'if (unlocked.expense) unlocked.waste = true;',
+     'void 0;',
+     'session_alias'),
+]
+
+section('D. v7.33 变异自证（把锁拆掉，对应判据必须转红）')
+for _idx, (_title, _old, _new, _key) in enumerate(LOCK_MUTANTS, 1):
+    if _old not in src:
+        check(f'v7.33 变异 {_idx}「{_title}」的锚点仍存在', False,
+              '锚点没找到（源码改动后要同步更新本脚本）')
+        continue
+    _got = waste_lock_wiring(src.replace(_old, _new, 1))
+    check(f'v7.33 变异 {_idx}「{_title}」后判据 {_key} 转红', _got.get(_key) is False, str(_got))
 
 print('\n' + '=' * 60)
 print('废纸（v7.10 需求 B）验收: ' + ('全部通过 ✅' if not FAIL else '存在失败 ❌'))
