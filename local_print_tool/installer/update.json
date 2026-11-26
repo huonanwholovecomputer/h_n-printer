@@ -1,9 +1,9 @@
 {
-  "version": "4.7.4",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.4.exe",
-  "md5": "4820666b5af496368710d058565e9167",
-  "sha256": "863374baf46d8f4a207f85f6509e6aab42fbfd65775e98b4317111d59c531d36",
-  "notes": "v4.7.4：修三处会悄悄出错的地方 —— ①云端单有时按「0 页」计费：缓存里「页数待定」的占位 0 被当成真页数，十几页的单只算 0 元，现在命中缓存会回读 PDF 重新数；②Word/WPS 转换引擎中途掉线原来只会静默重试，第一份文件必定白失败一次，现在一掉线就立刻重建实例并立刻重试；③取号被云端拒绝时日志里只剩「超时」，现在会写明 HTTP 状态码并提示重新签发 token。另外：外部打印监视中断会记录中断时长，超过 5 分钟提示检查 Print Spooler；程序崩溃也会写进当日日志，不再只落一个单独文件。",
+  "version": "4.7.5",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.5.exe",
+  "md5": "d445dcc7d274fa6a1226a25e1a779e03",
+  "sha256": "d0444c8b10dab39efcadf3cb3dd0b92708b3bb74c914824ff68be0cbaa16a057",
+  "notes": "v4.7.5：手动双面翻纸窗的「继续打第 2 趟」改为按放行比例先灰后亮，并修掉上一批的计时漏进本批（现场出现本批才开打 17 秒却写「已用 02:57」，按钮还一出现就是亮的）；字体名写坏的 docx（如把「黑体;黑体」原样塞进字体属性）现在单独识别成第三类问题，转换前在副本上修成单族名、打印前只提示不拦，并作废那批「整篇回落宋体」的旧缓存；WPS 保存的 .doc 改为按最后保存它的程序选引擎，页码不再算成 1/1、双面页序不再错，.doc 缓存也按引擎隔离；常驻窗被拖出屏幕后下次显示自动拉回。收支清算：废纸格加锁（与状态/采购支出同一把密码）、输入即落库、光标错位修好，并恢复云端账本并发冲突的三选一确认框。小程序滚轮重做需自行上传。",
   "sig_algo": "ed25519",
-  "sig": "Rb8Lz8Rm9CPqdu2mrsod/+fdfubX4KmzjoW63xLdHxN0MAwxWfewZF3fnc6KTnVh4KzGzHpvWXdNekoPRsinAg=="
+  "sig": "N8RTYMOVf0E2peOhz7uIoY/DhwMkd092iWP9/fcTl1/M+GbxpUAHurh4uYQBV76EBERrxr/l4VElxMAV5ZBjCQ=="
 }
