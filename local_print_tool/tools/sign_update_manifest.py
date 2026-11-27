@@ -189,7 +189,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("manifest", nargs="?",
                     help="更新清单路径（如 local_print_tool/installer/update.json）")
     ap.add_argument("--key", default=os.environ.get("HN_UPDATE_SIGNING_KEY_PATH", ""),
-                    help=f"私钥 PEM 路径（也可用环境变量 HN_UPDATE_SIGNING_KEY_PATH；默认提示 {DEFAULT_KEY_HINT}）")
+                    # argparse 会拿 help 做 % 格式化：%USERPROFILE% 里的 % 必须转义成 %%
+                    help=f"私钥 PEM 路径（也可用环境变量 HN_UPDATE_SIGNING_KEY_PATH；默认提示 {DEFAULT_KEY_HINT.replace('%', '%%')}）")
     ap.add_argument("--gen-key", metavar="PATH", default=None,
                     help="生成 ed25519 密钥对到 PATH（仓库外），并打印公钥")
     ap.add_argument("--write", action="store_true",

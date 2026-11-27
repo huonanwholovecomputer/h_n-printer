@@ -17,6 +17,7 @@
 反向验证（必红）：
   · 删掉 cmd 里 `start "" notepad "<note>"` 那行 → ② 红
   · 把 `write_update_note` 里的目标版本号去掉 → ① 红
+  · 把「写说明 / 启动安装器」挪回下载线程，或删掉 closeEvent 收尾的启动 → ③ 红
 """
 import os
 import sys
@@ -86,14 +87,41 @@ check("②-e 注释解释了为什么以前是空承诺（.iss 先删程序）",
 check("②-f 仍然会尝试重新启动程序（装了但没起来的情况）",
       "start" in _fail_block.split("notepad", 1)[-1], _fail_block[-200:])
 
-print("── ③ 主程序侧：启动安装器之前就调用（源码层）──")
+print("── ③ 主程序侧：启动安装器之前就写好说明（源码层）──")
 _src = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
-_w = _src.split("def _update_download_worker", 1)[1].split("\n    def ", 1)[0]
-check("③-a 下载完成后调用了 write_update_note", "write_update_note(" in _w)
-check("③-b 调用点在 `_run_cmd_minimized`（真正启动安装器）之前",
-      _w.index("write_update_note(") < _w.index("_run_cmd_minimized("), "顺序反了")
-check("③-c 传了当前版本与目标版本",
-      "APP_VERSION" in _w.split("write_update_note(", 1)[-1][:300])
+
+
+def _method(name):
+    """取 MainWindow 某个方法的源码（到下一个同级 def 为止）。"""
+    head = f"    def {name}("
+    if head not in _src:
+        return ""
+    return _src.split(head, 1)[1].split("\n    def ", 1)[0]
+
+
+# 2026-11-27：写说明与启动安装器拆到了两个方法。原来两步都挤在下载线程里，
+# 用户点「稍后安装」之后 update.cmd 仍会在等待循环到点时静默安装。
+_worker = _method("_update_download_worker")
+_prep = _method("_prepare_update_install")
+_launch = _method("_run_pending_update_install")
+_confirm = _method("_confirm_install_update")
+# gui.py 里有 4 个 closeEvent（2074/3188/8794/26548 行），主窗口的是最后一个
+_close = _src.rsplit("    def closeEvent(", 1)[1].split("\n    def ", 1)[0]
+
+check("③-a 下载线程不再自己写说明、也不启动安装器（都得等用户确认）",
+      "write_update_note(" not in _worker and "_run_cmd_minimized(" not in _worker,
+      "下载线程里不该出现这两步")
+check("③-b 用户点「立即安装」后写回滚说明", "write_update_note(" in _prep)
+check("③-c 说明写在确认时、启动在退出收尾（所以说明一定先于安装器写出）",
+      "_prepare_update_install(" in _confirm and "write_update_note(" not in _launch,
+      f"confirm={'_prepare_update_install(' in _confirm} launch_clean={'write_update_note(' not in _launch}")
+check("③-d 启动安装器只有一处，且在 closeEvent 收尾",
+      _src.count("self._run_pending_update_install()") == 1
+      and "_run_pending_update_install()" in _close,
+      f"count={_src.count('self._run_pending_update_install()')}")
+check("③-e 传了当前版本与目标版本",
+      "APP_VERSION" in _prep.split("write_update_note(", 1)[-1][:300]
+      and '"version"' in _prep.split("write_update_note(", 1)[-1][:300])
 
 print()
 if _fails:

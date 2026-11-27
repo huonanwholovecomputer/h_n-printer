@@ -131,7 +131,7 @@ import agent_ops  # 控制接口的 op 实现（建页/加文件/改参数/打�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.7.5"
+APP_VERSION = "4.7.6"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -11155,6 +11155,12 @@ class MainWindow(QMainWindow):
             if getattr(self, "_tray", None) is not None:
                 self._tray.stop()
             QApplication.quit()
+        else:
+            # 退出被用户在确认框里取消（攒批纸叠 / 打印进行中 / 未打印标签页）：
+            # 本次不装更新，并清掉两处一次性标记 —— 否则下一次普通关窗会跳过
+            # 「未打印标签页」确认，把订单静默放弃；残留的待装清单也会在下次退出时诈尸。
+            self._pending_update_install = None
+            self._update_install_confirmed = False
 
     # ---- 自更新（检查 / 下载 / 触发静默安装）----
 
@@ -11359,11 +11365,18 @@ class MainWindow(QMainWindow):
         self._log("☁ 已取消更新下载")
 
     def _update_download_worker(self, manifest: dict, code: str = ""):
-        """后台：下载安装包（带进度回调）→ 哈希校验 → 写 update.cmd → 最小化运行。"""
+        """后台：下载安装包（带进度回调）→ 哈希校验 → 把「待安装」材料交回主线程。
+
+        2026-11-27：这里**只下载，不装**。旧写法在这里就 `write_update_cmd` +
+        `_run_cmd_minimized` 把安装器拉起来，而 update.cmd 的等待循环有上限（约 1~2 分钟），
+        到点不管主进程是否还活着都会静默安装 —— 用户点「稍后安装」继续打单，过一两分钟
+        安装器就会把正在运行的程序目录删掉。现在改成：这里只算好 install_dir / start_cmd，
+        真正写 cmd 与启动都发生在用户点「立即安装」且退出确认全部走完之后
+        （_prepare_update_install / _run_pending_update_install）。
+        """
         try:
             from updater import (prepare_update, prepare_update_with_code, DownloadCodeError,
-                                 write_update_cmd, write_update_note, device_id,
-                                 _run_cmd_minimized)
+                                 device_id)
             import sys as _sys
 
             def _progress(downloaded: int, total: int):
@@ -11393,7 +11406,6 @@ class MainWindow(QMainWindow):
                 self._updateCheckDone.emit(("download_fail", None, False))
                 return
             setup_path, exe_path = result
-            cmd_path = os.path.join(os.path.dirname(setup_path), "update.cmd")
             # 启动新程序的完整命令 + 显式安装目录：
             # - 打包版：/DIR 指向当前程序目录（保证更新永远装到当前安装位置，
             #   无论发布者是否修改默认安装路径，已装用户都能原地升级）；启动即当前 exe
@@ -11407,22 +11419,14 @@ class MainWindow(QMainWindow):
                 argv0 = os.path.basename(_sys.argv[0]) or "main.py"
                 start_cmd = (
                     f'cd /d "{script_dir}" & start "" "{exe_path}" "{argv0}"')
-            if not write_update_cmd(setup_path, exe_path, cmd_path,
-                                    start_cmd=start_cmd, install_dir=install_dir,
-                                    allow_silent_install=True):
-                self._updateCheckDone.emit(("download_fail", None, False))
-                return
-            # 体检 🔴17：在**启动安装器之前**把「这次更新怎么回滚」写下来。
-            # 安装器会先删程序目录，装失败时程序已经不在了，唯一还活着的就是这个说明。
-            _note = write_update_note(os.path.dirname(setup_path), APP_VERSION,
-                                      str(manifest.get("version") or ""),
-                                      setup_path, install_dir)
-            if _note:
-                self._log(f"☁ 已写回滚说明：{_note}")
-            if not _run_cmd_minimized(cmd_path):
-                self._updateCheckDone.emit(("download_fail", None, False))
-                return
-            self._updateCheckDone.emit(("ready", manifest, False))
+            # 2026-11-27：只把材料交回主线程。用户点「立即安装」之前**不写 cmd、不启动安装器**
+            # （原因见本方法文档串：update.cmd 的等待循环有上限，超时后会在程序运行中静默安装）。
+            self._updateCheckDone.emit(("ready", manifest, {
+                "setup_path": setup_path,
+                "exe_path": exe_path,
+                "install_dir": install_dir,
+                "start_cmd": start_cmd,
+            }))
         except Exception as e:
             logger.error(f"更新准备失败: {e}")
             self._updateCheckDone.emit(("download_fail", None, False))
@@ -11437,7 +11441,13 @@ class MainWindow(QMainWindow):
             dlg.close()
             self._update_dlg = None
         if kind == "ready":
-            self._log(f"☁ 更新安装包已就绪 v{manifest.get('version', '')}，即将退出并自动安装...")
+            spec = _manual if isinstance(_manual, dict) else {}
+            self._log(f"☁ 更新安装包已就绪 v{manifest.get('version', '')}")
+            self._update_install_confirmed = False
+            if not self._confirm_install_update(manifest, spec):
+                # 收起进度弹窗后**不退出**：安装包留在 ready\，下次点「检查更新」直接复用
+                return
+            self._log("☁ 即将退出并自动安装新版本...")
             # 必须走 _quit_app：4.6.0 起裸 close() 只是收进托盘，update.cmd 等不到进程退出，
             # 安装永远装不上。_quit_app 置 _force_quit 走完整退出流程。
             self._quit_app()  # update.cmd 轮询到进程退出后执行静默安装并启动新版本
@@ -11466,9 +11476,120 @@ class MainWindow(QMainWindow):
                     self._open_github_release()
         elif kind == "download_fail":
             if getattr(self, '_update_cancelled', False):
-                QMessageBox.information(self, "更新已取消", "更新下载已取消。")
+                QMessageBox.information(
+                    self, "更新已取消",
+                    "更新下载已取消。\n\n（已下载的部分会保留，下次点「检查更新」接着下，"
+                    "不会从头再来。）")
             else:
                 QMessageBox.warning(self, "更新失败", "下载或准备更新安装包失败，请稍后重试。")
+
+    def _confirm_install_update(self, manifest: dict, spec: dict = None) -> bool:
+        """下载完成 → 先按退出流程处理未完成订单，再明确问「立即安装 / 稍后」。
+
+        2026-11-27 现场（用户原话）：「只有个『下载完成』，没有自动进行安装，
+        或者弹出什么提示框，如果有未完成的订单，需要转到标签页（和退出时同样的逻辑）」。
+
+        根因：ready 分支原来直接 `_quit_app()`，而退出流程会被 closeEvent 里的
+        「有未打印的标签页」确认框接住 —— 用户在**那个**框里点「取消」等于不退出，
+        update.cmd 等不到进程退出，安装包就永远躺在 ready\\ 里没人管，界面上一句
+        「下载完成」之后就再没动静了。现在把这一步摊开：先说清楚要退出安装，
+        未完成订单给和关窗时一模一样的三个去处（去标签页 / 标签页管理器 / 确定退出）。
+
+        `spec` 是下载线程交回来的材料（setup_path / exe_path / install_dir / start_cmd）；
+        **只有**用户在这里点「立即安装」才会写 update.cmd，且启动安装器还要等退出确认全部走完
+        （见 _prepare_update_install / _run_pending_update_install）。
+        """
+        self._ensure_visible_for_close_dialog()
+        info = self._unfinished_tabs_info()
+        if info:
+            choice = self._ask_unfinished_tabs(info)
+            if choice != "quit":
+                self._log(f"☁ 更新已就绪，但还有未打印的文件（{choice}）：先处理，暂不安装")
+                if choice == "goto" and info:
+                    self._goto_tab(info[0]["key"])
+                elif choice == "manager":
+                    self._show_tab_manager()
+                return False
+            # 上面已经问过一次「确定要带着未打印的标签页退出吗」→ closeEvent 不再问第二遍
+            self._update_install_confirmed = True
+        ver = str((manifest or {}).get("version") or "")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("更新已下载完成")
+        box.setText(f"v{ver} 的安装包已下载并通过校验。\n\n"
+                    "现在安装吗？程序会先退出，装好后自动重新打开。\n"
+                    "选「稍后安装」也不会白下：安装包留在本地，下次检查更新直接复用。")
+        btn_now = box.addButton("立即安装并重启", QMessageBox.AcceptRole)
+        btn_later = box.addButton("稍后安装", QMessageBox.RejectRole)
+        box.setDefaultButton(btn_now)
+        box.exec()
+        if box.clickedButton() is not btn_now:
+            self._update_install_confirmed = False  # 这次不退出，别影响以后正常的关窗确认
+            self._log("☁ 更新已下载：本次不安装（安装包已保留，下次不会再下载）")
+            return False
+        if not self._prepare_update_install(manifest, spec or {}):
+            self._update_install_confirmed = False  # 没准备成功 → 不退出，用户可重试
+            return False
+        self._update_install_confirmed = True
+        return True
+
+    def _prepare_update_install(self, manifest: dict, spec: dict) -> bool:
+        """用户确认「立即安装」后才写 update.cmd 与回滚说明；写不出来就地报错、不退出。
+
+        2026-11-27：这两步原来在下载线程里、用户还没看到确认框时就做了。现在必须在这里，
+        因为「写 cmd」本身是安全的，「启动 cmd」才是危险的（启动点见 _run_pending_update_install）；
+        在这里写还能把磁盘错误当场告诉用户，而不是静默失败。
+        """
+        setup_path = str(spec.get("setup_path") or "")
+        exe_path = str(spec.get("exe_path") or "")
+        start_cmd = str(spec.get("start_cmd") or "")
+        install_dir = str(spec.get("install_dir") or "")
+        if not (setup_path and exe_path and start_cmd):
+            QMessageBox.warning(self, "更新准备失败",
+                                "安装包信息不完整，请重新点「检查更新」。")
+            return False
+        try:
+            from updater import write_update_cmd, write_update_note
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"加载更新写盘模块失败: {e}")
+            QMessageBox.warning(self, "更新准备失败",
+                                "无法准备更新安装器，请稍后重试。")
+            return False
+        cmd_path = os.path.join(os.path.dirname(setup_path), "update.cmd")
+        if not write_update_cmd(setup_path, exe_path, cmd_path,
+                                start_cmd=start_cmd, install_dir=install_dir,
+                                allow_silent_install=True):
+            QMessageBox.warning(self, "更新准备失败",
+                                "无法生成 update.cmd（目录可能不可写），请稍后重试。")
+            return False
+        # 体检 🔴17：在**启动安装器之前**把「这次更新怎么回滚」写下来。
+        # 安装器会先删程序目录，装失败时程序已经不在了，唯一还活着的就是这个说明。
+        _note = write_update_note(os.path.dirname(setup_path), APP_VERSION,
+                                  str((manifest or {}).get("version") or ""),
+                                  setup_path, install_dir)
+        if _note:
+            self._log(f"☁ 已写回滚说明：{_note}")
+        self._pending_update_install = {"cmd_path": cmd_path}
+        return True
+
+    def _run_pending_update_install(self) -> None:
+        """退出流程最后一刻才真正启动 update.cmd（由 closeEvent 收尾调用）。
+
+        位置就是安全边界：早一步，用户还可能改主意（「稍后安装」、或在攒批/打印确认里
+        选「不退出」），而安装器已经在等主进程退出；update.cmd 的等待循环有上限，
+        到点会在程序仍在运行时静默安装，把正在跑的 exe / _internal 删掉。
+        """
+        spec = getattr(self, "_pending_update_install", None)
+        self._pending_update_install = None
+        if not spec:
+            return
+        cmd_path = str(spec.get("cmd_path") or "")
+        try:
+            from updater import _run_cmd_minimized
+            if not _run_cmd_minimized(cmd_path):
+                logger.error(f"启动更新安装器失败：{cmd_path}")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"启动更新安装器失败：{e}（可手动运行 {cmd_path} 完成安装）")
 
     def _open_github_release(self) -> None:
         """打开 GitHub Release 页（公开、免费、不限量的推荐下载渠道）。"""
@@ -26593,7 +26714,15 @@ class MainWindow(QMainWindow):
                 # 单页 → 「去到这个标签页」；多页 → 「打开标签页管理器」；两边都有 确定/取消。
                 self._ensure_visible_for_close_dialog()
                 _unfinished = self._unfinished_tabs_info()
-                _choice = self._ask_unfinished_tabs(_unfinished)
+                # 一次性消费：本次没退成（下面任何一处 ignore）就作废，下次关窗照常问，
+                # 不能因为「上次在更新框里确认过」就跳过未打印订单的确认（会静默 abandon）。
+                _install_confirmed = bool(getattr(self, "_update_install_confirmed", False))
+                self._update_install_confirmed = False
+                if _install_confirmed:
+                    # 更新窗口里已经问过「确定带着未打印的标签页退出并安装」，别问第二遍
+                    _choice = "quit"
+                else:
+                    _choice = self._ask_unfinished_tabs(_unfinished)
                 if _choice != "quit":
                     event.ignore()
                     self._closing = False  # 用户选择不退出，恢复打印启动流程
@@ -26670,6 +26799,11 @@ class MainWindow(QMainWindow):
         # 停止收支清算统计服务器
         if self._stats_server:
             self._stats_server.stop()
+
+        # 更新安装：所有「确认退出」都过了，这才是真正拉起安装器的位置。
+        # 必须放最后：早一步，用户改主意/点「稍后安装」时安装器已经在等主进程退出，
+        # update.cmd 的等待循环有上限，到点会在程序还活着的时候静默安装。
+        self._run_pending_update_install()
 
         # 走到这里说明「确认退出」的收尾确实跑完了（_quit_app 据此判断 close() 是否生效）
         self._close_done = True

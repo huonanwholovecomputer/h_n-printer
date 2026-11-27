@@ -51,7 +51,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import time
@@ -71,6 +70,13 @@ UPDATE_GRANT_URL = "https://hn-space.cn/api/dl/grant"
 GITHUB_RELEASE_URL = "https://github.com/huonanwholovecomputer/h_n-printer/releases/latest"
 FETCH_TIMEOUT = 10
 DOWNLOAD_CHUNK = 65536
+# ── 下载抗抖动（2026-11 现场：门店机读到 22% 就再也不动了，点取消重试又从 0 开始）──
+# socket 超时：一次 read 超过这么久没有字节就抛 TimeoutError，交给重试循环接着断点续传。
+# 旧实现写死 120s，等于"卡住 2 分钟才失败"，界面看着就是死了。
+DOWNLOAD_SOCK_TIMEOUT = 30
+# 单次网络失败后的重试次数（含首次尝试）。重试一律走 HTTP Range 续传，不重下整包。
+DOWNLOAD_MAX_ATTEMPTS = 3
+DOWNLOAD_RETRY_BACKOFF = 3.0  # 第 n 次重试前先睡 n*BACKOFF 秒（避开瞬断/限速窗口）
 _WAIT_MAX_LOOPS = 60  # update.cmd 轮询等待主程序退出上限（约 2 分钟）
 MAX_REDIRECTS = 3     # 更新链只允许极少量跳转（COS 回源/CDN 常见 0~1 次）
 MAX_MANIFEST_BYTES = 512 * 1024
@@ -659,15 +665,20 @@ def _write_rollback_note(root: str, exe_dir: str = "") -> None:
 
 
 def _cleanup_stale_setups(dest_dir: str, keep_fname: str,
-                          exts: tuple[str, ...] = (".exe", ".part", ".tmp")) -> None:
+                          exts: tuple[str, ...] = (".exe", ".part", ".tmp"),
+                          keep_extra: tuple[str, ...] = ()) -> None:
     """清理更新目录中的残留（防堆积）：保留 keep_fname，删其它命中 exts 的文件。
 
-    ⚠ ready\\ 目录**只清 .part/.tmp**（调用方传 exts=(".part", ".tmp")）：
+    `keep_extra` 是"额外要保住的文件名"（断点续传中的 `<安装包>.part` 就靠它保命，
+    否则每次开始下载都会把自己的续传进度删掉）。
+
+    ⚠ ready\\ 目录**只清 .part/.tmp**（调用方传 exts=((".part", ".tmp")）：
     旧写法把 .exe 一起清掉，会在 `_archive_previous` 之前就把上一版安装包删了，
     等于"保留上一版做回滚"形同虚设（S1-02 改动 5 的回滚材料）。"""
+    keep = {keep_fname, *keep_extra}
     try:
         for name in os.listdir(dest_dir):
-            if name == keep_fname:
+            if name in keep:
                 continue
             if name.lower().endswith(tuple(exts)):
                 try:
@@ -706,8 +717,28 @@ def _archive_previous(ready_dir: str, previous_dir: str, keep_fname: str) -> Non
 # 下载 + 校验（改动 2/5）
 # ============================================================================
 
-def _safe_setup_name(url: str) -> str:
-    """从 URL 取安装包文件名（去 query，禁路径分隔符，兜底 setup.exe）。"""
+def _safe_version_tag(version: str) -> str:
+    """把版本号压成可做文件名的片段（4.7.5 → 4.7.5；非法字符一律剔掉）。"""
+    tag = re.sub(r"[^0-9A-Za-z._-]", "", str(version or "")).strip("._-")
+    return tag[:32]
+
+
+def _safe_setup_name(url: str, version: str = "") -> str:
+    """安装包落地文件名。
+
+    **有版本号时一律用稳定名** `h_n_printer_setup_v<version>.exe`，不再从 URL 取名字。
+
+    为什么必须改（2026-11-26 现场）：走下载码通道时 url 是 `https://hn-space.cn/dl/<令牌>`，
+    令牌每次点「检查更新」都变 —— 旧实现按 URL basename 取名，于是每次下载都是新文件名，
+    下面「本地已有同哈希文件就直接复用」永远命中不了，用户下载过一次、装失败再试一次，
+    又得重下 74MB。按版本命名后，同一版本无论重试多少次都落在同一个文件上：
+      ① 下载中断 → 下次续传；
+      ② 下载完但没装成（UAC 拒绝 / 安装器失败）→ 下次直接复用，一步网络请求都不发。
+    没有版本号（老调用方/无清单场景）才退回 URL 文件名，保持旧行为。
+    """
+    tag = _safe_version_tag(version)
+    if tag:
+        return f"h_n_printer_setup_v{tag}.exe"
     name = os.path.basename(urlsplit(url).path) or "setup.exe"
     name = re.sub(r"[\\/:*?\"<>|\x00-\x1f]", "_", name).strip(". ")
     if not name.lower().endswith(".exe"):
@@ -727,20 +758,126 @@ def _infer_algo(expected_hash_hex: str, algo: str | None) -> str:
     raise ValueError(f"哈希长度非法（{n}），无法判断算法")
 
 
+class _Incomplete(Exception):
+    """本次尝试没拿到完整字节（超时/断流/服务端截断）→ 交给重试循环续传。"""
+
+
+class _RangeRejected(Exception):
+    """续传点被服务端拒绝（416 或半截文件比远端还大）→ 作废半截文件从 0 重来。"""
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _total_from_range(headers) -> int:
+    """从 `Content-Range: bytes 0-99/74105079` 里取总长度，取不到返回 0。"""
+    try:
+        raw = str(headers.get("Content-Range") or "")
+        return int(raw.rsplit("/", 1)[1].strip())
+    except (IndexError, ValueError, AttributeError):
+        return 0
+
+
+def _open_with_range(opener, url: str, offset: int):
+    """按续传点发一次请求（offset>0 时带 Range 头）。"""
+    req = _request(url)
+    if offset > 0:
+        req.add_header("Range", f"bytes={offset}-")
+    return opener.open(req, timeout=DOWNLOAD_SOCK_TIMEOUT)
+
+
+def _hash_prefix(path: str, inferred: str):
+    """把已落盘的半截文件喂进哈希器，返回 (hasher, 已确认的字节数)。"""
+    hasher = _new_hasher(inferred)
+    size = 0
+    try:
+        with open(path, "rb") as f:
+            while True:
+                block = f.read(1024 * 1024)
+                if not block:
+                    break
+                hasher.update(block)
+                size += len(block)
+    except OSError:
+        return _new_hasher(inferred), 0
+    return hasher, size
+
+
+def _stream_to_part(opener, url: str, part_path: str, inferred: str,
+                    progress_cb) -> tuple[str, int, int]:
+    """把 url 续写进 part_path。返回 (hexdigest, 已下载字节, 远端总字节)。
+
+    为什么要有这个函数（2026-11-26 现场：门店机停在 22% 再也不动）：
+    旧实现是"一条 open 读到底"，socket 超时 120s，中途断一下就整包作废、从 0 重来。
+    现在：① socket 超时降到 DOWNLOAD_SOCK_TIMEOUT 秒 —— 30 秒没字节就抛出去重试，
+    界面不会假死两分钟；② 重试带 Range 续传，已经下的 16MB 不用再下一遍；
+    ③ 服务端忽略 Range（回 200）时自动退化为整包重下，不会把两个包拼成一个坏文件。
+    """
+    offset = os.path.getsize(part_path) if os.path.isfile(part_path) else 0
+    hasher, offset = (_hash_prefix(part_path, inferred) if offset > 0
+                      else (_new_hasher(inferred), 0))
+    with _open_with_range(opener, url, offset) as resp:
+        _check_final_url(resp)  # 重定向后的最终地址再过一次白名单（续传也一样）
+        status = getattr(resp, "status", 200) or 200
+        if status == 416:
+            raise _RangeRejected(f"续传点 {offset} 超出远端文件长度")
+        if status == 206:
+            total = _total_from_range(resp.headers) or offset + int(
+                resp.headers.get("Content-Length", 0) or 0)
+            mode = "ab"
+        elif status == 200:
+            # 服务端不认 Range：丢掉半截文件整包重下（否则会拼出坏包）
+            offset = 0
+            hasher = _new_hasher(inferred)
+            mode = "wb"
+            total = int(resp.headers.get("Content-Length", 0) or 0)
+        else:
+            raise ValueError(f"HTTP {status}")
+        downloaded = offset
+        chunk_idx = 0
+        with open(part_path, mode) as f:
+            while True:
+                chunk = resp.read(DOWNLOAD_CHUNK)
+                if not chunk:
+                    break
+                f.write(chunk)
+                hasher.update(chunk)
+                downloaded += len(chunk)
+                if progress_cb:
+                    chunk_idx += 1
+                    # 约每 1MB 回调一次，避免高频信号刷 UI
+                    if chunk_idx % 16 == 0 or (total and downloaded >= total):
+                        if progress_cb(downloaded, total) is False:
+                            raise UpdateCancelled("用户取消下载")
+            f.flush()
+            os.fsync(f.fileno())
+    return hasher.hexdigest(), downloaded, total
+
+
 def download_setup(url: str, expected_hash: str, dest_dir: str,
-                   progress_cb=None, algo: str | None = None) -> str | None:
+                   progress_cb=None, algo: str | None = None,
+                   version: str = "") -> str | None:
     """下载安装包 → 校验哈希 → 落到私有目录 ready\\。返回最终路径，失败/取消返回 None。
 
-    dest_dir 作为**私有根目录**（默认 updates_root()）；下载先落在 root 下的随机子目录
-    `dl-xxxx\\`（半截文件不污染 ready\\），校验通过后才 `os.replace` 进 `ready\\`
+    dest_dir 作为**私有根目录**（默认 updates_root()）；半截文件写在
+    `ready\\<安装包名>.part`，校验通过后才 `os.replace` 成 `ready\\<安装包名>`
     （同卷原子重命名），随后对**落盘文件**再复算一次哈希，把"校验的是 tmp、执行的是
     dest"的 TOCTOU 窗口压到最小。
 
-    本地已有同目标文件且哈希匹配时直接复用（UAC 拒绝/安装失败后安装包被保留，
-    下次检查更新无需重新下载）。
+    **抗抖动三件套**（2026-11-26 现场：读到 22% 就停死、点取消重试又从 0 开始）：
+      ① 断点续传：半截文件跨进程保留，下次（哪怕隔天重启程序）接着下，不再重下 74MB；
+      ② 停滞判定：socket 超时 DOWNLOAD_SOCK_TIMEOUT 秒，卡住就立刻失败重试，不假死 2 分钟；
+      ③ 自动重试：最多 DOWNLOAD_MAX_ATTEMPTS 次，每次续传、不重下。
+
+    `version` 非空时落地文件名是 `h_n_printer_setup_v<版本>.exe`（见 _safe_setup_name）：
+    同一版本永远同一个文件名，所以"下完但没装成"下次能直接复用，连网络请求都不发。
 
     progress_cb(downloaded, total) 在下载循环中回调；返回 False 表示用户取消
-    （抛 UpdateCancelled 并清理半截文件）。
+    （抛 UpdateCancelled；半截文件**保留**，下次继续续传）。
     """
     try:
         url = validate_download_url(url)
@@ -766,10 +903,13 @@ def download_setup(url: str, expected_hash: str, dest_dir: str,
     exe_dir = os.path.dirname(os.path.abspath(__import__("sys").executable))
     _write_rollback_note(root, exe_dir if getattr(__import__("sys"), "frozen", False) else "")
 
-    fname = _safe_setup_name(url)
+    fname = _safe_setup_name(url, version)
     final_path = os.path.join(ready_dir, fname)
-    # 只清 ready\ 里的半截文件；**不删 .exe** —— 上一版安装包要留给 _archive_previous
-    _cleanup_stale_setups(ready_dir, fname, exts=(".part", ".tmp"))
+    part_path = final_path + ".part"
+    # 只清 ready\ 里的**别家**半截文件；**不删 .exe**（上一版要留给 _archive_previous），
+    # 也不删自己的 .part（那是本版本的续传进度）
+    _cleanup_stale_setups(ready_dir, fname, exts=(".part", ".tmp"),
+                          keep_extra=(os.path.basename(part_path),))
 
     # 本地复用：哈希匹配才算数（旧实现"expected 为空也复用"= 零校验，已删）
     if os.path.isfile(final_path) and verify_file_hash(final_path, inferred, expected):
@@ -782,70 +922,64 @@ def download_setup(url: str, expected_hash: str, dest_dir: str,
                 pass
         return final_path
 
-    staging = tempfile.mkdtemp(prefix="dl-", dir=root)
-    _restrict_dir_private(staging)
-    part = os.path.join(staging, fname + ".part")
     net_direct.ensure_direct(url)  # 安装包在 COS 等域名，同样绕开代理
+    opener = _build_opener()
+    last_error = ""
     try:
-        fd = os.open(part, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o600)
-        with os.fdopen(fd, "wb") as f:
-            hasher = _new_hasher(inferred)
-            opener = _build_opener()
-            with opener.open(_request(url), timeout=120) as resp:
-                _check_final_url(resp)
-                status = getattr(resp, "status", 200) or 200
-                if status != 200:
-                    raise ValueError(f"HTTP {status}")
-                total = int(resp.headers.get("Content-Length", 0) or 0)
-                downloaded = 0
-                chunk_idx = 0
-                while True:
-                    chunk = resp.read(DOWNLOAD_CHUNK)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    hasher.update(chunk)
-                    downloaded += len(chunk)
-                    if progress_cb:
-                        chunk_idx += 1
-                        # 约每 1MB 回调一次，避免高频信号刷 UI
-                        if chunk_idx % 16 == 0 or downloaded >= total:
-                            if progress_cb(downloaded, total) is False:
-                                raise UpdateCancelled("用户取消下载")
-            f.flush()
-            os.fsync(f.fileno())
-            actual = hasher.hexdigest()
+        for attempt in range(1, DOWNLOAD_MAX_ATTEMPTS + 1):
+            if attempt > 1:
+                time.sleep(DOWNLOAD_RETRY_BACKOFF * (attempt - 1))
+                _resume_at = os.path.getsize(part_path) if os.path.isfile(part_path) else 0
+                logger.info(f"安装包下载第 {attempt}/{DOWNLOAD_MAX_ATTEMPTS} 次尝试"
+                            f"（从 {_resume_at} 字节续传；上次失败: {last_error}）")
+            try:
+                actual, downloaded, total = _stream_to_part(
+                    opener, url, part_path, inferred, progress_cb)
+            except UpdateCancelled:
+                logger.info("下载被用户取消（半截文件保留，下次续传）")
+                raise
+            except _RangeRejected as e:
+                logger.warning(f"续传点被拒绝（{e}），半截文件作废重下")
+                _remove_quietly(part_path)
+                last_error = str(e)
+                continue
+            except Exception as e:  # noqa: BLE001 —— 网络层任何异常都只影响这一次尝试
+                if isinstance(e, urllib.error.HTTPError) and e.code == 416:
+                    # urllib 把 416 抛成 HTTPError，走不到 _stream_to_part 里的判断：
+                    # .part 比远端还长（远端换了包/被截断）时不能一直「保留半截待续传」，那会永久卡死
+                    logger.warning("续传点被服务器拒绝（HTTP 416），半截文件作废重下")
+                    _remove_quietly(part_path)
+                    last_error = "HTTP 416（续传点越界）"
+                    continue
+                last_error = f"{type(e).__name__}: {e}"
+                logger.warning(f"安装包下载中断（{last_error}），保留已下载部分，准备续传")
+                continue
+            if total and downloaded < total:
+                last_error = f"字节不完整（{downloaded}/{total}）"
+                logger.warning(f"安装包下载不完整（{last_error}），准备续传")
+                continue
             if actual != expected:
+                # 字节齐了但哈希不对 = 文件真的坏了，续传也救不回来 → 删掉重下才有意义
+                _remove_quietly(part_path)
                 raise ManifestError(
                     f"安装包 {inferred} 校验失败: 期望 {expected}, 实际 {actual}")
-        # 校验通过 → 同卷原子重命名进 ready\；再对落盘文件复算一次（缩小 TOCTOU）
-        _archive_previous(ready_dir, previous_dir, fname)
-        os.replace(part, final_path)
-        if not verify_file_hash(final_path, inferred, expected):
-            logger.error("安装包落盘后哈希不一致（疑似被替换），已删除")
-            try:
-                os.remove(final_path)
-            except OSError:
-                pass
-            return None
-        logger.info(f"安装包已就绪（{inferred} 校验通过）: {final_path}")
-        return final_path
-    except UpdateCancelled:
-        logger.info("下载被用户取消")
-        try:
-            os.remove(part)
-        except OSError:
-            pass
-        raise
-    except Exception as e:  # noqa: BLE001 —— 网络/校验/磁盘任何失败都只返回 None
-        logger.error(f"下载或校验安装包失败: {e}")
-        try:
-            os.remove(part)
-        except OSError:
-            pass
+            # 校验通过 → 同卷原子重命名进 ready\；再对落盘文件复算一次（缩小 TOCTOU）
+            _archive_previous(ready_dir, previous_dir, fname)
+            os.replace(part_path, final_path)
+            if not verify_file_hash(final_path, inferred, expected):
+                logger.error("安装包落盘后哈希不一致（疑似被替换），已删除")
+                _remove_quietly(final_path)
+                return None
+            logger.info(f"安装包已就绪（{inferred} 校验通过，{downloaded} 字节）: {final_path}")
+            return final_path
+        logger.error(f"安装包下载失败（已重试 {DOWNLOAD_MAX_ATTEMPTS} 次，"
+                     f"半截文件保留待续传）: {last_error}")
         return None
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
+    except UpdateCancelled:
+        raise
+    except Exception as e:  # noqa: BLE001 —— 校验/磁盘等其它失败只返回 None
+        logger.error(f"下载或校验安装包失败: {e}")
+        return None
 
 
 # ============================================================================
@@ -1011,7 +1145,8 @@ def prepare_update(manifest: dict, current_version: str, progress_cb=None,
         return None
     setup_path = download_setup(
         manifest.get("url", ""), digest, updates_root(),
-        progress_cb=progress_cb, algo=algo)
+        progress_cb=progress_cb, algo=algo,
+        version=str(manifest.get("version") or ""))
     return _finish_prepare(setup_path, algo, digest)
 
 
@@ -1039,7 +1174,8 @@ def prepare_update_with_code(manifest: dict, current_version: str, code: str,
         return None
     url = request_download_url(code, version, hwid)  # 失败抛 DownloadCodeError
     setup_path = download_setup(url, digest, updates_root(),
-                                progress_cb=progress_cb, algo=algo)
+                                progress_cb=progress_cb, algo=algo,
+                                version=version)
     return _finish_prepare(setup_path, algo, digest)
 
 

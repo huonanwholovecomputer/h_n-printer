@@ -42,6 +42,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 
@@ -128,6 +129,62 @@ def class_source(src: str, name: str) -> str:
     return m.group(0) if m else ""
 
 
+def _class_method_node(src: str, cls: str, func: str):
+    """定位 <cls>.<func> 的 AST 节点（注释、字符串都不算数；找不到返回 None）。"""
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.ClassDef) and node.name == cls):
+            continue
+        for sub in node.body:
+            if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub.name == func:
+                return sub
+    return None
+
+
+def method_calls(src: str, cls: str, func: str) -> list:
+    """方法体里所有调用的名字列表（裸调用取 Name，属性调用取最后一段；重复出现则重复计数）。"""
+    node = _class_method_node(src, cls, func)
+    if node is None:
+        return []
+    names = []
+    for call in ast.walk(node):
+        if not isinstance(call, ast.Call):
+            continue
+        f = call.func
+        if isinstance(f, ast.Name):
+            names.append(f.id)
+        elif isinstance(f, ast.Attribute):
+            names.append(f.attr)
+    return names
+
+
+def self_assigns(src: str, cls: str = "MainWindow") -> dict:
+    """{属性名: [(所在方法, 值节点类型)]}：类里所有 `self.x = ...`（AST 级）。"""
+    out: dict = {}
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return out
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.ClassDef) and node.name == cls):
+            continue
+        for fn in node.body:
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for sub in ast.walk(fn):
+                if not isinstance(sub, ast.Assign):
+                    continue
+                for t in sub.targets:
+                    if (isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name)
+                            and t.value.id == "self"):
+                        out.setdefault(t.attr, []).append(
+                            (fn.name, type(sub.value).__name__))
+    return out
+
+
 def top_level_const(src: str, name: str):
     try:
         tree = ast.parse(src)
@@ -185,6 +242,8 @@ class _Stub:
 
         stub = self
         self.counts: dict[str, int] = {}
+        self.ranges: list[str] = []      # 收到的 Range 请求头（续传证据）
+        self.force_no_range = False      # True ⇒ 服务器无视 Range 一律回 200 全量（降级场景）
         self.manifest = b"{}"
 
         class Handler(BaseHTTPRequestHandler):
@@ -197,6 +256,9 @@ class _Stub:
                 path = self.path.split("?")[0]
                 stub.counts[path] = stub.counts.get(path, 0) + 1
                 if path == "/pkg.exe":
+                    return self._body(PAYLOAD)
+                if path.startswith("/dl/"):
+                    # 模拟 /dl/<token>：token 每次都换，内容永远是同一个安装包
                     return self._body(PAYLOAD)
                 if path == "/other.exe":
                     return self._body(OTHER)
@@ -213,6 +275,29 @@ class _Stub:
                 return self.send_error(404)
 
             def _body(self, data: bytes):
+                rng = "" if stub.force_no_range else (self.headers.get("Range") or "")
+                if rng.startswith("bytes="):
+                    stub.ranges.append(rng)
+                    try:
+                        start = int(rng[len("bytes="):].split("-")[0])
+                    except ValueError:
+                        start = -1
+                    if start < 0 or start >= len(data):
+                        # 服务器不认这个偏移（比如 .part 比远端还长）→ 416 让客户端重下
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{len(data)}")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    body = data[start:]
+                    self.send_response(206)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header(
+                        "Content-Range", f"bytes {start}-{len(data) - 1}/{len(data)}")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 self.send_response(200)
                 self.send_header("Content-Type", "application/octet-stream")
                 self.send_header("Content-Length", str(len(data)))
@@ -515,8 +600,58 @@ def run_static():
           and "code=code" in prompt_fn)
     check("下载时传 user_confirmed=True（第二道闸）",
           "user_confirmed=True" in func_source(gui, "_update_download_worker"))
-    check("生成 update.cmd 时显式 allow_silent_install=True",
-          "allow_silent_install=True" in func_source(gui, "_update_download_worker"))
+    # 2026-11-27：安装器绝不能由下载线程拉起 —— update.cmd 的等待循环有上限，到点不管
+    # 主进程是否还活着都会静默安装。用户点「稍后安装」继续打单时，安装器会在程序运行中
+    # 删掉程序目录（正在跑的 exe / _internal）。写 cmd 与启动都必须等用户确认 + 退出收尾。
+    worker_calls = set(method_calls(gui, "MainWindow", "_update_download_worker"))
+    confirm_fn = func_source(gui, "_confirm_install_update")
+    check("★ 下载线程只准备安装包，不写、不启动 update.cmd",
+          not ({"write_update_cmd", "_run_cmd_minimized"} & worker_calls),
+          f"worker 内仍调用 {sorted({'write_update_cmd', '_run_cmd_minimized'} & worker_calls)}")
+    # 判据走 AST：注释掉一行 `allow_silent_install=True` 不算数（字符串匹配会被骗）
+    _prep_node = _class_method_node(gui, "MainWindow", "_prepare_update_install")
+    _silent_ok = False
+    if _prep_node is not None:
+        for _c in ast.walk(_prep_node):
+            if not (isinstance(_c, ast.Call)
+                    and getattr(_c.func, "id", "") == "write_update_cmd"):
+                continue
+            _silent_ok = any(
+                _k.arg == "allow_silent_install"
+                and isinstance(_k.value, ast.Constant) and _k.value.value is True
+                for _k in _c.keywords)
+    check("生成 update.cmd 时显式 allow_silent_install=True（AST 级）", _silent_ok)
+    # 结构：写 cmd 的调用必须出现在「立即安装」按钮判定之后（同一方法内按行号比）
+    _prep_lineno = None
+    _if_lineno = None
+    _dedented = textwrap.dedent(confirm_fn)
+    for _i, _ln in enumerate(_dedented.splitlines(), start=1):
+        if _ln.strip().startswith("#"):
+            continue
+        if "box.clickedButton() is not btn_now" in _ln and _if_lineno is None:
+            _if_lineno = _i
+        if "_prepare_update_install(" in _ln and not _ln.strip().startswith("#"):
+            _prep_lineno = _i
+    check("★ 写 update.cmd 发生在「立即安装」按钮判定之后（点「稍后安装」一个字节都不写）",
+          _prep_lineno is not None and _if_lineno is not None and _prep_lineno > _if_lineno,
+          f"prepare@{_prep_lineno} if@{_if_lineno}")
+    # 启动安装器只能有一处，且必须在主窗口 closeEvent 的收尾（注释掉的调用不算 —— AST 数）
+    launch_calls = method_calls(gui, "MainWindow", "closeEvent")
+    check("★ 安装器只在 closeEvent 收尾启动（退出确认全部走完之后）",
+          launch_calls.count("_run_pending_update_install") == 1
+          and gui.count("self._run_pending_update_install()") == 1,
+          f"closeEvent 内 {launch_calls.count('_run_pending_update_install')} 处 / "
+          f"全文 {gui.count('self._run_pending_update_install()')} 处")
+    assigns = self_assigns(gui)
+    pending_writes = assigns.get("_pending_update_install", [])
+    check("★ 待装清单只在准备方法里写入（唯一一处，AST 级）",
+          pending_writes.count(("_prepare_update_install", "Dict")) == 1,
+          repr(pending_writes))
+    check("★ 退出被取消时清掉待装清单与「已确认」标记（不诈尸、不跳过未打印确认）",
+          ("_quit_app", "Constant") in assigns.get("_pending_update_install", [])
+          and ("_quit_app", "Constant") in assigns.get("_update_install_confirmed", []),
+          f"pending={assigns.get('_pending_update_install')} "
+          f"confirmed={assigns.get('_update_install_confirmed')}")
     write_cmd = api("write_update_cmd")
     if write_cmd is not None:
         tmp = new_tmpdir()
@@ -872,13 +1007,90 @@ def _run_behavior_with_stub(stub: _Stub):
                            "9.9.9", user_confirmed=True)
         check("连续两次升级都成功", bool(got1) and bool(got2), f"{got1} / {got2}")
         prev_dir = os.path.join(root5, "previous")
+        # 4.7.6 起安装包按「版本号」命名，与 URL 末段无关：/dl/<token> 每次换 token，
+        # 若还按 URL 取名，本地复用（哈希命中）永远不成立，每次都重下 74MB。
+        name1 = updater._safe_setup_name(first["url"], first["version"])
+        name2 = updater._safe_setup_name(second["url"], second["version"])
+        check("安装包按版本号命名（与 URL 无关）",
+              name1 == "h_n_printer_setup_v9.9.9.exe"
+              and name2 == "h_n_printer_setup_v9.9.10.exe", f"{name1} / {name2}")
         check("★ 新版本落地后，上一版安装包归档到 previous\\（可手动回滚）",
-              os.path.isfile(os.path.join(prev_dir, "pkg.exe")),
+              os.path.isfile(os.path.join(prev_dir, name1)),
               repr(_dir_entries(prev_dir)))
         ready_now = sorted(n for n in _dir_entries(os.path.join(root5, "ready"))
                            if n.lower().endswith(".exe"))
-        check("ready\\ 只留最新这一份安装包（不堆积）", ready_now == ["other.exe"],
+        check("ready\\ 只留最新这一份安装包（不堆积）", ready_now == [name2],
               repr(ready_now))
+
+        # ⑦ 下载码短链每次换 token → 同一版本第二次必须复用本地文件，一个字节都不重下
+        root6 = new_tmpdir()
+        spec = {"version": "9.9.9", "sha256": sha256_hex(PAYLOAD)}
+        with patched(updater, updates_root=lambda: root6,
+                     **test_allowlist_patch(stub)):
+            p_first = guarded("download_setup", download_setup,
+                              stub.url("/dl/tokenAAA", "127.0.0.1"),
+                              spec["sha256"], root6, None, "sha256", "9.9.9")
+            hits_after_first = dict(stub.counts)
+            p_second = guarded("download_setup", download_setup,
+                               stub.url("/dl/tokenBBB", "127.0.0.1"),
+                               spec["sha256"], root6, None, "sha256", "9.9.9")
+        second_hits = sum(stub.counts.values()) - sum(hits_after_first.values())
+        check("短链换 token 后同一版本复用本地安装包（不重下）",
+              bool(p_first) and p_second == p_first and second_hits == 0,
+              f"{p_first} / {p_second} / 第二次新请求={second_hits}")
+
+        # ⑧ 断点续传：上次取消留下的 <安装包>.part 必须被接着下（发 Range），而不是从 0 重来
+        root7 = new_tmpdir()
+        os.makedirs(os.path.join(root7, "ready"), exist_ok=True)
+        url7 = stub.url("/dl/tokenCCC", "127.0.0.1")
+        part7 = os.path.join(root7, "ready",
+                             updater._safe_setup_name(url7, "9.9.9") + ".part")
+        half = len(PAYLOAD) // 2
+        with open(part7, "wb") as f:
+            f.write(PAYLOAD[:half])
+        stub.ranges.clear()
+        with patched(updater, updates_root=lambda: root7, **test_allowlist_patch(stub)):
+            got7 = guarded("download_setup", download_setup, url7,
+                           sha256_hex(PAYLOAD), root7, None, "sha256", "9.9.9")
+        check("★ 上次中断的 .part 会发 Range 续传（不从 0 重下）",
+              bool(stub.ranges) and f"bytes={half}-" in stub.ranges[0],
+              f"ranges={stub.ranges[:2]}")
+        check("续传后的安装包内容与哈希都对",
+              bool(got7) and open(got7, "rb").read() == PAYLOAD,
+              f"{got7}")
+        check("续传成功后不残留 .part", not os.path.exists(part7))
+
+        # ⑨ 服务器不认 Range（回 200 全量）→ 必须截断重下，不能把全量字节追加到半截后面
+        root8 = new_tmpdir()
+        os.makedirs(os.path.join(root8, "ready"), exist_ok=True)
+        url8 = stub.url("/dl/tokenDDD", "127.0.0.1")
+        part8 = os.path.join(root8, "ready",
+                             updater._safe_setup_name(url8, "9.9.9") + ".part")
+        with open(part8, "wb") as f:
+            f.write(PAYLOAD[:half])
+        stub.force_no_range = True
+        try:
+            with patched(updater, updates_root=lambda: root8, **test_allowlist_patch(stub)):
+                got8 = guarded("download_setup", download_setup, url8,
+                               sha256_hex(PAYLOAD), root8, None, "sha256", "9.9.9")
+        finally:
+            stub.force_no_range = False
+        check("★ 服务器忽略 Range（200 全量）时能自愈重下、哈希仍对",
+              bool(got8) and open(got8, "rb").read() == PAYLOAD, f"{got8}")
+
+        # ⑩ .part 比远端还长（换了安装包/远端变短）→ 416，必须丢掉重下而不是永久卡死
+        root9 = new_tmpdir()
+        os.makedirs(os.path.join(root9, "ready"), exist_ok=True)
+        url9 = stub.url("/dl/tokenEEE", "127.0.0.1")
+        part9 = os.path.join(root9, "ready",
+                             updater._safe_setup_name(url9, "9.9.9") + ".part")
+        with open(part9, "wb") as f:
+            f.write(PAYLOAD + b"X" * 4096)
+        with patched(updater, updates_root=lambda: root9, **test_allowlist_patch(stub)):
+            got9 = guarded("download_setup", download_setup, url9,
+                           sha256_hex(PAYLOAD), root9, None, "sha256", "9.9.9")
+        check("★ .part 比远端还长（416）时自愈重下",
+              bool(got9) and open(got9, "rb").read() == PAYLOAD, f"{got9}")
 
     section("B6. 重定向：跨 host / 到 file:// 一律拒绝；同 host 正常重定向放行")
     if download_setup is not None:
@@ -985,10 +1197,26 @@ def _run_behavior_with_stub(stub: _Stub):
     check("--check 对「非内置公钥签的清单」如实报失败（不谎报通过）",
           check_res.returncode == 1,
           f"rc={check_res.returncode}")
+    def _decode(raw: bytes) -> str:
+        """子进程输出解码：先 UTF-8，再 GBK。
+
+        中文 Windows 上 subprocess 的管道编码是 ANSI 代码页（cp936），签名工具吐的是
+        GBK 字节；以前只按 UTF-8 解 → 断言永远看到乱码，红得莫名其妙（与业务无关）。"""
+        for enc in ("utf-8", "gbk"):
+            try:
+                return raw.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("utf-8", "replace")
+
+    out_text = _decode(check_res.stderr or b"") + _decode(check_res.stdout or b"")
+    # 判据只看结构（工具自己的 [FAIL] 标记 + 没有 Traceback），不钉死中文措辞：
+    # 文案一改就红的那种断言是噪音（verify_guard_quality 的 A1 棘轮专门盯着它）。
+    _fail_lines = [ln.strip() for ln in out_text.splitlines() if ln.strip().startswith("[FAIL]")]
     check("--check 的失败原因可读（不是崩在异常里）",
-          "验签失败" in (check_res.stderr or b"").decode("utf-8", "replace")
-          or "验签失败" in (check_res.stdout or b"").decode("utf-8", "replace"),
-          (check_res.stderr or b"").decode("utf-8", "replace")[:200])
+          bool(_fail_lines) and all(len(ln) > len("[FAIL]") for ln in _fail_lines)
+          and "Traceback" not in out_text,
+          out_text[:200])
 
 
 def _list_exe(root: str) -> list[str]:
