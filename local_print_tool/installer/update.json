@@ -1,9 +1,9 @@
 {
   "version": "4.7.6",
   "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.6.exe",
-  "md5": "0adfdcd8322bac3b90558c6f0926c399",
-  "sha256": "aa2701dfbb7550044ab1b80d63df340f80f87cd4229910863ae14c796320cf46",
+  "md5": "4d7e931716465cbd3a83daf20ec5df30",
+  "sha256": "ebc693538818bb61bd5e53b50832ce4a07ed092d0256c994d814d6503be83b1e",
   "notes": "v4.7.6：更新包下载中断后能接着下、下完会明确问「现在装还是稍后装」，并修掉退出确认被跳过。下载到一半断网、关程序或点取消，半截包不再被扔掉，下次从断点续传（服务器不支持续传时自动丢掉旧字节重下；本地半截包比远端长、下完字节对不上也会自愈），连接中断会退避重试最多 3 次、每次都保留半截包，连接僵住最多等 30 秒。下完先照常处理未打印的标签页，再问「立即安装并重启 / 稍后安装」——选稍后不白下，包留本地下次直接复用；同一版本按版本号存一份，不再因为下载链接换 token 就整包重下。另修掉：退出时选过「先不退出」之后，正常关窗会跳过「还有未打印的文件」确认、把单子静默放弃。",
   "sig_algo": "ed25519",
-  "sig": "YJKPhbO+Ni4WZS3fGINK/b4HHNRdmTtC8Gs9wqjhWTsA25FgEyeh7NaCGI4HeFlme5eBV4fsncKtoc2z4xVzCQ=="
+  "sig": "gvJJtck2tQ74n+ITgY686ScZxLhL7gZKSvIgmwTG4ErllM8waBejbBw3aPjNWttgCK/zN5tSCMYTQKk8ISJtBA=="
 }
