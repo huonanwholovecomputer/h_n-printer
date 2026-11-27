@@ -123,6 +123,25 @@ await waitLayoutStable('#fileList .file-card .img-ori-toggle');
 check('页面处于深色模式', (await page.evaluate(() => document.body.classList.contains('theme-dark'))) === true);
 await mkdir(OUT_DIR, { recursive: true });
 
+async function waitColorStable(selector, timeoutMs = 5000) {
+  const t0 = Date.now();
+  let prev = null, stable = 0;
+  while (Date.now() - t0 < timeoutMs) {
+    const c = await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      return el ? getComputedStyle(el).backgroundColor : null;
+    }, selector);
+    if (c && c === prev) {
+      if (++stable >= 2) return c;
+    } else {
+      stable = 0;
+    }
+    prev = c;
+    await page.waitForTimeout(80);
+  }
+  throw new Error('轨道底色在超时内未稳定: ' + String(prev));
+}
+
 /** 用 elementFromPoint 定位「轨道内(纯轨道)」与「卡片表面(纯卡片)」两个采样点 */
 async function pickPoints() {
   return page.evaluate(() => {
@@ -161,17 +180,44 @@ async function pickPoints() {
   });
 }
 
+/** clip 用的是**页面坐标**，pickPoints 用的是**视口坐标**；页面一旦滚动就错位。
+ *  2026-11-27 逐帧取证：同一棵树连跑 4 次，轨道亮度 219/162/119/172 全不同 —— 文件列表
+ *  渲染完会随机滚动，采样点截到了卡片外面（卡片外是浅色的页面底色）。
+ *  判据 = 截图前后「滚动位置 + 轨道矩形」完全没变，否则重来。 */
+async function frameSignature() {
+  return page.evaluate(() => {
+    const t = document.querySelector('#fileList .file-card .img-ori-toggle');
+    const b = t ? t.getBoundingClientRect() : null;
+    return JSON.stringify({
+      scrollY: window.scrollY, scrollX: window.scrollX,
+      rect: b ? [b.top, b.left, b.width, b.height] : null,
+    });
+  });
+}
+
 async function capture(tag) {
-  const pts = await pickPoints();
-  if (!pts.rail || !pts.card) throw new Error('采样点定位失败: ' + JSON.stringify(pts));
-  const out = {};
-  for (const [k, v] of Object.entries({ rail: pts.rail, card: pts.card })) {
-    const p = join(OUT_DIR, `${tag}_${k}.png`);
-    writeFileSync(p, await page.screenshot({ clip: { x: v.x, y: v.y, width: 6, height: 6 } }));
-    out[k] = p;
+  let lastErr = '';
+  for (let attempt = 1; attempt <= 6; attempt++) {
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await waitLayoutStable('#fileList .file-card .img-ori-toggle');
+    await waitColorStable('#fileList .file-card .img-ori-toggle');
+    const sig1 = await frameSignature();
+    const pts = await pickPoints();
+    if (!pts.rail || !pts.card) { lastErr = '采样点定位失败: ' + JSON.stringify(pts); continue; }
+    const out = {};
+    for (const [k, v] of Object.entries({ rail: pts.rail, card: pts.card })) {
+      const p = join(OUT_DIR, `${tag}_${k}.png`);
+      writeFileSync(p, await page.screenshot({ clip: { x: v.x, y: v.y, width: 6, height: 6 } }));
+      out[k] = p;
+    }
+    const sig2 = await frameSignature();
+    if (sig1 === sig2) {
+      out.pts = JSON.stringify(pts);
+      return out;
+    }
+    lastErr = `截图期间页面动了（第 ${attempt} 次）：${sig1} → ${sig2}`;
   }
-  out.pts = JSON.stringify(pts);
-  return out;
+  throw new Error('采样点在同一帧内不稳定: ' + tag + ' / ' + lastErr);
 }
 
 const files = { after: await capture('after_new') };
