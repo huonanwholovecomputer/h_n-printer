@@ -1,9 +1,9 @@
 {
-  "version": "4.7.5",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.5.exe",
-  "md5": "d445dcc7d274fa6a1226a25e1a779e03",
-  "sha256": "d0444c8b10dab39efcadf3cb3dd0b92708b3bb74c914824ff68be0cbaa16a057",
-  "notes": "v4.7.5：手动双面翻纸窗的「继续打第 2 趟」改为按放行比例先灰后亮，并修掉上一批的计时漏进本批（现场出现本批才开打 17 秒却写「已用 02:57」，按钮还一出现就是亮的）；字体名写坏的 docx（如把「黑体;黑体」原样塞进字体属性）现在单独识别成第三类问题，转换前在副本上修成单族名、打印前只提示不拦，并作废那批「整篇回落宋体」的旧缓存；WPS 保存的 .doc 改为按最后保存它的程序选引擎，页码不再算成 1/1、双面页序不再错，.doc 缓存也按引擎隔离；常驻窗被拖出屏幕后下次显示自动拉回。收支清算：废纸格加锁（与状态/采购支出同一把密码）、输入即落库、光标错位修好，并恢复云端账本并发冲突的三选一确认框。小程序滚轮重做需自行上传。",
+  "version": "4.7.6",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.6.exe",
+  "md5": "0adfdcd8322bac3b90558c6f0926c399",
+  "sha256": "aa2701dfbb7550044ab1b80d63df340f80f87cd4229910863ae14c796320cf46",
+  "notes": "v4.7.6：更新包下载中断后能接着下、下完会明确问「现在装还是稍后装」，并修掉退出确认被跳过。下载到一半断网、关程序或点取消，半截包不再被扔掉，下次从断点续传（服务器不支持续传时自动丢掉旧字节重下；本地半截包比远端长、下完字节对不上也会自愈），连接中断会退避重试最多 3 次、每次都保留半截包，连接僵住最多等 30 秒。下完先照常处理未打印的标签页，再问「立即安装并重启 / 稍后安装」——选稍后不白下，包留本地下次直接复用；同一版本按版本号存一份，不再因为下载链接换 token 就整包重下。另修掉：退出时选过「先不退出」之后，正常关窗会跳过「还有未打印的文件」确认、把单子静默放弃。",
   "sig_algo": "ed25519",
-  "sig": "N8RTYMOVf0E2peOhz7uIoY/DhwMkd092iWP9/fcTl1/M+GbxpUAHurh4uYQBV76EBERrxr/l4VElxMAV5ZBjCQ=="
+  "sig": "YJKPhbO+Ni4WZS3fGINK/b4HHNRdmTtC8Gs9wqjhWTsA25FgEyeh7NaCGI4HeFlme5eBV4fsncKtoc2z4xVzCQ=="
 }
