@@ -510,8 +510,10 @@ def run_static():
     check("prepare_update 内先 validate_manifest（含验签）后 download_setup",
           i_sig >= 0 and i_dl > i_sig, f"validate_manifest@{i_sig} download_setup@{i_dl}")
     fetch_body = func_source(src, "fetch_update_info")
-    check("fetch_update_info 拉到清单后立刻过 validate_manifest",
-          "validate_manifest(data)" in fetch_body)
+    check("fetch_update_info 拉到清单后立刻过校验（带 url 走 validate_manifest、"
+          "无 url 走 validate_discovery_manifest，两条都不许跳过验签）",
+          "validate_manifest(data)" in fetch_body
+          and "validate_discovery_manifest(data)" in fetch_body)
     check("prepare_update 要求用户明确确认（user_confirmed）才继续",
           "user_confirmed" in prep and "if not user_confirmed" in prep)
     check("复用本地安装包也必须哈希匹配（旧实现 expected 为空就复用 = 零校验）",
@@ -741,12 +743,19 @@ def run_static():
     if isinstance(manifest, dict):
         check("installer/update.json 可解析", True)
         validate = api("validate_download_url")
-        if validate is not None:
+        if validate is not None and manifest.get("url"):
             try:
                 validate(manifest.get("url", ""))
                 check("清单 url 在 host 白名单内", True)
             except ValueError as e:
                 check("清单 url 在 host 白名单内", False, str(e))
+        else:
+            # 2026-11-27 起清单**故意不带 url**：桶已私有，直链匿名 GET 一律 403
+            # （4.7.5/4.7.6 两个对象实测都是 403），下载地址只能由 /api/dl/grant 凭码现发，
+            # 公开用户走 GitHub Release。这里不放松判定 —— 没有 url 必须是「凭码」形态。
+            needs_code = api("manifest_needs_code")
+            check("清单无 url 时必须是凭下载码形态（manifest_needs_code=True）",
+                  bool(needs_code(manifest)) if needs_code is not None else False)
         expected_hash = api("expected_hash")
         if expected_hash is not None:
             try:
@@ -1151,6 +1160,26 @@ def _run_behavior_with_stub(stub: _Stub):
         with patched(updater, UPDATE_PUBLIC_KEY_B64=pub_b64, **patch):
             got = fetch_update_info(timeout=5)
         check("★ 正确签名清单 → fetch_update_info 通过", isinstance(got, dict), repr(got)[:120])
+        # 无 url 的清单（下载码体系）：**必须**能过「发现」校验。
+        # 回归背景（2026-11-27）：旧 fetch 一律 require_url=True，无 url 清单在检查更新这一步
+        # 就被拒，GUI 里 manifest_needs_code 的分支永远走不到 ⇒ 删清单 url 会把更新通道打断。
+        no_url = {"version": "9.9.9", "sha256": sha256_hex(PAYLOAD), "notes": "无 url"}
+        stub.manifest = json.dumps(sign_manifest(no_url, key)).encode("utf-8")
+        with patched(updater, UPDATE_PUBLIC_KEY_B64=pub_b64, **patch):
+            got = fetch_update_info(timeout=5)
+        check("★ 无 url 清单（签名正确）→ fetch_update_info 通过",
+              isinstance(got, dict) and got.get("version") == "9.9.9", repr(got)[:120])
+        check("★ 无 url 清单被认成「凭下载码」形态（GUI 才能弹下载码入口）",
+              isinstance(got, dict) and not str(got.get("url") or "").strip(), repr(got)[:120])
+        # 无 url 也不能跳过验签/哈希：否则删 url 就成了"绕过签名校验"的开关
+        stub.manifest = json.dumps({**sign_manifest(no_url, key), "notes": "tampered"}).encode("utf-8")
+        with patched(updater, UPDATE_PUBLIC_KEY_B64=pub_b64, **patch):
+            got = fetch_update_info(timeout=5)
+        check("无 url 清单错签名 → 仍拒绝", got is None, repr(got))
+        stub.manifest = json.dumps({"version": "9.9.9", "notes": "无 url 无哈希"}).encode("utf-8")
+        with patched(updater, **patch):
+            got = fetch_update_info(timeout=5)
+        check("无 url 清单缺哈希 → 仍拒绝", got is None, repr(got))
 
     section("B8. 签名工具端到端（生成密钥 → 签临时清单 → 客户端公钥验过）")
     tmp = new_tmpdir()

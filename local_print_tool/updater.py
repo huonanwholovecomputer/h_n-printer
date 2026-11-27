@@ -547,7 +547,15 @@ def fetch_update_info(timeout: int = FETCH_TIMEOUT) -> dict | None:
         logger.warning(f"更新清单格式异常: {data!r}")
         return None
     try:
-        data = validate_manifest(data)
+        # 清单可以**故意不带 url**（4.7.0+ 下载码体系）：这时下载地址由 /api/dl/grant
+        # 凭码现发，走「发现清单」校验（同样验签、同样哈希必填，只是不要求 url）。
+        # 2026-11-27 修：旧实现一律 validate_manifest(require_url=True)，无 url 的清单在
+        # 「检查更新」这一步就被判成"下载地址为空"⇒ GUI 里的 manifest_needs_code 分支
+        # 永远走不到，删清单 url 等于把整条更新通道打成"拒绝更新"。
+        if str(data.get("url") or "").strip():
+            data = validate_manifest(data)
+        else:
+            data = validate_discovery_manifest(data)
     except (ManifestError, ValueError) as e:
         _set_reject_reason(str(e))
         logger.error(f"更新清单未通过安全校验，拒绝更新: {e}")
