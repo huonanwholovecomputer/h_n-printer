@@ -781,18 +781,18 @@ try {
         .filter((n) => typeof window[n] !== 'function'),
     };
   });
-  chk('v7.12/14 十一个明细区都折成了折叠块（……/垫付/结算公式/重分配/转账/实际盈亏）',
-      fold.n === 11 && fold.keys.join(',') === 'expense,paper,amort,dep,income,pl,advance,formula,redist,transfer,realpl',
+  chk('v7.12/14 十二个明细区都折成了折叠块（……/垫付/结算公式/计算过程/重分配/转账/实际盈亏）',
+      fold.n === 12 && fold.keys.join(',') === 'expense,paper,amort,dep,income,pl,advance,formula,calc,redist,transfer,realpl',
       fold.keys);
   chk('v7.12 默认全部收起（收敛态才叫"抓得住重点"）', fold.open === 0 && fold.aria === true, JSON.stringify({ open: fold.open, aria: fold.aria }));
   chk('v7.12 收起态 body 高度都是 0（不是靠 overflow 视觉隐藏）', fold.bodyH.every((h) => h < 1), fold.bodyH);
   chk('v7.12 收起后整页 < 1600px（改版前 4987px：结论卡 + KPI + 10 行摘要就够看完；v7.15 删卡后只会更短）',
       fold.height > 0 && fold.height < 1600, fold.height + 'px');
   chk('v7.12 标题上移到摘要行（块内 h2 隐藏，但仍留在 DOM 里给脚本按文案查）', fold.h2hidden);
-  chk('v7.12 工具条写着「已收起 N / 11 块」且与实际一致',
-      fold.hasBar && /已收起 11 \/ 11 块/.test(fold.count), fold.count);
-  chk('v7.12/14 每块摘要行都写了这一块最该看的数（11 块全非空）',
-      Object.keys(fold.sums).length === 11 && Object.keys(fold.sums).every((k) => (fold.sums[k] || '').length > 2),
+  chk('v7.12 工具条写着「已收起 N / 12 块」且与实际一致',
+      fold.hasBar && /已收起 12 \/ 12 块/.test(fold.count), fold.count);
+  chk('v7.12/14 每块摘要行都写了这一块最该看的数（12 块全非空）',
+      Object.keys(fold.sums).length === 12 && Object.keys(fold.sums).every((k) => (fold.sums[k] || '').length > 2),
       fold.sums);
   chk('v7.12 摘要行数字与 view/usage 同源（采购总额 / 团队折旧 / 损耗费单列 / 已录转账）',
       String(fold.sums.expense || '').indexOf('300.00') >= 0 && /^团队/.test(String(fold.sums.dep || ''))
@@ -830,14 +830,14 @@ try {
     count: (document.querySelector('#foldCount') || {}).textContent || '',
     height: document.querySelector('#tab-dash').scrollHeight,
   }));
-  chk('v7.12「全部展开」把 11 块都摊开且计数同步', allOpen.open === 11 && /已收起 0 \/ 11 块/.test(allOpen.count), allOpen);
+  chk('v7.12「全部展开」把 12 块都摊开且计数同步', allOpen.open === 12 && /已收起 0 \/ 12 块/.test(allOpen.count), allOpen);
   chk('v7.12 展开后仍装得下全部明细（高度回到 4000px 以上，说明内容没被折叠逻辑吃掉）',
       allOpen.height > 4000, allOpen.height + 'px');
   await page.evaluate(() => window.foldAllDash(0));
   await page.waitForTimeout(320);
 
-  chk('v7.12/14 renderDash 只用 foldBarHTML + 11 个 secFold 编排（再有人把表格 inline 回主函数会红）',
-      rd.indexOf('foldBarHTML()') >= 0 && (rd.match(/secFold\(/g) || []).length === 11
+  chk('v7.12/14 renderDash 只用 foldBarHTML + 12 个 secFold 编排（再有人把表格 inline 回主函数会红）',
+      rd.indexOf('foldBarHTML()') >= 0 && (rd.match(/secFold\(/g) || []).length === 12
       && rd.indexOf('<table') < 0 && rd.indexOf('kpi-grid') < 0,
       { secFold: (rd.match(/secFold\(/g) || []).length, len: rd.length });
   chk('v7.12 记一笔转账后摘要行跟着重算（_refreshDashSummary 里挂了 _applyFoldSums）',
@@ -915,6 +915,91 @@ try {
       /f\.innerHTML = secFold\('formula'/.test(src)
       && sliceFn(src, '_refreshDashSummary').indexOf('_syncFoldCount()') >= 0
       && src.indexOf('keepOpen') < 0);
+
+  /* ══ 16. v7.35：「🧮 计算过程和结果」—— 逐人累加 + 配对回放，讲清「① 结算转账」每笔钱哪来的 ══
+     用户口径（三次修正后定稿）：① 是「团队总额」❌ ② 是「配对过程」❌ —— 要的是把
+     「分红 / 服务评分 − A4纸 / 硒鼓 / 其它采购 + 垫付 − 代收 = 该转出/该收」**一个人一个人地加出来**，
+     再把这些人加到头的净额怎么配成那几笔转账回放一遍。
+     判据不是"写得多"，而是五件事：位置对（公式之后、重分配之前）、每人七项都在且累计列加到头、
+     ② 的回放与 r.transfers 同源、③ 的自检与 KPI 同源、以及**块里不许有第二份口径**
+     （不许 Math.round / parseCents / apportionCents / r.perPerson，只读 view.stack.byMember）。 */
+  const calc = await page.evaluate(async () => {
+    window.foldAllDash(0);
+    await new Promise((r) => setTimeout(r, 320));
+    const sec = document.querySelector('#cs-calc');
+    if (!sec) return { ok: false };
+    const inner = sec.querySelector('.cs-inner');
+    const body = sec.querySelector('.cs-body');
+    const txt = inner.textContent.replace(/\s+/g, ' ');
+    const out = {
+      ok: true,
+      sum: ((sec.querySelector('.cs-sum') || {}).textContent || '').replace(/\s+/g, ' ').trim(),
+      txt: txt,
+      prev: (sec.parentElement.previousElementSibling || {}).id,
+      next: (sec.parentElement.nextElementSibling || {}).id,
+      wrap: (sec.parentElement || {}).id,
+      persons: sec.querySelectorAll('.calc-body .calc-person').length,
+      tables: sec.querySelectorAll('.calc-body table').length,
+      rowsPerPerson: (function () {
+        const t = sec.querySelector('.calc-body .calc-person table');
+        return t ? t.querySelectorAll('tbody tr').length : 0;
+      })(),
+      heads: (function () {
+        const t = sec.querySelector('.calc-body .calc-person table');
+        return t ? Array.prototype.map.call(t.querySelectorAll('thead th'), (x) => (x.textContent || '').trim()) : [];
+      })(),
+      nets: sec.querySelectorAll('.calc-body .calc-person .calc-who b').length,
+      overflow: sec.scrollWidth - sec.clientWidth,
+    };
+    sec.querySelector('.cs-head').click();
+    await new Promise((r) => setTimeout(r, 340));
+    out.open = sec.getAttribute('data-open');
+    out.aria = sec.querySelector('.cs-head').getAttribute('aria-expanded');
+    out.h = Math.round(body.getBoundingClientRect().height);
+    out.innerH = inner.scrollHeight;
+    sec.querySelector('.cs-head').click();
+    await new Promise((r) => setTimeout(r, 320));
+    out.reclosed = Math.round(body.getBoundingClientRect().height);
+    return out;
+  });
+  const cTxt = calc.txt || '';
+  chk('v7.35「🧮 计算过程和结果」是标准折叠块，且夹在「📐 结算公式」与「🔄 资金重分配」之间',
+      calc.ok && calc.wrap === 'dashCalc' && calc.prev === 'dashFormula' && calc.next === 'cs-redist',
+      { wrap: calc.wrap, prev: calc.prev, next: calc.next });
+  chk('v7.35 摘要行写的是「N 人逐项 · M 笔 ¥X」（无转账时是 ✅ 无需转账）',
+      calc.ok && (/^\d+ 人逐项 · (\d+ 笔 ¥|✅ 无需转账)/.test(calc.sum)), calc.sum);
+  chk('v7.35 三小节齐全（① 逐人累加 ② 配成转账 ③ 结果与核对）',
+      calc.ok && ['① 每个人这个月的数', '② 这些净额', '③ 结果与核对'].every((t) => cTxt.indexOf(t) >= 0),
+      cTxt.slice(0, 120));
+  chk('v7.35 每个成员一段、每段 8 行（七项 + 末行合计），且四列表头是「项目/金额/累计/怎么来的」',
+      calc.ok && calc.persons === 3 && calc.rowsPerPerson === 8
+      && ['项目', '金额', '累计', '怎么来的'].every((t, i) => calc.heads[i] === t),
+      { persons: calc.persons, rows: calc.rowsPerPerson, heads: calc.heads });
+  chk('v7.35 七项齐全：分红 / 服务评分 / A4纸 / 硒鼓 / 其它采购 / 垫付 / 代收，末行「= 该转出 / 该收」',
+      calc.ok && ['＋ 投资者分红', '＋ 服务评分分配', '− A4 纸应摊', '− 硒鼓应摊',
+                  '− 其它采购应摊', '＋ 垫付', '− 代收', '= 该转出 / 该收']
+        .every((t) => cTxt.indexOf(t) >= 0), cTxt.slice(0, 240));
+  chk('v7.35 ② 把净额配成转账：写明「取较小」「结清」并回放每一笔',
+      calc.ok && /取较小/.test(cTxt) && /结清/.test(cTxt)
+      && /付之前/.test(cTxt) && /对方还应收/.test(cTxt), cTxt.slice(-520));
+  chk('v7.35 ③ 有现场核对徽标 ✅（Σ净额 = 0、付款侧 = 收款侧、逐人累加对得上）',
+      calc.ok && /✅ 三项都对得上/.test(cTxt) && /Σ每个人的净额/.test(cTxt), cTxt.slice(-420));
+  chk('v7.35 零值不带符号（块内无 −¥0.00 / +¥0.00）',
+      calc.ok && cTxt.indexOf('−¥0.00') < 0 && cTxt.indexOf('+¥0.00') < 0);
+  chk('v7.35 与其它块同一套开关（点开高度=内容高度、再点收起归 0、不横向溢出）',
+      calc.ok && calc.open === '1' && calc.aria === 'true' && Math.abs(calc.h - calc.innerH) < 2
+      && calc.reclosed < 1 && calc.overflow <= 0, calc);
+  const cBody = sliceFn(src, 'dashCalcTraceHTML');
+  chk('v7.35 块函数只读 view.stack.byMember 的已算量：不重算（无 r.perPerson / Math.round / parseCents / apportionCents）',
+      cBody.length > 800 && cBody.indexOf('r.perPerson') < 0 && cBody.indexOf('Math.round') < 0
+      && cBody.indexOf('parseCents(') < 0 && cBody.indexOf('apportionCents(') < 0
+      && cBody.indexOf('view.stack') >= 0 && cBody.indexOf('byMember') >= 0
+      && cBody.indexOf('settleNet') >= 0, { len: cBody.length });
+  chk('v7.35 数据源在 calcMonth 里就绪（_kindShare 分类份额 + view.stack.byMember + 均摊分支兜底）',
+      /view\.stack\.byMember = /.test(src) && sliceFn(src, 'calcMonth').indexOf('_kindShare') >= 0
+      && sliceFn(src, 'calcMonth').indexOf('_poolEq') >= 0
+      && src.indexOf("secFold('calc'") >= 0 && /cc\.innerHTML = secFold\('calc'/.test(src)
+      && sliceFn(src, '_foldSums').indexOf('calc:') >= 0);
 
   /* ══ 11. 页面干净：没有 JS 报错、没有外网请求 ══ */
   chk('无 JS 运行时错误（pageerror）', pageErrors.length === 0, pageErrors.slice(0, 3));

@@ -562,6 +562,10 @@ mark.hit { background: #fff3b0; color: #3b2f00; border-radius: 3px; padding: 0 1
 .formula-body .chk { display: inline-flex; align-items: center; gap: 6px; font-weight: 700; }
 .formula-body .chk.ok { color: var(--pos); }
 .formula-body .chk.bad { color: var(--neg); }
+/* v7.35：「🧮 计算过程和结果」逐人累加 —— 每个人一小段（谁 + 净额 + 一张加减表） */
+.calc-body .calc-person { margin: 0 0 14px; padding-top: 10px; border-top: 1px dashed var(--border); }
+.calc-body .calc-person:first-of-type { border-top: 0; padding-top: 0; }
+.calc-body .calc-who { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
 
 /* ==================== 图表 ==================== */
 .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 16px; }
@@ -1313,7 +1317,7 @@ function mergeStores(localStore, cloudStore) {
 /* ==================== 全局状态 ==================== */
 /* 版本号唯一来源：关于页标题 + 版本说明的最末条目都从它取。发版时只改这一处，
    别再在 renderAbout 里写死字面量（2026-11-16 现场：标题还停在 v7.10，日志已到 v7.25）。 */
-var APP_VER = 'v7.33';
+var APP_VER = 'v7.35';
 var STORE = migrateConfig(null);
 var currentKey = currentMonthKey();
 var currentTab = 'dash';
@@ -2810,6 +2814,36 @@ function calcMonth(m, opts) {
     var _pooled = purchasePools.paper + purchasePools.toner + purchasePools.other;
     if (_pooled !== totalExp) purchasePools.other += (totalExp - _pooled);
   }
+  /* ── v7.35：逐人「按类别」的应摊（A4 纸 / 硒鼓 / 其它）──────────────────────────
+     「🧮 计算过程和结果」要一个人一个人地把数字加出来（分红 + 服务评分 − 纸 − 鼓 − 其它
+     + 垫付 − 代收 = 净额），所以这里给每个人留一份分类明细，块函数只读、不再摊第二次。
+       · usage 分支：每一笔采购各自 apportionCents ⇒ 直接按 kind 累加，天然精确；
+       · equal 分支：只对 totalExp 摊过一次（每个 item 的 alloc 都是同一个「总数」，不能逐笔累加）
+         ⇒ 三类池子各摊一次，最后一类用「应摊小计 − 已分两类」兜住取整余数，
+         保证 纸 + 鼓 + 其它 === perPersonShare[i] 一分不差（余数最多几分，落在「其它」里）。 */
+  var _kindShare = {};
+  members.forEach(function (mem) { _kindShare[mem.id] = { paper: 0, toner: 0, other: 0 }; });
+  if (useUsage) {
+    purchaseItems.forEach(function (it) {
+      (it.alloc || []).forEach(function (a) {
+        var bag = _kindShare[a.id];
+        if (bag && a.share) bag[it.kind] = (bag[it.kind] || 0) + a.share;
+      });
+    });
+  } else {
+    var _ones = members.map(function () { return 1; });
+    var _poolEq = { paper: 0, toner: 0, other: 0 };
+    settledExps.forEach(function (e) { _poolEq[expenseKind(e)] += expenseAmountCents(e); });
+    var _eqPaper = apportionCents(_poolEq.paper, _ones, members);
+    var _eqToner = apportionCents(_poolEq.toner, _ones, members);
+    members.forEach(function (mem) {
+      var bag = _kindShare[mem.id];
+      bag.paper = _eqPaper[mem.id] || 0;
+      bag.toner = _eqToner[mem.id] || 0;
+      bag.other = (perPersonShare[mem.id] || 0) - bag.paper - bag.toner;
+    });
+  }
+
   var investReturn = apportionCents(investPool, members.map(function () { return 1; }), members);
   var serviceReturn = apportionCents(servicePool, members.map(function (mem) {
     return totalScore > 0 ? (scoreTotals[mem.id] || 0) : 1;
@@ -2978,6 +3012,46 @@ function calcMonth(m, opts) {
     amortState: amort ? (amort.state || "ready") : "none",
     amortUncovered: _uncovKeys
   };
+  /* ── v7.34/35：「本月盈亏」的逐项拆解 + 逐人明细（「🧮 计算过程和结果」的唯一数据源）──────
+     只做**分类求和**：收入 / A4 纸 / 硒鼓 / 其它采购 / 设备折旧，逐项减到 teamPL。
+     不做新的分摊或取整，所以 Σ三类采购 必然 ≡ totalExp、income − exp − dep 必然 ≡ teamPL；
+     v7.35 起卡片正文读的是同一份数据的逐人明细（byMember），团队口径仍留在核对行里
+     （tests/verify_settlement_invariants.mjs 的 v7.35 段钉住）。
+     摊销行（virtual）单独累计一份，只用于在类别行里写「含本月摊销 ¥x」，**不重复累加**。 */
+  var _costLines = { paper: 0, toner: 0, other: 0 };
+  var _amortLines = { paper: 0, toner: 0, other: 0 };
+  settledExps.forEach(function (e) {
+    var _k = expenseKind(e), _a = expenseAmountCents(e);
+    _costLines[_k] += _a;
+    if (e.virtual) _amortLines[_k] += _a;
+  });
+  view.stack = {
+    rate: rate, income: totalInc, investPool: investPool, servicePool: servicePool,
+    scoreTotal: totalScore, scoreCap: scoreCap,
+    paper: _costLines.paper, toner: _costLines.toner, other: _costLines.other,
+    amort: _amortLines.paper + _amortLines.toner + _amortLines.other,
+    amortPaper: _amortLines.paper, amortToner: _amortLines.toner, amortOther: _amortLines.other,
+    exp: totalExp, dep: depTotal || 0,
+    orphan: orphanPayerExp || 0, depUnallocated: depUnallocated || 0,
+    pl: (totalInc - totalExp - (depTotal || 0))
+  };
+  /* ── v7.35：逐人明细（「🧮 计算过程和结果」逐人累加那一节的唯一数据源）────────────────
+     settleNet = 分红 + 服务评分 − 三类应摊 + 垫付 − 代收，就是驱动「① 结算转账」的那个数
+     （**不含**损耗费、**不含**折旧）；net 才是把损耗费也算进去的「该转出/入」总额。
+     这里只把 calcMonth 已经算好的量搬进来，不新增任何分摊/取整。 */
+  view.stack.byMember = members.map(function (mem) {
+    var bag = _kindShare[mem.id] || { paper: 0, toner: 0, other: 0 };
+    return {
+      id: mem.id,
+      invest: investReturn[mem.id] || 0, service: serviceReturn[mem.id] || 0,
+      score: scoreTotals[mem.id] || 0, redist: redist[mem.id],
+      paper: bag.paper, toner: bag.toner, other: bag.other,
+      share: perPersonShare[mem.id],
+      paid: paid[mem.id] || 0, collected: _vi(mem.id),
+      dep: depByMember[mem.id] || 0, wear: wearNet[mem.id] || 0,
+      settleNet: settleNet[mem.id], net: net[mem.id], book: bookPL[mem.id]
+    };
+  });
 
   return { rate: rate, totalExp: totalExp, perPerson: perPerson, perPersonShare: perPersonShare,
            totalInc: totalInc, scoreTotals: scoreTotals, totalScore: totalScore,
@@ -8320,6 +8394,14 @@ function renderDash() {
               settleFormulaHTML(r), false)
     + '</div>';
 
+  /* 🧮 计算过程和结果（v7.35）—— 公式讲完后，把「① 结算转账」里那几笔钱一个人一个人地
+     加出来（分红 / 服务评分 − 纸 / 鼓 / 其它 + 垫付 − 代收 = 净额），再看这些净额怎么
+     两两抵消成具体转账。放在「资金重分配」之前：先看每笔钱怎么算出来，再看它落成哪几笔。 */
+  h += '<div id="dashCalc">'
+    + secFold('calc', { title: '🧮 计算过程和结果', hint: '每一笔转账的数字是怎么加出来的', sum: FS.calc, kind: 'real' },
+              dashCalcTraceHTML(r), false)
+    + '</div>';
+
   h += secFold('redist', { title: '🔄 资金重分配', hint: '按账面算的建议转账', sum: FS.redist, kind: 'warn' },
                dashRedistHTML(r), false);
 
@@ -8439,6 +8521,8 @@ function _foldSums(r, m) {
     if (row.adv > 0) advIn += row.adv; else if (row.adv < 0) advOut += -row.adv;
   });
   var ide = _formulaIdent(r);
+  /* 🧮 计算过程和结果：摘要行写「收入 → 成本 → 盈亏」这三个数（只做加法汇总，不改口径） */
+  var _stk = (r.view && r.view.stack) || null;
   var amortState = (amort.state || 'none');
   var amortHint = amortState === 'ready' ? '按批次摊销'
     : amortState === 'loading' ? '统计中…'
@@ -8463,6 +8547,15 @@ function _foldSums(r, m) {
     realpl: '实际 ' + sgn(t.totalActual),
     /* 与块内「③ 三条恒等式 · 本月实算」同一份 _formulaIdent() 结果，不允许各算一次 */
     formula: '恒等式 ' + (ide.ok ? '✅' : '❌') + ' · Π ' + sgn(ide.teamPL),
+    /* 🧮 计算过程和结果：这块讲的是「每个人的数怎么一项项加出来、又怎么配成转账」，
+       所以摘要行写「几个人、几笔、多少钱」，不写团队总数 */
+    calc: (function () {
+      if (!_stk || !_stk.byMember || !_stk.byMember.length) return '—';
+      var nTr = 0, sumTr = 0;
+      (r.transfers || []).forEach(function (x) { nTr++; sumTr += (x.amount || 0); });
+      return _stk.byMember.length + ' 人逐项 · '
+        + (nTr ? (nTr + ' 笔 ' + RMB(sumTr)) : '✅ 无需转账');
+    })(),
   };
 }
 
@@ -9229,6 +9322,182 @@ function settleFormulaHTML(r) {
   h += '</div>';
   return h;
 }
+/* ==================== 🧮 计算过程和结果（v7.35，2026-11-27） ====================
+   用户需求（现场原话）：「计算过程和结果的用途是展示这两个数字是怎么算出来的，
+   不是让你展示那些整体的数字的」——「这两个数字」就是「① 结算转账」里那几笔
+   （现场截图：姚懿样 → 霍楠 ¥48.46、姚懿样 → 闫承翰 ¥267.88）。
+   所以这块不讲团队总数，而是一个人一个人地讲：
+     ① 每个人把自己的数加出来（分红 + 服务评分 − A4 纸 − 硒鼓 − 其它采购 + 垫付 − 代收
+        = 该转出 / 该收的净额），每加一笔都留累计；
+     ② 这些净额怎么两两抵消成那几笔转账（回放 calcMonth 的贪心配对，每笔取较小值）；
+     ③ 核对：Σ净额 = 0、Σ转账付款侧 = 收款侧、逐人累加回得去；折旧单独列（只进账面盈亏）。
+   口径纪律：金额只读 calcMonth 的 view.stack.byMember（同一批中间量的逐人明细），
+   这里只做加减与回放，不重新分摊、不取整、不另算净额；配对用的是 calcMonth 已经产出的
+   r.transfers，回放只是「顺着走一遍」，所以末尾的核对能逐人对得上。
+   ⚠ 零值不带正负号（页面上不许出现 −¥0.00 / +¥0.00）。 */
+function dashCalcTraceHTML(r) {
+  var st = (r && r.view && r.view.stack) || null;
+  var rows = (st && st.byMember) || null;
+  if (!st || !rows || !rows.length) return '';
+  var signed = function (c) { return ((+c || 0) > 0 ? '+' : '') + RMB(c || 0); };
+  var isZero = function (c) { return Math.abs(+c || 0) < 1; };
+  var cls = function (c) { return isZero(c) ? '' : ((+c || 0) > 0 ? 'pos' : 'neg'); };
+  var ratePct = ((+st.rate || 0) * 100).toFixed(1).replace(/\.0$/, '');
+  var tag = function (id) {
+    return '<span class="member-tag" style="background:' + sanitizeColor(MC(id)) + '">' + esc(MN(id)) + '</span>';
+  };
+  var people = rows.slice().sort(function (a, b) { return (a.settleNet || 0) - (b.settleNet || 0); });
+  var settleTr = (r.transfers || []).filter(function (t) { return t.kind === 'settle'; });
+  var wearTr = (r.transfers || []).filter(function (t) { return t.kind === 'wear'; });
+  var payers = people.filter(function (p) { return (p.settleNet || 0) <= -1; });
+  var receivers = people.filter(function (p) { return (p.settleNet || 0) >= 1; });
+  var h = '<div class="formula-body calc-body">';
+
+  /* ── ① 一个人一个人地把数加出来 ── */
+  h += '<h3>① 每个人这个月的数，是怎么一项项加出来的</h3>';
+  h += '<p class="note">「① 结算转账」里那几笔钱，背后就是下面每一个人加出来的净额。'
+     + '收入这边先按<b>分红</b>（团队收入切一块给成员）和<b>服务评分</b>（剩下的按各人评分分）记到人头，'
+     + '再扣掉他该承担的<b>A4 纸 / 硒鼓 / 其它采购</b>，加上他<b>垫付</b>的钱、减去他<b>代收</b>的钱，'
+     + '加到最后一行，就是这个人「该转出多少 / 该收回多少」。</p>';
+  people.forEach(function (p) {
+    var acc = 0;
+    var line = function (label, cents, note) {
+      acc += cents;
+      return { label: label, cents: cents, acc: acc, note: note };
+    };
+    var tr = [
+      line('＋ 投资者分红', p.invest, '本月订单收入的 ' + ratePct + '%，切出来在成员之间均分'),
+      line('＋ 服务评分分配', p.service, '本人 ' + fmtInt(p.score || 0) + ' 分 / 全队 ' + fmtInt(st.scoreTotal || 0) + ' 分，按分加权（全队 0 分时均分）'),
+      line('− A4 纸应摊', -(p.paper || 0), '他该承担的那份纸钱：按本月出纸张数摊，双面也只算一张纸'),
+      line('− 硒鼓应摊', -(p.toner || 0), '按他在那台机器上的出纸页数摊（没指定机器的鼓按全队页数摊）'),
+      line('− 其它采购应摊', -(p.other || 0), '运费 / 装订 / 杂项，按全队页数摊'),
+      line('＋ 垫付', p.paid, '这个月由他先掏钱买下的采购 ' + RMB(p.paid || 0)),
+      line('− 代收', -(p.collected || 0), '实际的收款，全部回归团队进行重分配，需要减去 ' + RMB(p.collected || 0))
+    ];
+    h += '<div class="calc-person">';
+    h += '<div class="calc-who">' + tag(p.id)
+       + ' <span>· 净额 <b class="' + cls(p.settleNet) + '">' + signed(p.settleNet) + '</b>'
+       + (isZero(p.settleNet) ? '（正好持平，不用转）'
+          : (p.settleNet > 0 ? '（这个月该收）' : '（这个月该付）')) + '</span></div>';
+    h += '<div class="table-wrap"><table><thead><tr><th>项目</th><th>金额</th><th>累计</th>'
+       + '<th class="l">怎么来的</th></tr></thead><tbody>';
+    tr.forEach(function (x) {
+      h += '<tr><td>' + x.label + '</td>'
+         + '<td class="' + cls(x.cents) + '">' + signed(x.cents) + '</td>'
+         + '<td class="' + cls(x.acc) + '">' + RMB(x.acc) + '</td>'
+         + '<td class="l">' + x.note + '</td></tr>';
+    });
+    h += '<tr><td style="font-weight:700">= 该转出 / 该收</td>'
+       + '<td class="' + cls(p.settleNet) + '" style="font-weight:800">' + signed(p.settleNet) + '</td>'
+       + '<td class="' + cls(p.settleNet) + '" style="font-weight:800">' + signed(p.settleNet) + '</td>'
+       + '<td class="l">加到这个数，就是「① 结算转账」里那几笔钱的依据</td></tr>';
+    h += '</tbody></table></div>';
+    if (!isZero(p.wear)) {
+      h += '<p class="note">损耗费另算 ' + signed(p.wear)
+         + ' —— 用别人的机器要补给所有者、别人用他的机器他该收，见下面「② 损耗费」那几笔，不在这里的净额里。</p>';
+    }
+    if (!isZero(p.dep)) {
+      h += '<p class="note">设备折旧 ' + RMB(-(p.dep || 0))
+         + ' 只算进「账面盈亏」，<b>不产生任何转账</b> —— 机器磨掉的钱没有人该掏现金。</p>';
+    }
+    h += '</div>';
+  });
+
+  /* ── ② 净额怎么抵消成那几笔转账 ── */
+  h += '<h3>② 这些净额，是怎么配成那几笔转账的</h3>';
+  if (!settleTr.length) {
+    h += '<p class="note">这个月没有人的净额到得了 1 分钱，<b>所以一分钱都不用转</b>。</p>';
+  } else {
+    h += '<p class="note">配对只有一条规则：<b>欠得最多的人先付，付给「该收的钱最少」的那个人，'
+       + '金额取两者当中较小的那个</b>；付完谁归零谁就退场，接着配下一对 —— '
+       + '这样笔数最少，而且每一笔都能当场结清一个人。'
+       + (payers.length ? ('欠钱的是 ' + payers.map(function (p) { return '<b>' + esc(MN(p.id)) + '</b> 欠 ' + RMB(-p.settleNet); }).join('、') + '；') : '')
+       + (receivers.length ? ('该收的是 ' + receivers.map(function (p) { return '<b>' + esc(MN(p.id)) + '</b> 应收 ' + RMB(p.settleNet); }).join('、') + '。') : '')
+       + '</p>';
+    var rem = {};
+    people.forEach(function (p) { rem[p.id] = p.settleNet || 0; });
+    h += '<div class="table-wrap"><table><thead><tr><th>步骤</th><th>谁 → 谁</th>'
+       + '<th>付之前：他还欠</th><th>对方还应收</th><th>取较小的 = 这笔</th><th class="l">付完以后</th></tr></thead><tbody>';
+    settleTr.forEach(function (t, i) {
+      var oweBefore = -(rem[t.from] || 0);
+      var recvBefore = (rem[t.to] || 0);
+      rem[t.from] = (rem[t.from] || 0) + t.amount;
+      rem[t.to] = (rem[t.to] || 0) - t.amount;
+      var oweAfter = -(rem[t.from] || 0);
+      var recvAfter = (rem[t.to] || 0);
+      var after;
+      if (isZero(oweAfter) && isZero(recvAfter)) after = '两边同时结清 ✅';
+      else if (isZero(recvAfter)) after = esc(MN(t.to)) + ' 结清，' + esc(MN(t.from)) + ' 还欠 ' + RMB(oweAfter);
+      else if (isZero(oweAfter)) after = esc(MN(t.from)) + ' 结清，' + esc(MN(t.to)) + ' 还应收 ' + RMB(recvAfter);
+      else after = esc(MN(t.from)) + ' 还欠 ' + RMB(oweAfter) + '，' + esc(MN(t.to)) + ' 还应收 ' + RMB(recvAfter);
+      h += '<tr><td style="color:var(--muted)">' + (i + 1) + '.</td>'
+         + '<td>' + tag(t.from) + ' <span class="arrow">→</span> ' + tag(t.to) + '</td>'
+         + '<td>' + RMB(oweBefore) + '</td><td>' + RMB(recvBefore) + '</td>'
+         + '<td class="pos" style="font-weight:800">' + RMB(t.amount) + '</td>'
+         + '<td class="l">' + after + '</td></tr>';
+    });
+    h += '</tbody></table></div>';
+  }
+  if (wearTr.length) {
+    h += '<p class="note" style="margin-top:10px"><b>损耗费是另一类，不参与上面的配对</b>：'
+       + '它不是「互相欠」，而是「谁用了别人的机器，就把自己用的那份损耗现金补给所有者」，'
+       + '所以按机器一笔一笔定向转。</p>';
+    h += '<div class="table-wrap"><table><thead><tr><th>谁 → 谁</th><th>金额</th>'
+       + '<th class="l">为什么</th></tr></thead><tbody>';
+    wearTr.forEach(function (t) {
+      h += '<tr><td>' + tag(t.from) + ' <span class="arrow">→</span> ' + tag(t.to) + '</td>'
+         + '<td class="pos" style="font-weight:700">' + RMB(t.amount) + '</td>'
+         + '<td class="l">「' + esc(t.printer || '共用机器') + '」是共同出资买的机器：'
+         + esc(MN(t.from)) + ' 用它磨掉的那份寿命，要补给所有者 ' + esc(MN(t.to)) + '</td></tr>';
+    });
+    h += '</tbody></table></div>';
+  }
+
+  /* ── ③ 结果与核对 ── */
+  h += '<h3>③ 结果与核对</h3>';
+  var sumNet = 0, sumSet = 0, sumWear = 0, badRow = 0;
+  people.forEach(function (p) {
+    sumNet += (p.settleNet || 0);
+    if (((p.invest || 0) + (p.service || 0) - (p.share || 0) + (p.paid || 0) - (p.collected || 0)) !== (p.settleNet || 0)) badRow++;
+  });
+  settleTr.forEach(function (t) { sumSet += t.amount; });
+  wearTr.forEach(function (t) { sumWear += t.amount; });
+  var recvSum = 0, paySum = 0;
+  receivers.forEach(function (p) { recvSum += p.settleNet; });
+  payers.forEach(function (p) { paySum += -(p.settleNet || 0); });
+  var okNet = isZero(sumNet);
+  var okSum = (sumSet === recvSum) && (sumSet === paySum);
+  var okRow = (badRow === 0);
+  var okAll = okNet && okSum && okRow;
+  h += '<p><b>结果：' + (settleTr.length
+      ? ('这个月要转 ' + settleTr.length + ' 笔结算转账，合计 ' + RMB(sumSet) + '。')
+      : '这个月不用结算转账。')
+     + (wearTr.length ? ('另有损耗费 ' + wearTr.length + ' 笔，合计 ' + RMB(sumWear) + '。') : '')
+     + '</b></p>';
+  h += '<p>现场核对：<code>Σ每个人的净额 = ' + RMB(sumNet) + '</code> · <code>付款侧合计 = '
+     + RMB(paySum) + '</code> · <code>收款侧合计 = ' + RMB(recvSum) + '</code> · <code>逐人累加</code> '
+     + (okAll ? '<span class="chk ok">✅ 三项都对得上，一分不差</span>'
+              : '<span class="chk bad">❌ 有一项对不上（净额没归零 / 转账总额对不上 / 某个人累加差了几分）</span>') + '</p>';
+  var depList = people.filter(function (p) { return !isZero(p.dep); })
+    .map(function (p) { return esc(MN(p.id)) + ' ' + RMB(p.dep); }).join('、');
+  var notes = [];
+  notes.push('设备折旧本月合计 ' + RMB(st.dep) + (depList ? ('（' + depList + '）') : '')
+    + '：按各人在每台机器上的页数摊，只扣「账面盈亏」，不参与上面任何一笔转账。');
+  var teamPL = (r.view && r.view.totals) ? r.view.totals.totalPL : null;
+  if (teamPL !== null && teamPL !== undefined) {
+    notes.push('团队账面盈亏 ' + RMB(teamPL) + '（收入 − 三类采购 − 折旧）是团队口径；'
+      + '上面讲的是「这些钱在成员之间怎么走」—— 团队赚了，照样可能有人该掏钱，因为钱是从别人手里经过的。');
+  }
+  if (!isZero(st.orphan)) {
+    notes.push('另有 ' + RMB(st.orphan) + ' 采购的付款人已不是当前成员，没有记到任何人头上（在「采购明细」里标了未纳入结算）。');
+  }
+  if (!isZero(st.depUnallocated)) {
+    notes.push('另有 ' + RMB(st.depUnallocated) + ' 折旧的页数归不到任何成员，没有记到人头。');
+  }
+  h += '<p class="note">' + notes.join('<br>') + '</p>';
+  h += '</div>';
+  return h;
+}
 /* 只重绘两个派生区块（转出/入 状态条 + 实际盈亏表），不整体重绘 ——
    整体重绘会重建转账记录行的输入框，正在编辑的金额框会失焦。 */
 function _refreshDashSummary() {
@@ -9249,6 +9518,14 @@ function _refreshDashSummary() {
     f.innerHTML = secFold('formula',
       { title: '📐 结算公式', hint: '完整算式 · 金额整数分', sum: _foldSums(r, m).formula, kind: 'real' },
       settleFormulaHTML(r), false);
+    _syncFoldCount();
+  }
+  /* 🧮 计算过程和结果：里面的「逐人累加 / 配对 / 核对」也跟着本月数据变（分红、应摊、转账都依赖它） */
+  var cc = $('#dashCalc');
+  if (cc) {
+    cc.innerHTML = secFold('calc',
+      { title: '🧮 计算过程和结果', hint: '每一笔转账的数字是怎么加出来的', sum: _foldSums(r, m).calc, kind: 'real' },
+      dashCalcTraceHTML(r), false);
     _syncFoldCount();
   }
   var t = $('#dashTransferTotal');
@@ -12169,7 +12446,19 @@ function renderAbout() {
     '锁定态格子是只读的、<b>点格子本身也会弹密码框</b>；解锁后那枚锁变成 🔓，再点一下可以随手锁回去防误触。' +
     '用的是<b>「采购支出」那一个密码</b>，不另开密码 —— 废纸张数本来就决定 A4 纸摊销金额（同属耗材那笔钱），' +
     '再开一个模块只会让每次开页都弹一次「首次设置密码」。解锁后 30 分钟内有效，和其他敏感模块一样。</p>' +
-    '<p style="margin-top:10px">页面仅由本地打印工具启动，数据实时保存在云端服务器。</p>' +
+    '<p style="margin-top:10px">v7.35：<b>多了一张「🧮 计算过程和结果」，「① 结算转账」里那几笔钱一个人一个人加给你看</b> —— ' +
+    '以前只有「① 结算转账」给出结果（谁转给谁多少），为什么是这个数、差一分是哪一类采购差出来的，页面上无处可查。' +
+    '现在「📐 结算公式」与「🔄 资金重分配」之间多一个折叠块，按「逐人加数 → 配成转账 → 结果核对」三段摆开：' +
+    '① <b>每个人这个月的数，是怎么一项项加出来的</b>：一个人一张表，' +
+    '<b>＋ 投资者分红 / ＋ 服务评分分配 / − A4 纸应摊 / − 硒鼓应摊 / − 其它采购应摊 / ＋ 垫付 / − 代收</b> 七行，' +
+    '「累计」列一路加到最后一行，就是这个人「该转出多少 / 该收回多少」—— 也就是 ① 那几笔钱的依据；' +
+    '损耗费与设备折旧各有一句说明，告诉你不进这个净额（折旧根本不过现金）。' +
+    '② <b>这些净额怎么配成那几笔转账</b>：先写清规则（欠得最多的先付、付给应收最少的、金额取两者较小的），' +
+    '再一笔一笔回放「付之前他还欠多少 / 对方还应收多少 / 因此取较小的多少 / 付完谁结清了」，' +
+    '损耗费单独一张表写明是哪台机器、补给哪个所有者。' +
+    '③ <b>结果与核对</b>：这个月一共几笔、合计多少，以及「Σ每个人的净额 = 0、付款侧合计 = 收款侧合计、' +
+    '逐人累加对得上」三项现场核对。' +
+    '金额全部来自结算自己算出的逐人明细，页面不另立口径；标题右边就是「N 人逐项 · M 笔 ¥…」，不展开也知道有几笔。</p>' +
     '</div>' +
     '</div>');
 }
