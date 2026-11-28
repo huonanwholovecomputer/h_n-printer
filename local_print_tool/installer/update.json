@@ -1,9 +1,9 @@
 {
-  "version": "4.7.7",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.7.exe",
-  "md5": "075d6e665957e11375b8e585ffed312f",
-  "sha256": "6e1308de6cbffe501e8b607aea0360b20fa32665c6405b12823c8fda8eb749f5",
-  "notes": "v4.7.7：修掉「更新清单里没有直链下载地址时整份被拒绝」的问题。以前服务端清单一不带下载地址，「检查更新」就会报「下载地址为空」并拒绝，等于所有机器都看不到新版本；现在没有下载地址也能正常发现新版本，再按提示用下载码取到真正的下载地址。安全性没有放松：清单签名与安装包哈希照样强制校验。",
+  "version": "4.7.8",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.8.exe",
+  "md5": "85f78e3530bda2eab22f9d6a929c10fb",
+  "sha256": "6ce0a2c2a504a2d2fef7dc0eaf3c64460163ffb70a87655f0a89a6ae80228cef",
+  "notes": "v4.7.8：七项设置收进一个「设置」窗口（选项 → 设置…），左边列表切换、右边表单，保存按页进行；新增开机自启，并可选择静默启动（开机只留托盘、不挡桌面）。收支清算新增「🧮 计算过程和结果」，把每笔转账一个人一个人加给你看，并回放净额怎么抵消成那几笔转账。Windows 覆盖安装不丢配置。",
   "sig_algo": "ed25519",
-  "sig": "34nqG8Wt+D7sCY0fvLIESGFP8j4yamJdbqPM/EMOh6DpLurzQc74i2nhAs3qtHjS0rSxbD52bGxcgLi9hsr8CA=="
+  "sig": "jflMapMVmfZznG9oAuzChen1Z9KMUqXu2WrPkOStiPamWPAkhpow2HRmkt5a64s1PAIMJiEEIAaAG+smr03iAw=="
 }
