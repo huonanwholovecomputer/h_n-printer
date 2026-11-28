@@ -90,7 +90,7 @@ _end = SRC.find("]", _blk)
 _widgets_block = SRC[_blk:_end] if 0 <= _blk < _end else ""
 check("缩放控件不在 _edit_widgets（始终可用）",
       "_edit_scale_mode" not in _widgets_block and "_edit_scale_percent" not in _widgets_block)
-_menu_slot = SRC.find("def _on_print_scale_options")
+_menu_slot = SRC.find("def _apply_print_scale")
 _menu_next = SRC.find("\n    def ", _menu_slot + 10) if _menu_slot >= 0 else -1
 _menu_body = SRC[_menu_slot:_menu_next] if _menu_slot >= 0 and _menu_next > _menu_slot else ""
 check("菜单对话框保存后同步面板（_sync_scale_edit 在槽里）",
@@ -227,25 +227,9 @@ check("重启后百分比仍是 150", win2._edit_scale_percent.value() == 150,
       f"{win2._edit_scale_percent.value()}")
 
 
-class _FakeDialog:
-    """替身：模拟用户在「选项 → 打印缩放…」里选了「实际大小」并点保存。"""
-
-    def __init__(self, *_a, **_k):
-        pass
-
-    def exec(self):
-        return QDialog.Accepted
-
-    def values(self):
-        return (_pp.SCALE_ACTUAL, _pp.SCALE_PERCENT_DEFAULT)
-
-
-_orig_dlg = _gui.PrintScaleDialog
-_gui.PrintScaleDialog = _FakeDialog
-try:
-    win2._on_print_scale_options()
-finally:
-    _gui.PrintScaleDialog = _orig_dlg
+# 设置窗「打印缩放」页保存时调的就是这个助手（真弹模态窗在 offscreen 下会挂住）。
+# 判据不变：配置写 actual、面板那一行跟着变、百分比框灰着但值同步成 100。
+win2._apply_print_scale(_pp.SCALE_ACTUAL, _pp.SCALE_PERCENT_DEFAULT)
 app.processEvents()
 check("菜单对话框保存后 config = actual",
       win2._config.print_scale() == (_pp.SCALE_ACTUAL, _pp.SCALE_PERCENT_DEFAULT),

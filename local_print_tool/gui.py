@@ -55,6 +55,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QVBoxLayout,
     QHBoxLayout,
+    QLayout,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -80,6 +81,8 @@ from PySide6.QtWidgets import (
     QMenu,
     QAbstractItemView,
     QScrollArea,
+    QListWidget,
+    QStackedWidget,
     QAbstractScrollArea,
     QStatusBar,
     QStyleFactory,
@@ -115,6 +118,7 @@ import safe_confirm  # 危险确认统一口径：默认按钮永不是「执行
 import print_watch   # 外部打印监视（绕过本工具的作业：只检测+记账，不阻断，见 print_watch.py）
 import order_thumbs  # 本地订单首页缩略图（结算页"略缩图"；本地单没有云端 file_id，见 order_thumbs.py）
 import pass2_watch   # 「上一批第 2 趟可能还在出纸」的跨批次计时（插单会串页，见 pass2_watch.py）
+import startup       # 开机自启（HKCU Run 键，无管理员权限；见 startup.py）
 from theme_manager import ThemeManager, MODE_SYSTEM, MODE_LIGHT, MODE_DARK, MODE_LABELS
 from cloud_client import (CloudClient, CloudTask, cache_engine_for, pdf_cache_key,
                           order_status_label_cn, auth_headers)
@@ -4151,6 +4155,865 @@ class BlankSplitDialog(QDialog):
             self._sync_note()
         except Exception:
             logger.debug("恢复默认空白页率拆单失败", exc_info=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 设置窗口（选项 → 设置…）
+#
+# 2026-11-27 用户要求：云端连接 / 默认任务参数 / 打印缩放 / 空白页率拆单 /
+# 打印速度 / 打印机双面能力 / 开机自启 七项设置不再各弹一个框，统一收进一个
+# 独立窗口，参考 Windows 设置：左侧分类列表、右侧表单。
+#
+# 两条实现原则：
+#   ① 老对话框**不重写** —— 把它们的 layout 内容整体搬进普通 QWidget 当页面
+#      （_adopt_dialog_body），对话框对象只留作「无头控制器」（values() / _on_reset()
+#      读的是它自己的控件）。五个老设置框的表单、校验、归一逻辑一行不改，行为和
+#      以前单独弹窗完全一致；也避开了「把 QDialog 当子控件塞进去」的坑
+#      （那样 Esc/Enter 仍会触发 accept()/reject()，把那一页 hide 掉）。
+#   ② 保存是**按页**的（和原来每个对话框的「保存」语义一致）：切页不丢改动；
+#      关窗时若还有没保存的页，一次性问「保存并关闭 / 不保存 / 取消」。
+# ══════════════════════════════════════════════════════════════════════════
+
+_SETTINGS_DEAD_BUTTONS = ("保存", "取消", "关闭")
+
+
+def _adopt_dialog_body(dlg: QDialog) -> QWidget:
+    """把设置对话框的 layout 内容搬进一个普通 QWidget，并丢掉底部的 保存/取消/关闭。
+
+    QDialog 不能直接当页面用：`setWindowFlags(Qt.Widget)` 塞进 QStackedWidget 确实能显示，
+    但 QDialog 的 Esc/Enter 语义还在 —— Enter 会点那个已经藏起来的默认按钮、Esc 会
+    reject()，而 QDialog.done() 会把这一页 hide 掉（页面「消失」，操作员以为程序坏了）。
+    搬控件则是干净的：页面是普通 QWidget，键盘事件不会再落到 QDialog 那套语义上。
+
+    被搬空的 dlg 仍由页面持引用：`values()` / `_on_reset()` 读的是 dlg 自己的控件属性，
+    与 parent 无关，所以设置窗口可以直接调它们。
+    """
+    # 要丢的按钮：保存/取消/关闭（含各页自己的「恢复默认」，它由窗口底部统一提供），
+    # 其余按钮（例如「▶ 打印测速」）必须留着 —— 它们是有副作用的动作，不是保存。
+    doomed: list = []
+    seen: set = set()
+    for attr in ("_btn_save", "_btn_cancel", "_btn_reset"):
+        btn = getattr(dlg, attr, None)
+        if isinstance(btn, QPushButton) and id(btn) not in seen:
+            seen.add(id(btn))
+            doomed.append(btn)
+    for btn in dlg.findChildren(QPushButton):
+        if btn.text().strip() in _SETTINGS_DEAD_BUTTONS and id(btn) not in seen:
+            seen.add(id(btn))
+            doomed.append(btn)
+
+    # 先去引用，再搬控件：被 removeWidget 摘掉的按钮不会跟着 layout 一起搬走
+    layouts = [dlg.layout()] + [lay for lay in dlg.findChildren(QLayout) if lay is not None]
+    for btn in doomed:
+        for lay in layouts:
+            if lay is not None and lay.indexOf(btn) >= 0:
+                lay.removeWidget(btn)
+                break
+        btn.setParent(None)
+        btn.deleteLater()
+
+    src = dlg.layout()
+    page = QWidget()
+    page.setObjectName("settingsForm")
+    dst = QVBoxLayout(page)
+    margin = src.contentsMargins()
+    dst.setContentsMargins(margin.left(), margin.top(), margin.right(), margin.bottom())
+    dst.setSpacing(src.spacing())
+    while src.count():
+        item = src.takeAt(0)
+        widget = item.widget()
+        child = item.layout()
+        spacer = item.spacerItem()
+        if widget is not None:
+            widget.setParent(page)
+            dst.addWidget(widget)
+        elif child is not None:
+            dst.addLayout(child)      # QLayout 允许被重新 parent
+        elif spacer is not None:
+            continue                  # 空白弹簧交给页面末尾的统一拉伸
+    dst.addStretch(1)                 # 余量留在底部，别把控件拉开成一片空白
+    return page
+
+
+class SettingsPage(QWidget):
+    """设置窗口里的一页。子类只需给出 title + values()/save()/reset()。"""
+
+    title = ""
+
+    def __init__(self, win, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._win = win
+        self._initial = None
+
+    # ── 子类接口 ──
+    def values(self) -> dict:
+        """当前表单值（也用于脏判断，必须是可比较的稳定结构）。"""
+        raise NotImplementedError
+
+    def save(self) -> bool:
+        """写配置并落盘。失败时自己提示并返回 False（窗口据此保留脏标记）。"""
+        raise NotImplementedError
+
+    def reset(self) -> None:
+        """恢复这一页的出厂默认（只改控件，不落盘）。"""
+        return None
+
+    def can_reset(self) -> bool:
+        return True
+
+    def can_save(self) -> bool:
+        return True
+
+    # ── 通用 ──
+    def mark_saved(self) -> None:
+        try:
+            self._initial = self.values()
+        except Exception:
+            logger.debug("设置页快照失败（忽略）", exc_info=True)
+            self._initial = None
+
+    def is_dirty(self) -> bool:
+        if self._initial is None:
+            return False
+        try:
+            return self.values() != self._initial
+        except Exception:
+            return False
+
+
+class _DialogSettingsPage(SettingsPage):
+    """把某个老设置对话框整体搬成一页；save() 由子类接到 MainWindow 的 apply 助手。"""
+
+    def __init__(self, win, dialog: QDialog, parent: QWidget | None = None):
+        super().__init__(win, parent)
+        self._dlg = dialog
+        box = QVBoxLayout(self)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.addWidget(_adopt_dialog_body(dialog))
+        self.mark_saved()
+
+    def values(self) -> dict:
+        return self._dlg.values()
+
+    def reset(self) -> None:
+        fn = getattr(self._dlg, "_on_reset", None)
+        if fn is not None:
+            fn()
+
+    def can_reset(self) -> bool:
+        return hasattr(self._dlg, "_on_reset")
+
+
+class DefaultTaskOptionsPage(_DialogSettingsPage):
+    title = "默认任务参数"
+
+    def __init__(self, win, parent: QWidget | None = None):
+        # 版式旧快照必须在**对话框建好之前**取：apply 里用它判断这次到底改没改到
+        # 「会进 PDF」的那几个键（打开之后再取，判据永远相等，重渲染就再也不会触发）。
+        self._layout_before = task_options_to_print_options(win._config.task_options())
+        super().__init__(win, DefaultTaskOptionsDialog(
+            None,
+            options=(win._config.default_task_options or {}),
+            paper_size=win._config.paper_size,
+            theme_manager=getattr(win, "_theme_manager", None)), parent)
+
+    def save(self) -> bool:
+        return self._win._apply_default_task_options(self._dlg.values(), self._layout_before)
+
+
+class PrintScalePage(_DialogSettingsPage):
+    title = "打印缩放"
+
+    def __init__(self, win, parent: QWidget | None = None):
+        super().__init__(win, PrintScaleDialog(
+            None,
+            scale_mode=win._config.scale_mode,
+            scale_percent=win._config.scale_percent,
+            theme_manager=getattr(win, "_theme_manager", None)), parent)
+
+    def save(self) -> bool:
+        mode, percent = self._dlg.values()
+        return self._win._apply_print_scale(mode, percent)
+
+
+class BlankSplitPage(_DialogSettingsPage):
+    title = "空白页率拆单"
+
+    def __init__(self, win, parent: QWidget | None = None):
+        auto_pairs = bool(getattr(win._printer_profile(), "auto_duplex", False))
+        super().__init__(win, BlankSplitDialog(
+            None,
+            ask=win._config.blank_split_ask,
+            threshold_manual=win._config.blank_split_threshold(False),
+            threshold_auto=win._config.blank_split_threshold(True),
+            auto_duplex=auto_pairs,
+            theme_manager=getattr(win, "_theme_manager", None)), parent)
+
+    def save(self) -> bool:
+        ask, th_manual, th_auto = self._dlg.values()
+        return self._win._apply_blank_split(ask, th_manual, th_auto)
+
+
+class PrintSpeedPage(_DialogSettingsPage):
+    title = "打印速度"
+
+    def __init__(self, win, parent: QWidget | None = None):
+        # 自动双面机型上这套参数没有消费者：原对话框整页置灰、保存按钮改成「关闭」，
+        # 这里同样不给保存（灰掉的控件不回写配置）。
+        self._readonly = win._printer_profile().auto_duplex is True
+        dialog = PrintSpeedDialog(
+            None, win._printer_profile(),
+            win._config.printer_name or "(系统默认打印机)")
+        super().__init__(win, dialog, parent)
+        dialog.calibrate_requested.connect(self._on_calibrate_requested)
+
+    def _on_calibrate_requested(self):
+        # 测速是「打 11 张纸」的副作用动作，不是保存；闸门仍在 _start_speed_calibration 里
+        try:
+            self._win._start_speed_calibration()
+        except Exception:
+            logger.exception("打印测速启动失败")
+            QMessageBox.warning(self, "打印测速", "启动失败，详见日志。")
+
+    def can_save(self) -> bool:
+        return not self._readonly
+
+    def can_reset(self) -> bool:
+        return not self._readonly
+
+    def save(self) -> bool:
+        # 自动双面机型上这一页是只读说明：连「硬调 save」都不许回写档案
+        # （与旧对话框「保存按钮改成关闭、走 reject」同一口径）。
+        if not self.can_save():
+            return False
+        return self._win._apply_print_speed(self._dlg.values())
+
+
+class DuplexCapabilityPage(_DialogSettingsPage):
+    title = "打印机双面能力"
+
+    def __init__(self, win, parent: QWidget | None = None):
+        self._queue = (win._config.printer_name or "").strip()
+        dialog = PrinterDuplexCapabilityDialog(
+            self._queue or "(系统默认打印机)",
+            win._printer_profile(),
+            verified_by=(win._config.cloud_owner_name or ""),
+            parent=None)
+        super().__init__(win, dialog, parent)
+        if not self._queue:
+            hint = QLabel("先在顶栏选一台打印机，才能给它的双面能力盖章。")
+            hint.setStyleSheet("color: #d68910; font-size: 12px;")
+            self.layout().insertWidget(0, hint)
+
+    def _control_state(self) -> tuple:
+        # 不能拿 values() 比脏：它每次都带 verified_at=now，永远"有改动"
+        dlg = self._dlg
+        return (dlg._cap.currentIndex(), dlg._first.currentIndex(),
+                dlg._reverse.currentIndex(), bool(dlg._rotate.isChecked()),
+                dlg._by.text().strip())
+
+    def mark_saved(self) -> None:
+        super().mark_saved()
+        self._state = self._control_state()
+
+    def is_dirty(self) -> bool:
+        return self._control_state() != getattr(self, "_state", self._control_state())
+
+    def can_save(self) -> bool:
+        return bool(self._queue)
+
+    def can_reset(self) -> bool:
+        return False
+
+    def save(self) -> bool:
+        if not self._queue:
+            return False
+        ok = self._win._apply_duplex_capability(self._queue, self._dlg.values())
+        if ok:
+            # 存完后把「当前档案」那行也刷一遍，否则页面还显示保存前的结论（看不出生效了）
+            try:
+                self._dlg._show_current(self._win._printer_profile())
+            except Exception:
+                logger.debug("刷新当前档案文案失败（忽略）", exc_info=True)
+        return ok
+
+
+class StartupSettingsPage(SettingsPage):
+    """常规：开机自启 + 静默启动（开机只留托盘，不弹主窗口）。"""
+
+    title = "常规"
+
+    def __init__(self, win, parent: QWidget | None = None):
+        super().__init__(win, parent)
+        theme_manager = getattr(win, "_theme_manager", None)
+        box = QVBoxLayout(self)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(10)
+
+        group = QGroupBox("启动")
+        inner = QVBoxLayout(group)
+        inner.setSpacing(8)
+
+        self._chk = ThemedCheckBox("登录 Windows 后自动启动本工具", theme_manager=theme_manager)
+        self._chk.setToolTip(
+            "把本工具登记到当前用户的启动项（注册表 HKCU\\...\\Run），不需要管理员权限。\n"
+            "关掉开关立即移除，不用重启。")
+        self._chk.toggled.connect(self._sync_enabled)
+        inner.addWidget(self._chk)
+
+        self._silent = ThemedCheckBox("静默启动：不弹出主窗口，只留托盘图标", theme_manager=theme_manager)
+        self._silent.setToolTip(
+            "开机自启的命令行会带 --start-minimized：\n"
+            "一开机就在托盘里待命，不挡在桌面上，双击托盘图标才打开主窗口。")
+        inner.addWidget(self._silent)
+
+        self._detail = QLabel("")
+        self._detail.setWordWrap(True)
+        self._detail.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._detail.setStyleSheet("color: #8a8f98; font-size: 12px;")
+        inner.addWidget(self._detail)
+
+        box.addWidget(group)
+
+        hint = QLabel("提示：Windows 的「任务管理器 → 启动应用」里也能单独禁用它；"
+                      "若在那里被禁用，本页仍会显示「已登记」。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #8a8f98; font-size: 12px;")
+        box.addWidget(hint)
+        box.addStretch(1)
+
+        self._sync_from_registry()
+        self.mark_saved()
+
+    # ── 表单 ──
+    def values(self) -> dict:
+        return {"enabled": bool(self._chk.isChecked()),
+                "silent": bool(self._silent.isChecked())}
+
+    def _sync_from_registry(self) -> None:
+        try:
+            st = startup.status()
+        except Exception as e:
+            logger.debug(f"读取开机自启状态失败（忽略）: {e}")
+            st = {"enabled": False, "silent": True, "command": "", "expected": "",
+                  "current": False}
+        self._chk.setChecked(bool(st.get("enabled")))
+        self._silent.setChecked(bool(st.get("silent")) if st.get("enabled") else True)
+        self._sync_enabled()
+        self._refresh_detail(st)
+
+    def _sync_enabled(self, *_args) -> None:
+        self._silent.setEnabled(bool(self._chk.isChecked()))
+
+    def _refresh_detail(self, st: dict | None = None) -> None:
+        if st is None:
+            try:
+                st = startup.status()
+            except Exception:
+                st = {"enabled": False}
+        if not st.get("enabled"):
+            self._detail.setText("当前未登记开机自启。")
+            return
+        cmd = st.get("command") or ""
+        if not st.get("current", True):
+            self._detail.setText(
+                "⚠ 启动项里登记的还是旧路径（可能程序被移动过）：\n"
+                f"    {cmd}\n"
+                f"当前程序：{st.get('expected', '')}\n"
+                "把上面的开关关掉再打开，即可改成现在的路径。")
+            return
+        self._detail.setText(f"已登记：\n    {cmd}")
+
+    def reset(self) -> None:
+        self._chk.setChecked(False)
+        self._silent.setChecked(True)
+
+    def save(self) -> bool:
+        want = bool(self._chk.isChecked())
+        silent = want and bool(self._silent.isChecked())
+        try:
+            ok, msg = startup.set_enabled(want, silent)
+        except Exception as e:
+            logger.exception("设置开机自启失败")
+            QMessageBox.warning(self, "开机自启", f"设置失败：{type(e).__name__}: {e}")
+            return False
+        self._sync_from_registry()
+        if not ok:
+            QMessageBox.warning(self, "开机自启", msg)
+            return False
+        try:
+            self._win._log(f"⚙ {msg}")
+        except Exception:
+            pass
+        return True
+
+
+class CloudSettingsPage(SettingsPage):
+    """云端连接：从原来的「☁ 云端连接设置」对话框整页搬过来。"""
+
+    title = "云端连接"
+
+    def __init__(self, win, parent: QWidget | None = None):
+        super().__init__(win, parent)
+        self._tm = getattr(win, "_theme_manager", None)
+        cfg = win._config
+        box = QVBoxLayout(self)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(10)
+
+        box.addWidget(QLabel("连接到你部署的后端服务器，接收小程序/APP 提交的打印任务。"))
+
+        self.cloud_switch = ThemedCheckBox("启用云端功能", theme_manager=self._tm)
+        self.cloud_switch.setToolTip(
+            "关闭后将以纯本地模式运行（本地订单库记录打印，收支清算显示本地订单统计）。"
+            "切换后需重启应用生效。")
+        self.cloud_switch.setChecked(bool(cfg.cloud_enabled))
+        box.addWidget(self.cloud_switch)
+
+        self.take_orders_switch = ThemedCheckBox("启用接单（接收云端订单）", theme_manager=self._tm)
+        self.take_orders_switch.setToolTip(
+            "勾选后本机进入「可接单设备」列表，移动端提交订单时可选择向本机发送打印任务。\n"
+            "多台设备可同时启用接单；未指定目标设备的订单由任一在线接单设备接收。")
+        self.take_orders_switch.setChecked(bool(cfg.cloud_take_orders))
+        box.addWidget(self.take_orders_switch)
+
+        self.claim_hint = QLabel("")
+        self.claim_hint.setWordWrap(True)
+        self.claim_hint.setStyleSheet("color: #8a8f98; font-size: 12px;")
+        box.addWidget(self.claim_hint)
+
+        box.addWidget(QLabel("API 地址："))
+        self.api_input = QLineEdit(cfg.cloud_api_url)
+        self.api_input.setPlaceholderText("https://your-server.com")
+        box.addWidget(self.api_input)
+
+        box.addWidget(QLabel("WebSocket 地址："))
+        self.ws_input = QLineEdit(cfg.cloud_ws_url)
+        self.ws_input.setPlaceholderText("wss://your-server.com")
+        box.addWidget(self.ws_input)
+
+        box.addWidget(QLabel("认证 Token："))
+        self.token_input = QLineEdit(cfg.cloud_token)
+        self.token_input.setPlaceholderText(
+            "打印机认证 token（全局 token，或用下面的按钮换本机专用 token）")
+        self.token_input.setEchoMode(QLineEdit.Password)
+        box.addWidget(self.token_input)
+
+        self.device_tok_label = QLabel("")
+        self.device_tok_label.setWordWrap(True)
+        self.device_tok_label.setStyleSheet("color: #8a8f98; font-size: 12px;")
+        box.addWidget(self.device_tok_label)
+        self._fill_device_token_hint()
+
+        issue_row = QHBoxLayout()
+        self.issue_btn = QPushButton("🔑 重新签发本机 token")
+        self.issue_btn.setToolTip(
+            "用上面的认证 Token（需 admin 权限）为本机签发专用 token。\n"
+            "签发后立即改用新 token 重连；服务端会作废旧 token（明文只显示这一次，工具自动保存）。")
+        self.issue_btn.setEnabled(bool(win._cloud_client))
+        self.issue_btn.clicked.connect(self._issue_device_token)
+        issue_row.addWidget(self.issue_btn)
+        issue_row.addStretch(1)
+        box.addLayout(issue_row)
+
+        text = ("🟢 已连接"
+                if (win._cloud_client and win._cloud_client.is_connected()) else "🔴 未连接")
+        self.status_label = QLabel(text)
+        box.addWidget(self.status_label)
+
+        if win._cloud_client and win._cloud_client.is_connected():
+            self.disconnect_btn = QPushButton("断开连接")
+            self.disconnect_btn.setObjectName("cloudDisconnected")
+            self.disconnect_btn.clicked.connect(self._on_disconnect)
+            box.addWidget(self.disconnect_btn)
+        else:
+            self.disconnect_btn = None
+
+        box.addStretch(1)
+
+        self._fill_claim_hint()
+        if win._cloud_client and win._cloud_client.is_connected():
+            threading.Thread(target=self._refresh_claim_hint, daemon=True).start()
+        self.mark_saved()
+
+    # ── 表单 ──
+    def values(self) -> dict:
+        return {
+            "api_url": self.api_input.text().strip(),
+            "ws_url": self.ws_input.text().strip(),
+            "token": self.token_input.text().strip(),
+            "enabled": bool(self.cloud_switch.isChecked()),
+            "take_orders": bool(self.take_orders_switch.isChecked()
+                                and self.cloud_switch.isChecked()),
+        }
+
+    def save(self) -> bool:
+        return self._win._apply_cloud_settings(self)
+
+    def reset(self) -> None:
+        # 「恢复本页默认」= 回到当前已保存的配置（云端地址/Ttoken 没有出厂默认值可回）
+        cfg = self._win._config
+        self.api_input.setText(cfg.cloud_api_url or "")
+        self.ws_input.setText(cfg.cloud_ws_url or "")
+        self.token_input.setText(cfg.cloud_token or "")
+        self.cloud_switch.setChecked(bool(cfg.cloud_enabled))
+        self.take_orders_switch.setChecked(bool(cfg.cloud_take_orders))
+
+    def can_reset(self) -> bool:
+        return True
+
+    # ── 交互 ──
+    def _on_disconnect(self) -> None:
+        client = self._win._cloud_client
+        if client is not None:
+            client.stop()
+        self.status_label.setText("🔴 未连接")
+
+    def _fill_device_token_hint(self) -> None:
+        if self._win._config.cloud_device_token:
+            self.device_tok_label.setText(
+                "🔑 本机专用 token：已启用（只存在本机配置文件，可在服务端单独吊销）")
+        else:
+            self.device_tok_label.setText(
+                "🔑 本机专用 token：未启用（连接时会用全局 token 自动签发一次）")
+
+    def _fill_claim_hint(self) -> None:
+        try:
+            st = getattr(self._win, "_cloud_printer_state_cache", {}) or {}
+            if st.get("is_active"):
+                self.claim_hint.setText("✅ 本机已启用接单（可接收云端订单）")
+                return
+            count = st.get("claiming_count", 0)
+            if count > 0:
+                self.claim_hint.setText(f"当前有 {count} 台设备启用接单；本机未启用")
+            else:
+                self.claim_hint.setText("当前无设备启用接单")
+        except RuntimeError:
+            pass          # 页面已随窗口销毁
+
+    def _refresh_claim_hint(self) -> None:
+        try:
+            client = self._win._cloud_client
+            if client is None:
+                return
+            data = client.get_printer_devices()
+            if not data:
+                return
+            claiming_count = sum(1 for d in data.get("devices", []) if d.get("is_active"))
+            self._win._cloud_printer_state_cache = {
+                "claiming_count": claiming_count,
+                "is_active": bool(client.take_orders),
+            }
+            QTimer.singleShot(0, self._fill_claim_hint)
+        except Exception:
+            pass
+
+    def _issue_device_token(self) -> None:
+        client = self._win._cloud_client
+        if not client:
+            self.device_tok_label.setText(
+                "⚠ 云端未启用：先把「启用云端功能」保存并连上，再签发本机 token")
+            return
+        self.issue_btn.setEnabled(False)
+        self.device_tok_label.setText("⏳ 正在签发本机 token…")
+
+        def _net():
+            err, tok, scopes = "", "", []
+            try:
+                tok, scopes = client.request_device_token(scopes=("print", "admin"))
+            except Exception as e:      # noqa: BLE001
+                err = str(e)
+
+            def _done():
+                try:
+                    self.issue_btn.setEnabled(True)
+                    if err:
+                        self.device_tok_label.setText(f"❌ 签发失败：{err}")
+                        return
+                    self._win._config.cloud_device_token = tok
+                    client.device_token = tok
+                    try:
+                        self._win._save_config(sync_ui=False)
+                    except Exception as e:
+                        logger.warning(f"保存本机 token 失败: {e}")
+                    self.device_tok_label.setText(
+                        f"✅ 已签发并切换本机 token（scopes={','.join(scopes) or 'print'}），正在重连…")
+                    try:
+                        client.stop()
+                        client.start()
+                    except Exception as e:
+                        logger.warning(f"切换本机 token 后重连失败: {e}")
+                except RuntimeError:
+                    pass                  # 窗口已关闭、控件已销毁
+            QTimer.singleShot(0, _done)
+
+        threading.Thread(target=_net, daemon=True).start()
+
+
+_SETTINGS_PAGES = (
+    ("startup", StartupSettingsPage),
+    ("cloud", CloudSettingsPage),
+    ("default_task", DefaultTaskOptionsPage),
+    ("print_scale", PrintScalePage),
+    ("blank_split", BlankSplitPage),
+    ("print_speed", PrintSpeedPage),
+    ("duplex", DuplexCapabilityPage),
+)
+
+
+class SettingsWindow(QDialog):
+    """选项 → 设置…：参考 Windows 设置布局的统一设置窗口（左侧分类 / 右侧表单）。"""
+
+    def __init__(self, win):
+        # 父窗口的选择和原来「云端连接设置」同一个道理：主窗口在托盘里/最小化时
+        # 做成独立窗口，否则模态框会挂在看不见的父窗上，抢不到前台就等于程序假死。
+        standalone = (not win.isVisible()) or win.isMinimized()
+        super().__init__(None if standalone else win)
+        if standalone:
+            self.setWindowIcon(win.windowIcon())
+        self._win = win
+        self._pages: dict[str, SettingsPage] = {}
+        self._frames: dict[str, QScrollArea] = {}   # key → 外面那层滚动区（QStackedWidget 的直接页面）
+        self._nav_keys = [key for key, _cls in _SETTINGS_PAGES]
+        self.setWindowTitle("设置")
+        self.setModal(True)
+        self.resize(1020, 780)
+        self.setMinimumSize(880, 560)
+        self.setStyleSheet("""
+            QWidget#settingsSidebar { background: rgba(127, 127, 127, 0.10); }
+            QListWidget#settingsNav { background: transparent; border: none; outline: none; }
+            QListWidget#settingsNav::item { padding: 9px 12px; border-radius: 6px; }
+            QListWidget#settingsNav::item:selected { background: rgba(127, 127, 127, 0.26); }
+            QListWidget#settingsNav::item:hover { background: rgba(127, 127, 127, 0.16); }
+            QLabel#settingsBrand { font-size: 20px; font-weight: 600; padding: 0 6px 8px 6px; }
+            QLabel#settingsTitle { font-size: 19px; font-weight: 600; }
+            QLabel#settingsHint { color: #8a8f98; font-size: 12px; }
+        """)
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        side = QWidget()
+        side.setObjectName("settingsSidebar")
+        side.setFixedWidth(232)
+        side_box = QVBoxLayout(side)
+        side_box.setContentsMargins(14, 18, 10, 12)
+        side_box.setSpacing(10)
+        brand = QLabel("设置")
+        brand.setObjectName("settingsBrand")
+        side_box.addWidget(brand)
+        self._nav = QListWidget()
+        self._nav.setObjectName("settingsNav")
+        self._nav.setFrameShape(QFrame.NoFrame)
+        self._nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        for key, cls in _SETTINGS_PAGES:
+            self._nav.addItem(cls.title)
+        for row in range(self._nav.count()):
+            self._nav.item(row).setSizeHint(QSize(0, 40))
+        self._nav.currentRowChanged.connect(self._on_nav_changed)
+        side_box.addWidget(self._nav, 1)
+        root.addWidget(side)
+
+        body = QWidget()
+        body_box = QVBoxLayout(body)
+        body_box.setContentsMargins(28, 20, 24, 16)
+        body_box.setSpacing(12)
+        self._title = QLabel("")
+        self._title.setObjectName("settingsTitle")
+        body_box.addWidget(self._title)
+        self._stack = QStackedWidget()
+        body_box.addWidget(self._stack, 1)
+
+        foot = QHBoxLayout()
+        foot.setSpacing(8)
+        self._btn_reset = QPushButton("恢复本页默认")
+        self._btn_reset.clicked.connect(self._on_reset_page)
+        self._hint = QLabel("")
+        self._hint.setObjectName("settingsHint")
+        self._btn_save = QPushButton("保存本页")
+        self._btn_save.setObjectName("settingsSave")
+        self._btn_save.clicked.connect(self._on_save_page)
+        self._btn_close = QPushButton("关闭")
+        self._btn_close.clicked.connect(self._on_close)
+        foot.addWidget(self._btn_reset)
+        foot.addWidget(self._hint)
+        foot.addStretch(1)
+        foot.addWidget(self._btn_save)
+        foot.addWidget(self._btn_close)
+        body_box.addLayout(foot)
+
+        root.addWidget(body, 1)
+        self._nav.setCurrentRow(0)
+
+    # ── 页面 ──
+    def _wrap_page(self, page: QWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(page)
+        return scroll
+
+    def _ensure_page(self, key: str) -> SettingsPage | None:
+        page = self._pages.get(key)
+        if page is not None:
+            return page
+        cls = dict(_SETTINGS_PAGES).get(key)
+        if cls is None:
+            return None
+        try:
+            page = cls(self._win)
+        except Exception as e:
+            logger.exception(f"创建设置页「{key}」失败")
+            QMessageBox.warning(self, "设置", f"打开这一页失败：{type(e).__name__}: {e}")
+            return None
+        self._pages[key] = page
+        frame = self._wrap_page(page)
+        self._frames[key] = frame
+        self._stack.addWidget(frame)
+        return page
+
+    def open_page(self, key: str) -> None:
+        """切到某一页（菜单/旧入口集中打开设置窗口时用）。"""
+        try:
+            row = self._nav_keys.index(key)
+        except ValueError:
+            row = 0
+        if row == self._nav.currentRow():
+            self._on_nav_changed(row)      # 同一行不会再发 currentRowChanged，手动刷一次
+        else:
+            self._nav.setCurrentRow(row)
+
+    def _current_page(self) -> SettingsPage | None:
+        widget = self._stack.currentWidget()
+        if widget is None:
+            return None
+        inner = widget.widget() if isinstance(widget, QScrollArea) else widget
+        return inner if isinstance(inner, SettingsPage) else None
+
+    def _on_nav_changed(self, row: int) -> None:
+        try:
+            if row < 0 or row >= len(self._nav_keys):
+                return
+            key = self._nav_keys[row]
+            page = self._ensure_page(key)
+            if page is None:
+                return
+            frame = self._frames.get(key)
+            if frame is not None:
+                self._stack.setCurrentWidget(frame)
+            self._title.setText(page.title)
+            self._refresh_footer()
+        except Exception:
+            logger.exception("切换设置页失败")
+
+    def _refresh_footer(self) -> None:
+        page = self._current_page()
+        if page is None:
+            self._btn_reset.setEnabled(False)
+            self._btn_save.setEnabled(False)
+            self._hint.setText("")
+            return
+        self._btn_reset.setEnabled(page.can_reset())
+        self._btn_save.setEnabled(page.can_save())
+        self._hint.setText("本页有未保存的改动" if page.is_dirty() else "")
+
+    def _refresh_nav_texts(self) -> None:
+        titles = {key: cls.title for key, cls in _SETTINGS_PAGES}
+        for row, key in enumerate(self._nav_keys):
+            page = self._pages.get(key)
+            dirty = bool(page is not None and page.is_dirty())
+            self._nav.item(row).setText(titles.get(key, key) + ("  ●" if dirty else ""))
+        self._refresh_footer()
+
+    # ── 按钮 ──
+    def _on_reset_page(self) -> None:
+        page = self._current_page()
+        if page is None or not page.can_reset():
+            return
+        try:
+            page.reset()
+        except Exception as e:
+            logger.exception("恢复设置默认值失败")
+            QMessageBox.warning(self, "设置", f"恢复默认失败：{type(e).__name__}: {e}")
+            return
+        self._refresh_nav_texts()
+
+    def _on_save_page(self) -> None:
+        page = self._current_page()
+        if page is None or not page.can_save():
+            return
+        try:
+            ok = page.save()
+        except Exception as e:
+            logger.exception("保存设置页失败")
+            QMessageBox.warning(self, "设置", f"保存失败：{type(e).__name__}: {e}")
+            return
+        if ok:
+            page.mark_saved()
+        self._refresh_nav_texts()
+
+    def _save_all(self) -> bool:
+        # 顺序即依赖顺序：**云端固定放最后** —— 它的开关一变就要断开重连、甚至弹重启确认，
+        # 排在中间会把后面的页晾在那儿（用户点了「保存并关闭」，结果只存了一半）。
+        keys = [k for k, _c in _SETTINGS_PAGES if k != "cloud"] + ["cloud"]
+        for key in keys:
+            page = self._pages.get(key)
+            if page is None or not page.is_dirty() or not page.can_save():
+                continue
+            try:
+                ok = page.save()
+            except Exception as e:
+                logger.exception(f"保存设置页「{key}」失败")
+                QMessageBox.warning(self, "设置", f"保存失败：{type(e).__name__}: {e}")
+                return False
+            if not ok:
+                return False
+            page.mark_saved()
+        self._refresh_nav_texts()
+        return True
+
+    def _confirm_close(self) -> bool:
+        dirty = [p for p in self._pages.values() if p.is_dirty() and p.can_save()]
+        if not dirty:
+            return True
+        names = "、".join(p.title for p in dirty)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("设置")
+        box.setText(f"还有 {len(dirty)} 页设置没保存：{names}")
+        box.setInformativeText("要保存这些改动再关闭吗？")
+        btn_save = box.addButton("保存并关闭", QMessageBox.AcceptRole)
+        box.addButton("不保存", QMessageBox.DestructiveRole)
+        btn_back = box.addButton("取消", QMessageBox.RejectRole)
+        box.setDefaultButton(btn_save)
+        box.exec()
+        hit = box.clickedButton()
+        if hit is btn_back or hit is None:
+            return False
+        if hit is btn_save:
+            return self._save_all()
+        return True
+
+    # ── 生命周期 ──
+    def _on_close(self) -> None:
+        if self._confirm_close():
+            super().accept()
+
+    def reject(self) -> None:            # Esc / 右上角关闭 都要走脏检查
+        if self._confirm_close():
+            super().reject()
+
+    def closeEvent(self, event) -> None:
+        # QDialog 的默认 closeEvent 会 reject()；这里自己接管，但**必须把 exec 循环收掉**：
+        # 只 accept 事件不结束模态循环，窗口虽然藏起来了，exec() 还在跑 —— 托盘菜单点不动、
+        # 主窗口也点不动，现场看起来就是"整个程序卡死"。
+        if self._confirm_close():
+            event.accept()
+            super().accept()
+        else:
+            event.ignore()
 
 
 class SpeedCalibrationWorker(QThread):
@@ -10043,219 +10906,52 @@ class MainWindow(QMainWindow):
         logger.info(f"打开{mode_txt}页面: {self._stats_server.url}")
         QDesktopServices.openUrl(QUrl(url))
 
+    def _open_settings(self):
+        """选项 → 设置…：所有设置统一进一个独立窗口（参考 Windows 设置布局）。"""
+        try:
+            win = SettingsWindow(self)
+            win.exec()
+        except Exception:
+            logger.exception("打开设置窗口失败")
+            QMessageBox.warning(self, "设置", "打开设置窗口失败，详见日志。")
+
     def _on_cloud_settings(self):
-        """打开云端连接设置对话框。
+        """打开「设置 → 云端连接」。
 
         父窗口的选择有讲究（4.6.0 后台常驻后才露出这个坑）：
-          主窗口正常显示  → 沿用 `QDialog(self)`：对话框是它的所属窗，模态把主窗口一起锁住，
-                            关掉对话框就回到主窗口，最符合预期。
-          主窗口在托盘里 / 最小化 → **做成独立窗口**（parent=None）。父=self 而 self 不可见时，
-                            对话框是"隐藏窗口的所属窗"：Windows 不给它任务栏按钮，主窗口又不出来，
+          主窗口正常显示  → 设置窗以主窗口为所属窗，模态把主窗口一起锁住，
+                            关掉设置就回到主窗口，最符合预期。
+          主窗口在托盘里 / 最小化 → 设置窗做成独立窗口（parent=None）。父=self 而 self 不可见时，
+                            模态框是"隐藏窗口的所属窗"：Windows 不给它任务栏按钮，主窗口又不出来，
                             万一抢不到前台，就成了一个看不见、却能拦住整个程序的模态框
                             （模态期间托盘菜单也点不动，用户只能杀进程）。独立窗口自带任务栏
                             按钮，一定找得回来；也不必为了改个 token 把整个主窗口弹起来。
+        选择逻辑收在 SettingsWindow.__init__（与「选项 → 设置…」共用同一套）。
         """
-        standalone = (not self.isVisible()) or self.isMinimized()
-        dlg = QDialog(None if standalone else self)
-        if standalone:
-            # 独立窗口不继承主窗口图标，手动补上（任务栏/Alt+Tab 里还是本程序）
-            dlg.setWindowIcon(self.windowIcon())
-        dlg.setWindowTitle("☁ 云端连接设置")
-        dlg.setMinimumWidth(460)
-        dlg.setModal(True)
+        try:
+            win = SettingsWindow(self)
+            win.open_page("cloud")
+            win.exec()
+        except Exception:
+            logger.exception("打开云端连接设置失败")
+            QMessageBox.warning(self, "云端连接", "打开设置窗口失败，详见日志。")
 
-        layout = QVBoxLayout(dlg)
-        layout.setSpacing(10)
-        layout.setContentsMargins(20, 16, 20, 16)
+    def _apply_cloud_settings(self, page) -> bool:
+        """把「云端连接」页的值写回配置并重连（原 _on_cloud_settings 的保存体）。
 
-        # 说明文字
-        title = QLabel("<b>☁ 云打印服务器连接设置</b>")
-        layout.addWidget(title)
-        layout.addWidget(QLabel("连接到你部署的后端服务器，接收小程序/APP 提交的打印任务。"))
-
-        layout.addSpacing(8)
-
-        # 云端总开关：关闭时禁用所有云端功能，程序以纯本地订单模式运行
-        cloud_switch = ThemedCheckBox("启用云端功能", theme_manager=self._theme_manager)
-        cloud_switch.setToolTip("关闭后将以纯本地模式运行（本地订单库记录打印，收支清算显示本地订单统计）。切换后需重启应用生效。")
-        cloud_switch.setChecked(bool(self._config.cloud_enabled))
-        layout.addWidget(cloud_switch)
-
-        layout.addSpacing(4)
-
-        # 接单开关（2026-12）：多设备可同时启用接单，勾选后本机进入「可接单设备」列表，
-        # 移动端提交订单时选择向哪台设备发送
-        take_orders_switch = ThemedCheckBox("启用接单（接收云端订单）", theme_manager=self._theme_manager)
-        take_orders_switch.setToolTip(
-            "勾选后本机进入「可接单设备」列表，移动端提交订单时可选择向本机发送打印任务。\n"
-            "多台设备可同时启用接单；未指定目标设备的订单由任一在线接单设备接收。")
-        take_orders_switch.setChecked(bool(self._config.cloud_take_orders))
-        layout.addWidget(take_orders_switch)
-        # 当前接单状态提示（来自后端 printer_state 推送缓存；后台刷新见下方线程）
-        claim_hint = QLabel("")
-        claim_hint.setWordWrap(True)
-        claim_hint.setStyleSheet("color: #8a8f98; font-size: 12px;")
-        layout.addWidget(claim_hint)
-
-        layout.addSpacing(4)
-
-        # API 地址
-        layout.addWidget(QLabel("API 地址："))
-        api_input = QLineEdit(self._config.cloud_api_url)
-        api_input.setPlaceholderText("https://your-server.com")
-        layout.addWidget(api_input)
-
-        # WebSocket 地址
-        layout.addWidget(QLabel("WebSocket 地址："))
-        ws_input = QLineEdit(self._config.cloud_ws_url)
-        ws_input.setPlaceholderText("wss://your-server.com")
-        layout.addWidget(ws_input)
-
-        # Token
-        layout.addWidget(QLabel("认证 Token："))
-        token_input = QLineEdit(self._config.cloud_token)
-        token_input.setPlaceholderText("打印机认证 token（全局 token，或用下面的按钮换本机专用 token）")
-        token_input.setEchoMode(QLineEdit.Password)
-        layout.addWidget(token_input)
-
-        # S1-01：本机专用 token 状态 + 手动重新签发
-        # 迁移口径：首次连上会自动用上面的全局 token 为本机签一个专用 token（只存本机配置），
-        # 之后请求都带它；全局 token 保留作紧急通道，本机 token 失效时自动回退并重签。
-        device_tok_label = QLabel("")
-        device_tok_label.setWordWrap(True)
-        device_tok_label.setStyleSheet("color: #8a8f98; font-size: 12px;")
-        layout.addWidget(device_tok_label)
-
-        def _fill_device_token_hint():
-            if self._config.cloud_device_token:
-                device_tok_label.setText(
-                    "🔑 本机专用 token：已启用（只存在本机配置文件，可在服务端单独吊销）")
-            else:
-                device_tok_label.setText(
-                    "🔑 本机专用 token：未启用（连接时会用全局 token 自动签发一次）")
-
-        _fill_device_token_hint()
-
-        issue_row = QHBoxLayout()
-        issue_btn = QPushButton("🔑 重新签发本机 token")
-        issue_btn.setToolTip(
-            "用上面的认证 Token（需 admin 权限）为本机签发专用 token。\n"
-            "签发后立即改用新 token 重连；服务端会作废旧 token（明文只显示这一次，工具自动保存）。")
-        issue_btn.setEnabled(bool(self._cloud_client))
-        issue_row.addWidget(issue_btn)
-        issue_row.addStretch()
-        layout.addLayout(issue_row)
-
-        def _issue_device_token():
-            client = self._cloud_client
-            if not client:
-                device_tok_label.setText(
-                    "⚠ 云端未启用：先勾选「启用云端功能」并保存，再签发本机 token")
-                return
-            issue_btn.setEnabled(False)
-            device_tok_label.setText("⏳ 正在签发本机 token…")
-
-            def _net():
-                err, tok, scopes = "", "", []
-                try:
-                    tok, scopes = client.request_device_token(scopes=("print", "admin"))
-                except Exception as e:  # noqa: BLE001
-                    err = str(e)
-
-                def _done():
-                    issue_btn.setEnabled(True)
-                    if err:
-                        device_tok_label.setText(f"❌ 签发失败：{err}")
-                        return
-                    self._config.cloud_device_token = tok
-                    client.device_token = tok
-                    try:
-                        self._save_config(sync_ui=False)
-                    except Exception as e:
-                        logger.warning(f"保存本机 token 失败: {e}")
-                    device_tok_label.setText(
-                        f"✅ 已签发并切换本机 token（scopes={','.join(scopes) or 'print'}），正在重连…")
-                    try:
-                        client.stop()
-                        client.start()
-                    except Exception as e:
-                        logger.warning(f"切换本机 token 后重连失败: {e}")
-                QTimer.singleShot(0, _done)
-
-            threading.Thread(target=_net, daemon=True).start()
-
-        issue_btn.clicked.connect(_issue_device_token)
-
-        # 连接状态
-        layout.addSpacing(4)
-        status_text = "🟢 已连接" if (self._cloud_client and self._cloud_client.is_connected()) else "🔴 未连接"
-        status_label = QLabel(status_text)
-        layout.addWidget(status_label)
-
-        # 按钮行
-        layout.addSpacing(8)
-        btn_row = QHBoxLayout()
-
-        if self._cloud_client and self._cloud_client.is_connected():
-            disconnect_btn = QPushButton("断开连接")
-            disconnect_btn.setObjectName("cloudDisconnected")
-            disconnect_btn.clicked.connect(lambda: self._cloud_client.stop())
-            disconnect_btn.clicked.connect(lambda: status_label.setText("🔴 未连接"))
-            btn_row.addWidget(disconnect_btn)
-
-        btn_row.addStretch()
-
-        save_btn = QPushButton("保存")
-        save_btn.clicked.connect(dlg.accept)
-        btn_row.addWidget(save_btn)
-
-        cancel_btn = QPushButton("取消")
-        cancel_btn.clicked.connect(dlg.reject)
-        btn_row.addWidget(cancel_btn)
-
-        layout.addLayout(btn_row)
-
-        # 打开时填充当前接单状态提示（缓存 + 后台刷新一次，不阻塞对话框）
-        def _fill_claim_hint():
-            st = getattr(self, "_cloud_printer_state_cache", {}) or {}
-            if st.get("is_active"):
-                claim_hint.setText("✅ 本机已启用接单（可接收云端订单）")
-            else:
-                cnt = st.get("claiming_count", 0)
-                if cnt > 0:
-                    claim_hint.setText(f"当前有 {cnt} 台设备启用接单；本机未启用")
-                else:
-                    claim_hint.setText("当前无设备启用接单")
-
-        _fill_claim_hint()
-
-        if self._cloud_client and self._cloud_client.is_connected():
-            def _refresh_claim_hint():
-                try:
-                    data = self._cloud_client.get_printer_devices()
-                    if not data:
-                        return
-                    claiming_count = sum(1 for d in data.get("devices", []) if d.get("is_active"))
-                    self._cloud_printer_state_cache = {
-                        "claiming_count": claiming_count,
-                        "is_active": bool(self._cloud_client.take_orders),
-                    }
-                    QTimer.singleShot(0, _fill_claim_hint)
-                except Exception:
-                    pass
-            threading.Thread(target=_refresh_claim_hint, daemon=True).start()
-
-        if dlg.exec() == QDialog.Accepted:
-            # 保存配置到内存（云端开关以对话中的勾选为准）
+        返回 True = 已保存（设置窗口据此清掉脏标记）；False = 没保存（例如用户取消了
+        「关闭云端」的确认，配置已回滚），窗口会保留改动。
+        """
+        try:
             old_enabled = bool(self._config.cloud_enabled)
             old_token = self._config.cloud_token
-            self._config.cloud_api_url = api_input.text().strip()
-            self._config.cloud_ws_url = ws_input.text().strip()
-            self._config.cloud_token = token_input.text().strip()
+            self._config.cloud_api_url = page.api_input.text().strip()
+            self._config.cloud_ws_url = page.ws_input.text().strip()
+            self._config.cloud_token = page.token_input.text().strip()
             # S1-01：换了全局 token ⇒ 旧的本机专用 token 不再可信，清掉并按新 token 重新自签
             if self._config.cloud_token != old_token:
                 self._config.cloud_device_token = ""
-            self._config.cloud_enabled = bool(cloud_switch.isChecked())
+            self._config.cloud_enabled = bool(page.cloud_switch.isChecked())
 
             # 立刻写入磁盘，防止程序崩溃丢失
             try:
@@ -10275,13 +10971,13 @@ class MainWindow(QMainWindow):
                         except Exception:
                             pass
                         self._log("❌ 已取消「关闭云端」：云端保持开启，配置已回滚，未做任何改动")
-                        return
-                self._cloud_client and self._cloud_client.stop()
+                        return False
+                if self._cloud_client:
+                    self._cloud_client.stop()
                 self._restart_for_cloud_switch(self._config.cloud_enabled)
-                return
+                return True
 
             # 开关未变化：仅更新连接（用户可能只是改了地址/token）
-            # 更新 CloudClient 并连接/停止
             if self._config.cloud_enabled:
                 if self._cloud_client:
                     self._cloud_client.stop()
@@ -10312,14 +11008,15 @@ class MainWindow(QMainWindow):
                     self._offline_sync.stop_background_sync()
 
             # 接单开关同步后端（多设备可同时启用，2026-12）：勾选 → 加入可接单设备列表
-            new_take = bool(take_orders_switch.isChecked()) and bool(cloud_switch.isChecked())
+            new_take = (bool(page.take_orders_switch.isChecked())
+                        and bool(page.cloud_switch.isChecked()))
             if self._config.cloud_enabled and self._config.cloud_token and self._cloud_client:
                 if new_take and not self._config.cloud_take_orders:
                     ok, msg, _extra = self._cloud_client.claim_printer()
                     if not ok:
-                        from PySide6.QtWidgets import QMessageBox
                         QMessageBox.warning(self, "无法启用接单", msg)
                         new_take = False
+                        page.take_orders_switch.setChecked(False)
                 elif not new_take and self._config.cloud_take_orders:
                     self._cloud_client.release_printer()
             if self._config.cloud_take_orders != new_take:
@@ -10334,7 +11031,13 @@ class MainWindow(QMainWindow):
                 self._stats_server.update_config(
                     self._config.cloud_api_url,
                     self._cloud_client.auth_token if self._cloud_client else self._config.cloud_token)
-            self._log("☁ 云端配置已保存并写入磁盘" + ("，正在连接..." if self._config.cloud_enabled else "，云端已关闭"))
+            self._log("☁ 云端配置已保存并写入磁盘"
+                      + ("，正在连接..." if self._config.cloud_enabled else "，云端已关闭"))
+            return True
+        except Exception as e:
+            logger.exception("保存云端配置失败")
+            QMessageBox.warning(self, "云端连接", f"保存失败：{type(e).__name__}: {e}")
+            return False
 
     def _restart_for_cloud_switch(self, enabled: bool):
         """云端总开关变化后：提示用户并重启应用，重新装配本地/云端 UI。"""
@@ -10787,39 +11490,20 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self._quit_app)
         file_menu.addAction(exit_action)
 
-        # 选项菜单（2026-11-03 用户要求）：把「打印速度…」「打印机双面能力…」（原在帮助菜单）
-        # 与「外部打印监视」「外部打印账本…」（原在文件菜单）**整块迁到**这里，和新增的
-        # 「默认任务参数…」放在一起 —— 这五项都是"改设置"，不再散落在文件/帮助两个语义无关的菜单里。
+        # 选项菜单（2026-11-03 用户要求）：「外部打印监视」「外部打印账本…」（原在文件菜单）
+        # 与「⚠ 半成品补救…」「🤖 智能助手接口」放在这里。
+        # 2026-11-27 用户要求：云端连接 / 默认任务参数 / 打印缩放 / 空白页率拆单 / 打印速度 /
+        # 打印机双面能力 / 开机自启 全部收进「设置…」一个独立窗口（参考 Windows 设置：
+        # 左侧分类、右侧表单），菜单里不再各占一条。
         # 迁移只搬入口位置：QAction 对象、信号连接、托盘镜像（tray_icon 读 self._ext_print_action）
         # 与快捷键注册一律原样保留，行为零变化。
         options_menu = mb.addMenu("选项(&O)")
 
-        # 默认任务参数：纸张大小 / 页边距 / 方向 / 缩放 / 打印范围等**跨文件类型**的全局默认。
-        # 没动过时各项默认值与 4.x 的行为完全一致（A4 / 1cm 页边距 / 水平居中 / 所有列一页 /
-        # 双面 / 纵向），旧 print_config.json 缺这些键也按这套默认值回落。
-        default_task_action = QAction("默认任务参数…(&D)", self)
-        default_task_action.setToolTip("纸张大小、页边距、页面方向、缩放与打印范围等默认值；"
-                                       "Word/PDF/图片/表格全部沿用（不改就是旧行为）")
-        default_task_action.triggered.connect(self._on_default_task_options)
-        options_menu.addAction(default_task_action)
-
-        # 打印缩放：PDF 页面按多大比例画到纸上（调整为可打印区域大小 / 实际大小 / 自定义 %）。
-        # 与上面那个「默认任务参数 → 缩放」不是一回事：那一项是 Excel 表格的版式缩放。
-        scale_action = QAction("打印缩放…(&S)", self)
-        scale_action.setToolTip("PDF/Word/图片按多大比例打到纸上：调整为可打印区域大小、"
-                                "实际大小（100%，超出裁掉）或自定义百分比；"
-                                "手动双面的两趟/攒批整叠/首页/补打都用同一套（表格不受影响）")
-        scale_action.triggered.connect(self._on_print_scale_options)
-        options_menu.addAction(scale_action)
-
-        # 空白页率拆单（2026-11-23 用户需求）：一单里混着「只需单面」和「需要双面」的文件时，
-        # 单面文件各占一张纸、背面全空；空白页率达到阈值就拆成「先单面 → 取走 → 再双面」。
-        blank_split_action = QAction("空白页率拆单…(&B)", self)
-        blank_split_action.setToolTip("空白页率多高时把一单拆成两次打印（先打只需单面的文件，"
-                                      "取走后再打双面文件）；阈值按机型分别设置，"
-                                      "也可设成达到阈值直接拆、不再询问")
-        blank_split_action.triggered.connect(self._on_blank_split_options)
-        options_menu.addAction(blank_split_action)
+        settings_action = QAction("设置…(&S)", self)
+        settings_action.setToolTip("云端连接、默认任务参数、打印缩放、空白页率拆单、打印速度、"
+                                   "打印机双面能力、开机自启 —— 所有设置都在这个窗口里")
+        settings_action.triggered.connect(self._open_settings)
+        options_menu.addAction(settings_action)
 
         options_menu.addSeparator()
 
@@ -10838,25 +11522,6 @@ class MainWindow(QMainWindow):
                                      "（HP LaserJet 1020 这类机型拿不到页数时靠它）、导出 CSV")
         ext_ledger_action.triggered.connect(self._open_external_prints_dialog)
         options_menu.addAction(ext_ledger_action)
-
-        options_menu.addSeparator()
-
-        # 2026-10-20 用户要求：把「启动/预热」「每张纸」「翻纸放行比例」「人工翻页准备时间」
-        # 和原来的两点测速**全部塞进同一个窗口**，入口改名「打印速度…」。
-        # 2026-11-03：入口从帮助菜单迁到选项菜单（设置类都归这里），action 与槽不变。
-        speed_action = QAction("打印速度…", self)
-        speed_action.setToolTip("第 1 趟耗时模型（启动/预热、每张纸）+ 翻纸放行策略"
-                                "（按预估百分比放行、人工翻页准备时间）+ 一键测速"
-                                "（只对「无自动双面器、需要人工翻纸」的机型生效；"
-                                "自动双面机型打开会看到说明）")
-        speed_action.triggered.connect(self._on_calibrate_speed)
-        options_menu.addAction(speed_action)
-        duplex_cap_action = QAction("打印机双面能力…", self)
-        duplex_cap_action.setToolTip("给当前打印队列盖「支持/不支持自动双面」的章："
-                                     "不支持则改用程序自己的两趟控制器（人工翻纸），"
-                                     "不再走驱动程序自带的「双面打印说明」向导")
-        duplex_cap_action.triggered.connect(self._on_printer_duplex_capability)
-        options_menu.addAction(duplex_cap_action)
 
         options_menu.addSeparator()
 
@@ -20272,7 +20937,17 @@ class MainWindow(QMainWindow):
             logger.debug(f"双面能力提示失败（忽略）: {e}")
 
     def _on_default_task_options(self):
-        """选项 → 默认任务参数…：改表格与图片的全局打印默认值（纸张/页边距/缩放/范围…）。
+        """旧入口（菜单已并入「设置」）：打开「设置 → 默认任务参数」。"""
+        try:
+            win = SettingsWindow(self)
+            win.open_page("default_task")
+            win.exec()
+        except Exception:
+            logger.exception("打开默认任务参数失败")
+            QMessageBox.warning(self, "默认任务参数", "打开设置窗口失败，详见日志。")
+
+    def _apply_default_task_options(self, vals: dict, layout_before: dict | None = None) -> bool:
+        """把「默认任务参数」页的值写进配置并落盘（原 _on_default_task_options 的保存体）。
 
         两件事分开存、各自独立生效（见 printer_config 的 DEFAULT_TASK_OPTIONS 注释）：
           · `paper_size`：标量，打印时经 `effective_paper()` 只套给**表格/图片**批次
@@ -20282,19 +20957,14 @@ class MainWindow(QMainWindow):
             （DPI / 图片方向 / 排除末尾空白页 / 封面单独打印）；**空 = 从未配置**，
             引擎走旧行为（不传 print_options、新任务字段仍按原逻辑推导），
             所以"没动过的人升级后看不出差别"。
-        保存后立刻落盘（下一批打印生效）；不打纸、不动任何已存在的任务。
+
+        `layout_before` 是**打开这一页之前**的版式快照（`task_options_to_print_options`）：
+        用它判断这次到底有没有改到"会进 PDF"的那几个键。不传就按当前配置算（＝判据相等，
+        不会触发重渲染）—— 单独调这个函数（例如验收脚本）时不会误伤队列。
         """
         try:
-            # 版式默认值的旧快照（判断这次到底有没有改到"会进 PDF"的那几个键）
-            _layout_before = task_options_to_print_options(self._config.task_options())
-            dlg = DefaultTaskOptionsDialog(
-                self,
-                options=(self._config.default_task_options or {}),
-                paper_size=self._config.paper_size,
-                theme_manager=self._theme_manager)
-            if dlg.exec() != QDialog.Accepted:
-                return
-            vals = dlg.values()
+            if layout_before is None:
+                layout_before = task_options_to_print_options(self._config.task_options())
             self._config.paper_size = normalize_paper_size(vals.get("paper"))
             # 只存**与出厂默认不同**的键（差量），不存整份：
             #   · 空 dict = 从未配置 = 引擎接到 None = 旧行为，这是"没动过的人升级后看不出差别"的依据；
@@ -20309,7 +20979,7 @@ class MainWindow(QMainWindow):
             # （2026-11-06 用户要求全面检查这类"改了配置但没重渲染"的问题）。
             _stale: dict[str, set] = {}
             try:
-                if task_options_to_print_options(self._config.task_options()) != _layout_before:
+                if task_options_to_print_options(self._config.task_options()) != layout_before:
                     for _tk, _tab in (self._config.tabs or {}).items():
                         if getattr(_tab, "frozen", False):
                             continue          # 冻结页是已上报订单的账目快照，一律不动
@@ -20330,14 +21000,26 @@ class MainWindow(QMainWindow):
                       f"／页边距 {vals.get('margin_left_cm')}cm（下一批打印生效）")
             for _tk, _rows in sorted(_stale.items()):
                 self._schedule_render_reconvert(_rows, tab_key=_tk)
+            return True
         except Exception as e:
             # 槽内异常在 PySide6 6.11 会直接崩进程，必须自己兜住
             logger.exception("保存默认任务参数失败")
             QMessageBox.warning(self, "默认任务参数",
                                 f"保存失败：{type(e).__name__}: {e}")
+            return False
 
     def _on_print_scale_options(self):
-        """选项 → 打印缩放…：PDF 按多大比例画到纸上（2026-11-18 用户需求）。
+        """旧入口（菜单已并入「设置」）：打开「设置 → 打印缩放」。"""
+        try:
+            win = SettingsWindow(self)
+            win.open_page("print_scale")
+            win.exec()
+        except Exception:
+            logger.exception("打开打印缩放设置失败")
+            QMessageBox.warning(self, "打印缩放", "打开设置窗口失败，详见日志。")
+
+    def _apply_print_scale(self, mode: str, percent: int) -> bool:
+        """把「打印缩放」页的值写回配置（原 _on_print_scale_options 的保存体）。
 
         只管渲染那一路（`pdf_printer.plan_page_raster` 的缩放因子）：Word/PDF/图片
         最终都转成 PDF 再光栅化，所以都吃这一项；表格由 Excel 版式自己缩放，不叠加。
@@ -20345,27 +21027,31 @@ class MainWindow(QMainWindow):
         **下一批打印生效**（已经在打的那一批不会中途换缩放）。
         """
         try:
-            dlg = PrintScaleDialog(
-                self,
-                scale_mode=self._config.scale_mode,
-                scale_percent=self._config.scale_percent,
-                theme_manager=self._theme_manager)
-            if dlg.exec() != QDialog.Accepted:
-                return
-            mode, percent = dlg.values()
             self._config.scale_mode = mode
             self._config.scale_percent = int(percent)
             self._save_config()
             self._sync_scale_edit()   # 右侧面板那一行跟着变（两个入口一份配置）
             self._log(f"🔍 打印缩放已设为：{describe_scale(mode, percent)}（下一批打印生效）")
+            return True
         except Exception as e:
             # 槽内异常在 PySide6 6.11 会直接崩进程，必须自己兜住
             logger.exception("保存打印缩放失败")
             QMessageBox.warning(self, "打印缩放",
                                 f"保存失败：{type(e).__name__}: {e}")
+            return False
 
     def _on_blank_split_options(self):
-        """选项 → 空白页率拆单…：阈值与「是否先询问」（2026-11-23 用户需求）。
+        """旧入口（菜单已并入「设置」）：打开「设置 → 空白页率拆单」。"""
+        try:
+            win = SettingsWindow(self)
+            win.open_page("blank_split")
+            win.exec()
+        except Exception:
+            logger.exception("打开空白页率拆单设置失败")
+            QMessageBox.warning(self, "空白页率拆单", "打开设置窗口失败，详见日志。")
+
+    def _apply_blank_split(self, ask: bool, th_manual: float, th_auto: float) -> bool:
+        """把「空白页率拆单」页的三个值写回配置（原 _on_blank_split_options 的保存体）。
 
         只管**判定与问法**：一单里「整份单面」和「双面」文件混排时，单面文件各占一张纸、
         背面全空；空白页率达到这里的阈值就拆成「先打单面组 → 操作员取走 → 再打双面组」。
@@ -20374,16 +21060,6 @@ class MainWindow(QMainWindow):
         """
         auto_pairs = bool(getattr(self._printer_profile(), "auto_duplex", False))
         try:
-            dlg = BlankSplitDialog(
-                self,
-                ask=self._config.blank_split_ask,
-                threshold_manual=self._config.blank_split_threshold(False),
-                threshold_auto=self._config.blank_split_threshold(True),
-                auto_duplex=auto_pairs,
-                theme_manager=self._theme_manager)
-            if dlg.exec() != QDialog.Accepted:
-                return
-            ask, th_manual, th_auto = dlg.values()
             self._config.blank_split_ask = bool(ask)
             self._config.blank_split_threshold_manual = float(th_manual)
             self._config.blank_split_threshold_auto = float(th_auto)
@@ -20395,38 +21071,32 @@ class MainWindow(QMainWindow):
                    self._config.blank_split_threshold_auto * 100,
                    "达到阈值先询问" if self._config.blank_split_ask else "达到阈值直接拆"))
             logger.debug("空白页率拆单：当前机型阈值 %.2f", now)
+            return True
         except Exception as e:
             # 槽内异常在 PySide6 6.11 会直接崩进程，必须自己兜住
             logger.exception("保存空白页率拆单设置失败")
             QMessageBox.warning(self, "空白页率拆单",
                                 f"保存失败：{type(e).__name__}: {e}")
+            return False
 
     def _on_printer_duplex_capability(self):
-        """选项 → 打印机双面能力…：给当前队列盖三态章 + 手动双面参数。
+        """旧入口（菜单已并入「设置」）：打开「设置 → 打印机双面能力」。
 
         人工结论（capability_source="manual"）**优先于自动探测且不被探测覆盖** ——
-        这正是老机型（驱动虚报支持）唯一可靠的判据来源。此前只能敲命令行建档案，
-        而档案又被旧版客户端的整体落盘清空过一次（根因见 printer_config.py 顶部），
-        所以补上这个图形入口。
+        这正是老机型（驱动虚报支持）唯一可靠的判据来源。
         """
         queue = (self._config.printer_name or "").strip()
         if not queue:
             QMessageBox.information(self, "打印机双面能力",
                                     "请先在顶栏选择一台打印机，再设置它的双面能力。")
             return
-        dlg = PrinterDuplexCapabilityDialog(
-            queue, self._printer_profile(),
-            verified_by=(self._config.cloud_owner_name or ""), parent=self)
-        if dlg.exec() != QDialog.Accepted:
-            return
-        if self._apply_duplex_capability(queue, dlg.values()):
-            summary = self._config.get_profile(queue).summary()
-            self._log(f"🖨 打印机双面能力已更新：{queue} → {summary}")
-            QMessageBox.information(
-                self, "打印机双面能力",
-                f"「{queue}」的能力档案已保存：\n\n{summary}\n\n"
-                f"人工结论不会被自动探测覆盖；双面作业按它决定走程序自己的两趟控制器"
-                f"（人工翻纸）还是交给驱动一次成型。")
+        try:
+            win = SettingsWindow(self)
+            win.open_page("duplex")
+            win.exec()
+        except Exception:
+            logger.exception("打开打印机双面能力设置失败")
+            QMessageBox.warning(self, "打印机双面能力", "打开设置窗口失败，详见日志。")
 
     def _apply_duplex_capability(self, queue: str, values: dict) -> bool:
         """把对话框结果写进该队列档案并落盘（读写都在 printer_config 层，GUI 不另开口子）。"""
@@ -20445,6 +21115,10 @@ class MainWindow(QMainWindow):
             self._update_duplex_label()
         except Exception as e:
             logger.debug(f"能力变更后的 UI 刷新失败（忽略）: {e}")
+        try:
+            self._log(f"🖨 打印机双面能力已更新：{queue} → {self._config.get_profile(queue).summary()}")
+        except Exception:
+            logger.debug("打印双面能力日志输出失败（忽略）", exc_info=True)
         return True
 
     def _manual_flip_required_for(self, jobs) -> bool:
@@ -20738,63 +21412,62 @@ class MainWindow(QMainWindow):
         return ""
 
     def _on_calibrate_speed(self):
-        """选项 → 打印速度…：一个窗口里装下所有"第 1 趟耗时 / 翻纸放行"设置。
+        """旧入口（菜单已并入「设置」）：打开「设置 → 打印速度」。
 
-        2026-10-20 用户要求（原入口是"点一下就打 11 张纸的测速"）：
-          ① 启动/预热时间、每张纸耗时 —— 机器量不准的分量允许人工填；
-          ② 翻纸放行改成「预估 × 比例（默认 50%）+ 人工翻页准备时间」；
-          ③ 原来那个两点测速收进同一个窗口，当它的一个按钮。
-        方法名保持不变：`tests/verify_stack_gate_exclusive.py` ④ 直接调它验"纸叠未完成必须被拒"。
+        方法名保持不变：`other/tests/verify_stack_gate_exclusive.py` ④ 直接调它验
+        「出纸槽里有未完成的手动双面纸叠时必须被拒」—— 那道闸门放在**打开窗口之前**
+        （与旧行为一致：旧版连窗口都不给开，因为整窗都是测速/放行的参数）。
+        自动双面机型不拦：那一页是只读说明，进得去也改不了东西。
         """
-        prof = self._printer_profile()
-        if prof.auto_duplex is True:
-            # 自动双面机型没有「第 1 趟 / 翻纸放行」：这套设置对它零影响（速度模型与放行比例
-            # 的唯一消费者是 ManualDuplexDialog 的闸门，只在人工翻纸路径上存在）。仍开窗，
-            # 只为把"为什么用不上"当面说清；窗口是只读的 ⇒ 不必拦「打印机正忙 / 攒批未完成」。
-            dlg = PrintSpeedDialog(self, prof,
-                                   self._config.printer_name or "(系统默认打印机)")
-            dlg.exec()
-            return
-        reason = self._speed_settings_block_reason()
-        if reason == "打印机正忙":
-            QMessageBox.information(self, "打印机正忙",
-                                    "当前有打印任务在进行，请等它结束后再调整速度设置。")
-            return
-        if reason == "攒批未完成":
-            # 🔴-3 旁路之三：测速会打出 11 张纸，插进未完成的攒批纸叠会让整叠乱序。
-            # 窗口里的「打印测速」按钮走同一道闸门（`_start_speed_calibration`）。
-            QMessageBox.information(
-                self, "攒批未完成",
-                "出纸槽里还有未完成的手动双面纸叠（第 2 趟还没打）。" + chr(10) + chr(10) +
-                "测速会打出 11 张纸，插进这一叠会让整叠的逆序配对报废。" + chr(10) +
-                "请先处理完纸叠（打完第 2 趟 / 放弃整叠）再测速。")
-            self._log("🕐 测速被拒：出纸槽里有未完成的手动双面纸叠")
-            return
-        prof = self._printer_profile()
-        dlg = PrintSpeedDialog(self, prof,
-                               self._config.printer_name or "(系统默认打印机)")
-        dlg.calibrate_requested.connect(self._start_speed_calibration)
-        if dlg.exec() != QDialog.Accepted:
-            return
-        vals = dlg.values()
+        try:
+            if self._printer_profile().auto_duplex is not True:
+                reason = self._speed_settings_block_reason()
+                if reason == "打印机正忙":
+                    QMessageBox.information(self, "打印机正忙",
+                                            "当前有打印任务在进行，请等它结束后再调整速度设置。")
+                    return
+                if reason == "攒批未完成":
+                    # 🔴-3 旁路之三：测速会打出 11 张纸，插进未完成的攒批纸叠会让整叠乱序。
+                    # 窗口里的「打印测速」按钮走同一道闸门（`_start_speed_calibration`）。
+                    QMessageBox.information(
+                        self, "攒批未完成",
+                        "出纸槽里还有未完成的手动双面纸叠（第 2 趟还没打）。" + chr(10) + chr(10) +
+                        "测速会打出 11 张纸，插进这一叠会让整叠的逆序配对报废。" + chr(10) +
+                        "请先处理完纸叠（打完第 2 趟 / 放弃整叠）再测速。")
+                    self._log("🕐 测速被拒：出纸槽里有未完成的手动双面纸叠")
+                    return
+            win = SettingsWindow(self)
+            win.open_page("print_speed")
+            win.exec()
+        except Exception:
+            logger.exception("打开打印速度设置失败")
+            QMessageBox.warning(self, "打印速度", "打开设置窗口失败，详见日志。")
+
+    def _apply_print_speed(self, vals: dict) -> bool:
+        """把「打印速度」页的值写进当前队列档案（原 _on_calibrate_speed 的保存体）。"""
         try:
             self._config.update_profile(self._config.printer_name, **vals)
             self._save_config()
         except Exception as e:
+            logger.exception("保存打印速度设置失败")
             QMessageBox.warning(self, "打印速度",
                                 f"保存失败：{type(e).__name__}: {e}")
-            return
-        a, b = self._printer_profile().speed_fit()
-        ratio = int(round(vals["gate_ratio"] * 100))
-        extra = vals["flip_ready_sec"]
-        self._log(f"🕐 打印速度设置已保存：启动 {vals['speed_manual_a']:.0f}s"
-                  f"（{'手动' if vals['speed_manual_a'] else '自动'}）+ 每张 "
-                  f"{vals['speed_manual_b']:.1f}s"
-                  f"（{'手动' if vals['speed_manual_b'] else '自动'}）"
-                  f" → 当前模型 启动 ≈{a:.0f}s + 每张 ≈{b:.1f}s；"
-                  f"翻纸放行 = 预估 {ratio}%"
-                  + (f" + {extra:.0f}s" if extra else "")
-                  + "（下一批打印生效）")
+            return False
+        try:
+            a, b = self._printer_profile().speed_fit()
+            ratio = int(round(vals["gate_ratio"] * 100))
+            extra = vals["flip_ready_sec"]
+            self._log(f"🕐 打印速度设置已保存：启动 {vals['speed_manual_a']:.0f}s"
+                      f"（{'手动' if vals['speed_manual_a'] else '自动'}）+ 每张 "
+                      f"{vals['speed_manual_b']:.1f}s"
+                      f"（{'手动' if vals['speed_manual_b'] else '自动'}）"
+                      f" → 当前模型 启动 ≈{a:.0f}s + 每张 ≈{b:.1f}s；"
+                      f"翻纸放行 = 预估 {ratio}%"
+                      + (f" + {extra:.0f}s" if extra else "")
+                      + "（下一批打印生效）")
+        except Exception:
+            logger.debug("打印速度日志输出失败（忽略）", exc_info=True)
+        return True
 
     def _start_speed_calibration(self):
         """「打印速度」窗里的「▶ 打印测速」：打 1 张 + 10 张空白页自动计时，写进本机档案。

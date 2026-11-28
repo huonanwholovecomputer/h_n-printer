@@ -100,13 +100,13 @@ _tray_cloud_body = (_tray_src.split("def _on_cloud_settings(self) -> None:", 1)[
 check("托盘「云端…」不再 show_window（改个 token 不必把整个主窗口弹起来）",
       bool(_tray_cloud_body.strip()) and "show_window()" not in _tray_cloud_body)
 check("主窗口不可见/最小化 ⇒ 对话框做成独立窗口（parent=None）",
-      "standalone = (not self.isVisible()) or self.isMinimized()" in _gui_src
-      and "dlg = QDialog(None if standalone else self)" in _gui_src,
+      "standalone = (not win.isVisible()) or win.isMinimized()" in _gui_src
+      and "super().__init__(None if standalone else win)" in _gui_src,
       "父=隐藏窗口的模态框没有任务栏按钮，抢不到前台就是看不见的死锁")
 check("独立对话框补回了窗口图标（任务栏/Alt+Tab 里还认得出是本程序）",
-      "dlg.setWindowIcon(self.windowIcon())" in _gui_src)
+      "self.setWindowIcon(win.windowIcon())" in _gui_src)
 check("主窗口正常显示时仍用 QDialog(self)（模态把主窗口一起锁住，关掉就回到主窗口）",
-      "dlg = QDialog(None if standalone else self)" in _gui_src)
+      "super().__init__(None if standalone else win)" in _gui_src)
 check("_on_cloud_settings 的签名没变（verify_offline_sync_target.py 按它切函数体）",
       "def _on_cloud_settings(self):" in _gui_src)
 

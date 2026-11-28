@@ -68,7 +68,8 @@ check("窗口里有一键测速按钮（原入口收进来了）",
       hasattr(dlg, "_btn_cal") and "测速" in dlg._btn_cal.text())
 check("测速按钮通过信号交给主窗口（窗口自己不打纸）",
       dlg.__class__.calibrate_requested is not None
-      and "dlg.calibrate_requested.connect(self._start_speed_calibration)" in SRC)
+      and "dialog.calibrate_requested.connect(self._on_calibrate_requested)" in SRC
+      and "self._win._start_speed_calibration()" in SRC)
 dlg.close()
 
 # ══════════════════════════════════════════════════════════════════════
@@ -105,9 +106,10 @@ dr.close()
 
 # ══════════════════════════════════════════════════════════════════════
 print("\n=== ② 菜单入口与保存链路 ===")
-check("帮助菜单改名「打印速度…」并仍走 _on_calibrate_speed",
-      'QAction("打印速度…"' in SRC and "speed_action.triggered.connect(self._on_calibrate_speed)" in SRC
-      and 'QAction("打印速度校准…"' not in SRC)
+check("「打印速度」已并入「选项 → 设置…」（旧入口仍保留）",
+      "settings_action.triggered.connect(self._open_settings)" in SRC
+      and 'QAction("打印速度校准…"' not in SRC
+      and "def _on_calibrate_speed(self):" in SRC)
 check("保存写进本机档案（update_profile + _save_config，下一批生效）",
       "self._config.update_profile(self._config.printer_name, **vals)" in SRC
       and "（下一批打印生效）" in SRC)
@@ -199,52 +201,26 @@ d4.close()
 
 # ══════════════════════════════════════════════════════════════════════
 print("\\n=== ⑥ 主窗口入口：自动双面机型走只读说明窗 + 拒绝打 11 张纸 ===")
-from PySide6.QtWidgets import QMessageBox  # noqa: E402
+from PySide6.QtWidgets import QLabel, QMessageBox  # noqa: E402
 QMessageBox.information = staticmethod(lambda *a, **kw: QMessageBox.Ok)
 QMessageBox.warning = staticmethod(lambda *a, **kw: QMessageBox.Ok)
 QMessageBox.question = staticmethod(lambda *a, **kw: QMessageBox.Yes)
 
 import paths  # noqa: E402
 
-_spy = {}
-
-
-class _SpyDlg:
-    def __init__(self, parent=None, profile=None, queue_name=""):
-        _spy["cap"] = getattr(profile, "auto_duplex", "missing")
-        _spy["queue"] = queue_name
-
-    def exec(self):
-        return 0
-
-
-_orig_dlg = gui.PrintSpeedDialog
-gui.PrintSpeedDialog = _SpyDlg
-try:
-    win = gui.MainWindow(config_path=paths.config_path())
-    win._cloud_client = None
-    win._printer_profile = lambda: pc.PrinterProfile(auto_duplex=True,
-                                                     capability_source="manual")
-    saved = []
-    win._config.update_profile = lambda *a, **kw: saved.append((a, kw))
-    win._on_calibrate_speed()
-    check("自动双面 ⇒ 仍开说明窗（不静默无反应），队列名带过去",
-          _spy.get("cap") is True and bool(_spy.get("queue")), str(_spy))
-    check("自动双面 ⇒ 打开窗口不写档案", not saved, str(saved))
-
-    started = []
-
-    class _NoWorker:
-        def __init__(self, *a, **kw):
-            started.append(a)
-
-    gui.SpeedCalibrationWorker = _NoWorker
-    win._speed_cal_worker = None
-    win._start_speed_calibration()
-    check("自动双面 ⇒ 直接拒绝测速（连 worker 都不建、一张纸都不打）",
-          not started and win._speed_cal_worker is None, str(started))
-finally:
-    gui.PrintSpeedDialog = _orig_dlg
+# 自动双面机型：设置窗里这一页照样按只读说明页构造（不能静默无反应），但不许回写档案
+win = gui.MainWindow(config_path=paths.config_path())
+win._cloud_client = None
+win._printer_profile = lambda: pc.PrinterProfile(auto_duplex=True,
+                                                capability_source="manual")
+saved = []
+win._config.update_profile = lambda *a, **kw: saved.append((a, kw))
+page = gui.PrintSpeedPage(win)
+_heads = [lbl.text() for lbl in page.findChildren(QLabel) if "打印队列：" in lbl.text()]
+check("自动双面 ⇒ 仍建出说明页（不静默无反应），队列名带过去",
+      isinstance(page._dlg, gui.PrintSpeedDialog) and bool(_heads), str(_heads[:1]))
+check("自动双面 ⇒ 这一页不给保存（灰掉的不回写配置）", page.can_save() is False)
+check("自动双面 ⇒ 就算硬调 save 也不写档案", page.save() is False and not saved, str(saved))
 
 print("\n" + "=" * 56)
 print("打印速度窗口验收:", "全部通过 ✅" if ok_all else "存在失败 ❌")

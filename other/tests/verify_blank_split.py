@@ -748,8 +748,10 @@ for _name, _needle in [
     ("主线程 _on_blank_split_ask", "def _on_blank_split_ask("),
     ("主线程 _on_split_pickup", "def _on_split_pickup("),
     ("设置项 _on_blank_split_options", "def _on_blank_split_options("),
+    ("保存助手 _apply_blank_split", "def _apply_blank_split("),
     ("对话框 BlankSplitDialog", "class BlankSplitDialog(QDialog)"),
-    ("菜单项已挂到选项菜单", "blank_split_action = QAction("),
+    ("设置页 BlankSplitPage", "class BlankSplitPage("),
+    ("设置窗口 SettingsWindow", "class SettingsWindow(QDialog)"),
     ("启动时传 interactive=True", "blank_split_interactive=True"),
     ("信号已接线", "worker.blank_split_ask.connect("),
     ("取纸信号已接线", "worker.split_pickup.connect("),
@@ -811,7 +813,8 @@ def _user_facing_literals(source: str, names) -> list:
 
 
 _SPLIT_LITS = _user_facing_literals(
-    gui_src, ("_on_blank_split_ask", "_on_split_pickup", "BlankSplitDialog"))
+    gui_src, ("_on_blank_split_ask", "_on_split_pickup", "BlankSplitDialog",
+              "BlankSplitPage"))
 check("★ 拆单三处界面文案里没有「省纸 / 省一趟」的错口径",
       len(_SPLIT_LITS) >= 8 and not any(_claims_saving(t) for t in _SPLIT_LITS),
       [t[:40] for t in _SPLIT_LITS if _claims_saving(t)])

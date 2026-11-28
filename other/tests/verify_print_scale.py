@@ -363,13 +363,13 @@ check("三档文案常量存在且顺序与取值一致",
       "SCALE_MODE_LABELS" in src_gui and "SCALE_MODE_VALUES = (SCALE_FIT, SCALE_ACTUAL,"
       in src_gui.replace("\n", " ").replace("  ", " ")
       or "SCALE_MODE_VALUES = (SCALE_FIT, SCALE_ACTUAL," in src_gui)
-check("选项菜单有「打印缩放…」且连到槽",
-      "scale_action = QAction(" in src_gui
-      and "options_menu.addAction(scale_action)" in src_gui
-      and "scale_action.triggered.connect(self._on_print_scale_options)" in src_gui)
-check("槽 _on_print_scale_options 存在并落盘", "def _on_print_scale_options" in src_gui
+check("「打印缩放」已并入「选项 → 设置…」（不再单独一条菜单）",
+      "settings_action = QAction(" in src_gui
+      and "settings_action.triggered.connect(self._open_settings)" in src_gui
+      and "scale_action = QAction(" not in src_gui)
+check("保存槽 _apply_print_scale 存在并落盘", "def _apply_print_scale" in src_gui
       and "self._config.scale_mode = mode" in src_gui)
-_slot_pos = src_gui.find("def _on_print_scale_options")
+_slot_pos = src_gui.find("def _apply_print_scale")
 _slot_body = src_gui[_slot_pos:_slot_pos + 1400] if _slot_pos >= 0 else ""
 check("槽内异常自己兜住（PySide6 槽异常会崩进程）",
       _slot_pos >= 0 and "except Exception as e:" in _slot_body

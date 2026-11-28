@@ -494,7 +494,17 @@ def main():
     # 启动主窗口（UI 优先显示，其他检查放入后台）
     from gui import MainWindow
     window = MainWindow(config_path=config_path, theme_manager=theme_manager)
-    window.show()
+    # 开机自启（注册表 Run 键）的命令行带 --start-minimized：只留托盘图标，不弹主窗口。
+    # 托盘没建起来（TrayController 失败）时照旧显示窗口 —— 否则启动后"哪都找不到"，
+    # 进程还在跑、用户只能去任务管理器杀。
+    _start_minimized = "--start-minimized" in sys.argv[1:]
+    if _start_minimized and getattr(window, "_tray", None) is not None:
+        window._minimize_to_tray()
+        logger.info("以 --start-minimized 启动：已最小化到系统托盘")
+    else:
+        window.show()
+        if _start_minimized:
+            logger.warning("--start-minimized 无效（系统托盘不可用）：仍然显示主窗口")
 
     # 后台：外部工具检测（日志记录，不阻塞 UI）
     _check_external_tools(logger)

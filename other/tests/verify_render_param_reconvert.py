@@ -129,7 +129,7 @@ _FLUSH = _method_body(_src, "def _flush_render_reconvert(")
 _RENDER = _method_body(_src, "def _restart_convert_for_render_change(")
 _FILL = _method_body(_src, "def _fill_table_row(")
 _XLSX_DEFAULT = _method_body(_src, "def _on_xlsx_follow_default(")
-_DEF_TASK = _method_body(_src, "def _on_default_task_options(")
+_DEF_TASK = _method_body(_src, "def _apply_default_task_options(")
 
 
 def _render_ok(src: str) -> bool:
@@ -161,8 +161,13 @@ check("★ ② 方向列优先用 job.image_orientation（列头文字与打印�
       'getattr(job, "image_orientation", "auto")' in _FILL
       and 'ori_map = {"portrait": "竖", "landscape": "横", "mixed": "混"}' in _FILL)
 check("★ ⑤ 表格「跟随默认」也排队重转", "self._schedule_render_reconvert(" in _XLSX_DEFAULT)
-check("★ ⑥ 默认任务参数改了版面才排队重转（并有 _layout_before 快照）",
-      "_layout_before" in _DEF_TASK and "self._schedule_render_reconvert(" in _DEF_TASK)
+_DEF_PAGE = _method_body(_src, "class DefaultTaskOptionsPage(")
+check("★ ⑥ 默认任务参数改了版面才排队重转（并有 layout_before 快照）",
+      "layout_before" in _DEF_TASK and "self._schedule_render_reconvert(" in _DEF_TASK)
+check("⑥ 版式快照在打开对话框之前取（放到之后取，判据永远相等，重渲染再也不触发）",
+      "_layout_before" in _DEF_PAGE
+      and 0 <= _DEF_PAGE.find("_layout_before") < _DEF_PAGE.find("DefaultTaskOptionsDialog("))
+check("⑥ 设置页保存时把快照原样传下去", "self._layout_before)" in _DEF_PAGE)
 check("⑥ 只作废「跟着全局默认走」的表格任务（自己设过版式的不动）",
       'dict(getattr(_job, "xlsx_options", {}) or {})' in _DEF_TASK)
 check("⑥ 冻结标签页不动", 'getattr(_tab, "frozen", False)' in _DEF_TASK)

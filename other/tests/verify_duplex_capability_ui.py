@@ -99,10 +99,13 @@ for menu_action in win.menuBar().actions():
     m = menu_action.menu()
     if m is not None:
         texts.extend(a.text() for a in m.actions())
-check("帮助菜单里有「打印机双面能力…」", any("打印机双面能力" in t for t in texts),
-      f"菜单动作: {texts}")
-check("动作已接线到 _on_printer_duplex_capability（方法存在且可调用）",
-      callable(getattr(win, "_on_printer_duplex_capability", None)))
+check("「打印机双面能力」已并入「选项 → 设置…」（不再单独一条菜单）",
+      not any("打印机双面能力" in t for t in texts), f"菜单动作: {texts}")
+_gui_src = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
+check("设置窗里有这一页、且旧入口仍能直达",
+      "class DuplexCapabilityPage(" in _gui_src
+      and 'win.open_page("duplex")' in _gui_src
+      and callable(getattr(win, "_on_printer_duplex_capability", None)))
 
 print("\n② 未确认队列 ⇒ 日志明说（含「驱动自带向导 / 空白页」后果）")
 select_printer("HP LaserJet 1020")
@@ -214,25 +217,13 @@ print("\n⑦ 端到端：_on_printer_duplex_capability 真的把对话框结果�
 _saved = {}
 
 
-class _StubDialog:
-    def __init__(self, *a, **k):
-        pass
-
-    def exec(self):
-        return QDialog.Accepted
-
-    def values(self):
-        return {"auto_duplex": False, "capability_source": "manual", "manual_duplex": True,
-                "first": "odd", "reverse_second": True, "second_rotate_180": True,
-                "verified_at": "2026-10-17 18:00:00", "verified_by": "霍楠", "note": "端到端桩"}
-
-
-_orig_dlg = gui.PrinterDuplexCapabilityDialog
-gui.PrinterDuplexCapabilityDialog = _StubDialog
-try:
-    win._on_printer_duplex_capability()
-finally:
-    gui.PrinterDuplexCapabilityDialog = _orig_dlg
+# 设置窗「打印机双面能力」页保存时调的就是 _apply_duplex_capability。
+# 这里直接喂「页面上会得到的 values()」，验端到端写档案 + 落盘 + 立刻联动。
+_e2e_vals = {"auto_duplex": False, "capability_source": "manual", "manual_duplex": True,
+             "first": "odd", "reverse_second": True, "second_rotate_180": True,
+             "verified_at": "2026-10-17 18:00:00", "verified_by": "霍楠", "note": "端到端桩"}
+check("端到端：_apply_duplex_capability 返回 True",
+      win._apply_duplex_capability("HP LaserJet 1020", _e2e_vals) is True)
 _saved = win._printer_profile()
 check("端到端后档案=不支持自动双面 + manual（内含 _save_config 落盘）",
       _saved.auto_duplex is False and _saved.manual_duplex is True

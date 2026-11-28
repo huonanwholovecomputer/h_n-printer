@@ -77,11 +77,12 @@ titles = list(menus.keys())
 check("菜单栏有「选项(O)」", any("选项" in t for t in titles), str(titles))
 opt_title = next((t for t in titles if "选项" in t), "")
 opts = menus.get(opt_title, [])
-check("选项菜单含四项（打印速度/双面能力/外部打印监视/外部打印账本）",
-      all(any(k in item for item in opts) for k in
-          ("打印速度", "打印机双面能力", "外部打印监视", "外部打印账本")), str(opts))
-check("选项菜单第一项是「默认任务参数…」",
-      bool(opts) and "默认任务参数" in opts[0], str(opts[:2]))
+check("选项菜单第一项是「设置…」（七项设置收进一个独立窗口）",
+      bool(opts) and "设置" in opts[0], str(opts[:2]))
+check("外部打印监视/外部打印账本仍在菜单里（它们不是设置项）",
+      all(any(k in item for item in opts) for k in ("外部打印监视", "外部打印账本")), str(opts))
+check("打印速度/打印机双面能力已从菜单移出（进「设置」，不是复制一份）",
+      not any(("打印速度" in t) or ("打印机双面能力" in t) for t in opts), str(opts))
 file_title = next((t for t in titles if "文件" in t), "")
 help_title = next((t for t in titles if "帮助" in t), "")
 check("文件菜单里不再有外部打印监视/账本",
@@ -109,9 +110,13 @@ check("外部打印监视仍是 checkable 且接线到 _on_external_watch_toggle
 check("setChecked 在 connect 之前（启动恢复不会重复起线程）",
       SRC.index("self._ext_print_action.setChecked(bool(")
       < SRC.index("self._ext_print_action.toggled.connect("))
-check("打印速度/双面能力仍走原槽函数",
-      "speed_action.triggered.connect(self._on_calibrate_speed)" in SRC
-      and "duplex_cap_action.triggered.connect(self._on_printer_duplex_capability)" in SRC)
+check("「设置…」连到 _open_settings（统一窗口入口）",
+      "settings_action = QAction(" in SRC
+      and "settings_action.triggered.connect(self._open_settings)" in SRC)
+check("五个旧槽函数仍在（托盘/验收脚本仍可能直接调）",
+      all(("def " + _n + "(self):") in SRC for _n in
+          ("_on_default_task_options", "_on_print_scale_options", "_on_blank_split_options",
+           "_on_printer_duplex_capability", "_on_calibrate_speed")))
 check("外部打印监视线程仍按配置延迟恢复（不被搬走而丢）",
       "QTimer.singleShot(1200, self._restore_external_watch)" in SRC)
 
@@ -192,28 +197,12 @@ check("变异自证：切回 NoButtons 时编辑区塌成 1px（主题 QSS 下�
 dlg.close()
 
 print("\n=== ④ 保存链路：写进 print_config.json 并能读回 ===")
-_orig_dlg = _gui.DefaultTaskOptionsDialog
-
-
-class _FakeDlg:
-    """模态对话框不能真弹（offscreen 下 exec 会挂住）→ 用桩直接给返回值。"""
-
-    def __init__(self, *a, **k):
-        self.values_d = dict(pc.DEFAULT_TASK_OPTIONS, paper="A3", orientation="landscape",
-                             margin_left_cm=2.0, fit="sheet")
-
-    def exec(self):
-        return QDialog.Accepted
-
-    def values(self):
-        return self.values_d
-
-
-_gui.DefaultTaskOptionsDialog = _FakeDlg
-try:
-    win._on_default_task_options()
-finally:
-    _gui.DefaultTaskOptionsDialog = _orig_dlg
+# 设置窗里「默认任务参数」页保存时调的就是这个助手（对话框本体已在 ③ 单独验过；
+# 真弹模态窗在 offscreen 下会挂住，所以这里只验「控件值 → 配置 → 落盘」）。
+_vals_saved = dict(pc.DEFAULT_TASK_OPTIONS, paper="A3", orientation="landscape",
+                   margin_left_cm=2.0, fit="sheet")
+check("保存链路：_apply_default_task_options 返回 True",
+      win._apply_default_task_options(_vals_saved) is True)
 
 cfg = win._config
 check("配置里 paper_size 跟着对话框选了 A3", cfg.paper_size == "A3", cfg.paper_size)
@@ -387,12 +376,9 @@ class _FakeDlg2:
         return pc.normalize_task_options(_v)
 
 
-_orig_dlg2 = _gui.DefaultTaskOptionsDialog
-_gui.DefaultTaskOptionsDialog = _FakeDlg2
-try:
-    _win3._on_default_task_options()
-finally:
-    _gui.DefaultTaskOptionsDialog = _orig_dlg2
+_v_one = dict(pc.DEFAULT_TASK_OPTIONS)
+_v_one["dpi"] = 400                      # 只改了一项
+_win3._apply_default_task_options(pc.normalize_task_options(_v_one))
 _stored = dict(_win3._config.default_task_options)
 check("只改一项 ⇒ 落盘只存这一项（差量存储）", _stored == {"dpi": 400}, str(_stored))
 check("差量存储后 resolve 仍得到完整默认值",

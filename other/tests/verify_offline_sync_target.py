@@ -128,16 +128,18 @@ print("=== D. 静态接线：配置保存路径同步后台同步目标 ===")
 gui_src = open(os.path.join(LOCAL_TOOL, "gui.py"), encoding="utf-8").read()
 _osync_src = open(os.path.join(LOCAL_TOOL, "offline_sync.py"), encoding="utf-8").read()
 
-if "def _on_cloud_settings(self):" in gui_src and "def _restart_for_cloud_switch" in gui_src:
-    _body_raw = gui_src.split("def _on_cloud_settings(self):", 1)[1] \
+# 4.7：云端设置搬进「设置 → 云端连接」页，保存体在 _apply_cloud_settings（页面调它）
+if "def _apply_cloud_settings(self, page) -> bool:" in gui_src \
+        and "def _restart_for_cloud_switch" in gui_src:
+    _body_raw = gui_src.split("def _apply_cloud_settings(self, page) -> bool:", 1)[1] \
         .split("def _restart_for_cloud_switch", 1)[0]
     _body = _blank_comment_lines(_body_raw)
 else:
     _body = ""
-check("取到 _on_cloud_settings 函数体（判据前提）", bool(_body))
-check("★ _on_cloud_settings 内调用了 start_background_sync（改完配置就换目标）",
+check("取到 _apply_cloud_settings 函数体（判据前提）", bool(_body))
+check("★ _apply_cloud_settings 内调用了 start_background_sync（改完配置就换目标）",
       "start_background_sync(" in _body)
-check("★ _on_cloud_settings 内调用了 stop_background_sync（云端关闭时停线程）",
+check("★ _apply_cloud_settings 内调用了 stop_background_sync（云端关闭时停线程）",
       "stop_background_sync()" in _body)
 check("传给 start 的是**当前**配置（cloud_api_url / cloud_token）",
       "self._config.cloud_api_url" in _body and "self._config.cloud_token" in _body)
