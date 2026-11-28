@@ -1,9 +1,9 @@
 {
-  "version": "4.7.8",
-  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.8.exe",
-  "md5": "85f78e3530bda2eab22f9d6a929c10fb",
-  "sha256": "6ce0a2c2a504a2d2fef7dc0eaf3c64460163ffb70a87655f0a89a6ae80228cef",
-  "notes": "v4.7.8：七项设置收进一个「设置」窗口（选项 → 设置…），左边列表切换、右边表单，保存按页进行；新增开机自启，并可选择静默启动（开机只留托盘、不挡桌面）。收支清算新增「🧮 计算过程和结果」，把每笔转账一个人一个人加给你看，并回放净额怎么抵消成那几笔转账。Windows 覆盖安装不丢配置。",
+  "version": "4.7.9",
+  "url": "https://hn-printer-updates-1324480550.cos.ap-guangzhou.myqcloud.com/h_n-printer_setup_4.7.9.exe",
+  "md5": "2dbf9f93d98cfdc05362cb08751ef0d1",
+  "sha256": "87738b3d5df179ed14256e45986dee00f2bb495603626f4d4af4bc0e489144b1",
+  "notes": "v4.7.9：窗口底部「合计」左边多了一行「耗纸：N张；预估时间：X分」，点开始打印之前就知道这单要出多少纸、大概打多久。张数按双面 2 页一张、单面每页一张、份数照乘，「封面单独打印」的页按段重算；时间用本机实测速度（启动 + 每张 × 张数）算，没自动双面的机型按两趟加翻页准备时间，悬停可看算式。这行只是提前告知，不含封面与 Word/Excel 转 PDF 时间。另修一处空白页率少算：勾「封面单独打印」时单面页的背面空白以前没计入，现在与耗纸统计同一口径。Windows 覆盖安装不丢配置。",
   "sig_algo": "ed25519",
-  "sig": "jflMapMVmfZznG9oAuzChen1Z9KMUqXu2WrPkOStiPamWPAkhpow2HRmkt5a64s1PAIMJiEEIAaAG+smr03iAw=="
+  "sig": "dVHjoBG8f3XAwe7krSlN5bCjU2YaaT8+emDujXnsTDRcSzr9enTyfQk9lr9mKH5VIv10coFrr2iMZ6IaFu7KCQ=="
 }
