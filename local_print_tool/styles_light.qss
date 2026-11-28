@@ -435,6 +435,12 @@ QLabel#totalCostLabel {
     font-weight: bold;
 }
 
+/* 底部「耗纸：N张；预估时间：X分Y秒」（合计左侧的次要信息，2026-11-28） */
+QLabel#printEstimateLabel {
+    color: #6c6f85;
+    font-size: 12px;
+}
+
 /* ---------- 云端面板 ---------- */
 QPushButton#cloudConnected {
     background-color: #40a02b;

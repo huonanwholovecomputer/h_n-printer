@@ -135,7 +135,7 @@ import agent_ops  # 控制接口的 op 实现（建页/加文件/改参数/打�
 logger = logging.getLogger(__name__)
 
 # 应用版本号（与 HN打印工具.spec 引用的 version_info.txt 保持一致，升级时两处同步递增）
-APP_VERSION = "4.7.8"
+APP_VERSION = "4.7.9"
 
 # 冻结预约单的本地自恢复等待秒数（🔴-B3）：后端只在 file_ready 那一瞬清 schedule_frozen，
 # 最后一次 file_ready 早于冻结置位时两侧会**永久冻结** ⇒ 到点后仍冻结就由本机自行解冻打印。
@@ -487,6 +487,31 @@ def _format_engine_label(ext: str) -> str:
     if ext == ".pdf":
         return "直接打印"
     return "—"
+
+
+def _format_cn_duration(seconds: float) -> str:
+    """把秒数写成口语时长：「1分3秒」/「2分」/「1小时5分」。
+
+    与 `printer_config.format_duration`（mm:ss 计时器口径）分开：那个是给翻纸窗正计时用的
+    机器读数，这里是底部「耗纸 / 预估打印时间」给人做预算的写法 —— 2026-11-28 用户现场
+    指定的格式就是「1分3秒」。0 秒写「0秒」（没有文件时整块隐藏，正常看不到它）。
+    """
+    try:
+        sec = int(round(float(seconds or 0)))
+    except (TypeError, ValueError):
+        sec = 0
+    sec = max(0, sec)
+    hh, rem = divmod(sec, 3600)
+    mm, ss = divmod(rem, 60)
+    # 整点/整分不写零分量（3600 秒 ⇒「1小时」，不是「1小时0分0秒」）
+    parts = []
+    if hh:
+        parts.append(f"{hh}小时")
+    if mm:
+        parts.append(f"{mm}分")
+    if ss:
+        parts.append(f"{ss}秒")
+    return "".join(parts) if parts else "0秒"
 
 
 def _truncate_filename(filename: str, max_width: int = 52) -> str:
@@ -12710,6 +12735,13 @@ class MainWindow(QMainWindow):
         self._admin_print_check.toggled.connect(self._on_admin_print_toggled)
         total_row.addWidget(self._admin_print_check)
         total_row.addStretch()
+        # 耗纸 / 预估打印时间（2026-11-28 用户要求）：贴在「合计」左侧 —— 下单前一眼看到
+        # 这一单要出多少张纸、本机大概打多久。没有文件时整块隐藏（不占位）。
+        self._print_estimate_label = QLabel("")
+        self._print_estimate_label.setObjectName("printEstimateLabel")
+        self._print_estimate_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        total_row.addWidget(self._print_estimate_label)
+        total_row.addSpacing(10)
         self._total_label = QLabel("合计：¥0.00")
         self._total_label.setObjectName("totalCostLabel")
         self._total_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -15184,7 +15216,13 @@ class MainWindow(QMainWindow):
             sx = []
             if dup:
                 try:
-                    sx = sorted(set(job_simplex_pages(job)) & set(sel))
+                    # 「封面单独打印」的页各占一张纸、背面必然空白 ⇒ 必须从双面配对里摘出来，
+                    # 否则摊纸按整份双面算（31 页里 2 页单面会少算一张纸，空白面也跟着少记）。
+                    # 解析复用 printer_config.simplex_page_set（与 _job_simplex_pages / 页序同一口径）。
+                    if getattr(job, "simplex_enabled", False):
+                        sx = sorted(simplex_page_set(str(job.page_range or ""), n_pages,
+                                                     getattr(job, "simplex_pages", "") or "")
+                                    & set(sel))
                 except Exception:
                     sx = []
                 if sx and set(sel) <= set(sx):
@@ -15239,6 +15277,97 @@ class MainWindow(QMainWindow):
                if suggest else "没到阈值：默认一次打完；不想拆可以在那个选项里把阈值调高。"))
         label.setVisible(True)
 
+    def _print_estimate_stat(self, jobs):
+        """按当前列表估「这一单要出几张纸 + 大概打多久」→ (张数, 秒数, 有无未知页, 趟数)。
+
+        口径全部复用打印侧，不在 GUI 里另算一套：
+          · 张数：`duplex_stack.estimate_jobs_sheets` —— 双面 n 页 ⌈n/2⌉ 张、单面 n 页 n 张、
+            份数照乘；勾了「封面单独打印」的页按段重算（与攒批入叠/页序同一条算式）。
+          · 趟数：本机要人工翻纸（`_uses_manual_duplex_job`）⇒ 整单两趟（第 1 趟正面、
+            第 2 趟背面，两趟各走一遍纸）；否则一趟。
+          · 秒数：`PrinterProfile.estimate_first_pass`（本机实测样本拟合的「启动 + 每张×张数」），
+            两趟时 ×2 再加档案里的「人工翻页准备时间」（flip_ready_sec）。
+        不读盘、不含首页封面与 Word→PDF 转换；页数未知的文件按 1 页兜底（与入叠口径一致，
+        宁可低估），返回的第三项置 True 让 UI 标「≈」。
+        """
+        jobs = [j for j in (jobs or []) if j is not None]
+        if not jobs:
+            return None
+        try:
+            sheets, unknown = duplex_stack.estimate_jobs_sheets(
+                jobs,
+                count_selected=_count_pages_in_range,
+                simplex_of=self._job_simplex_pages,
+                # pages_of 收的是「单个 job → 实际要打的页列表」，不是 selected_pages
+                # 的 (range, total) 两参签名 —— 与攒批入叠 / 攒批列表那两处同一个 lambda，
+                # 传错会让「封面单独打印」静默退回整份双面的粗算（31 页混排少算一张纸）。
+                pages_of=lambda j: selected_pages(getattr(j, "page_range", "") or "",
+                                                  int(getattr(j, "page_count", 0) or 0)),
+            )
+        except Exception:
+            logger.debug("耗纸张数估算失败", exc_info=True)
+            return None
+        sheets = int(sheets or 0)
+        if sheets <= 0:
+            return None
+        p = self._printer_profile()
+        passes = 2 if any(self._uses_manual_duplex_job(j) for j in jobs) else 1
+        try:
+            seconds = float(p.estimate_first_pass(sheets)) * passes
+            if passes == 2:
+                seconds += max(0.0, float(getattr(p, "flip_ready_sec", 0.0) or 0.0))
+        except Exception:
+            logger.debug("打印耗时估算失败", exc_info=True)
+            return None
+        return sheets, float(seconds), bool(unknown), int(passes)
+
+    def _update_print_estimate(self, jobs=None):
+        """刷新底部「耗纸：N张；预估时间：X分Y秒」常显（没有文件就整块隐藏）。"""
+        label = getattr(self, "_print_estimate_label", None)
+        if label is None:
+            return
+        try:
+            if jobs is None:
+                jobs = self._get_current_jobs()
+            stat = self._print_estimate_stat(jobs)
+        except Exception:
+            stat = None
+        if not stat:
+            label.setText("")
+            label.setVisible(False)
+            return
+        sheets, seconds, unknown, passes = stat
+        label.setText("耗纸：%s%d张；预估时间：%s"
+                      % ("≈" if unknown else "", sheets, _format_cn_duration(seconds)))
+        try:
+            p = self._printer_profile()
+            a, b = p.speed_fit()
+            manual_speed = bool(p.speed_is_manual)
+            flip = max(0.0, float(getattr(p, "flip_ready_sec", 0.0) or 0.0))
+            one_pass = float(p.estimate_first_pass(sheets))
+        except Exception:
+            a = b = 0.0
+            manual_speed, flip, one_pass = False, 0.0, 0.0
+        tip = ["这单一共要出 %d 张纸（含份数）：双面 2 页一张、单面每页一张，"
+               "勾了「封面单独打印」的页按段重算。" % sheets]
+        if passes == 2:
+            tip.append("本机不支持自动双面 ⇒ 整单两趟：第 1 趟正面、第 2 趟背面，"
+                       "两趟都要把纸走一遍。")
+            tip.append("耗时 ≈ %s × 2 趟 + 翻页准备 %s ≈ %s。"
+                       % (_format_cn_duration(one_pass), _format_cn_duration(flip),
+                          _format_cn_duration(seconds)))
+        else:
+            tip.append("耗时 ≈ %s（一趟打完）。" % _format_cn_duration(seconds))
+        tip.append("速度取自本机档案的实测样本：启动 ≈%.0f秒 + 每张 ≈%.1f秒%s。"
+                   % (a, b, "（手动覆盖）" if manual_speed else ""))
+        tip.append("不含首页封面、也不含 Word/Excel → PDF 的转换时间；"
+                   "页数未知的文件按 1 页保守估。")
+        if passes == 2 and self._stack_mode_on():
+            tip.append("攒批模式下本单先只打第 1 趟，第 2 趟等整叠一起补 —— "
+                       "上面两趟是这单自己打完的总时长。")
+        label.setToolTip("\n".join(tip))
+        label.setVisible(True)
+
     def _update_total_cost(self):
         """更新合计费用标签（含附加服务）。"""
         jobs = self._get_current_jobs()
@@ -15269,6 +15398,8 @@ class MainWindow(QMainWindow):
                 self._copy_detail_btn.setEnabled(True)
         # 底部「空白页率」常显跟着同一批 jobs 走（加删文件 / 改单双面 / 切标签页都会重算）
         self._update_blank_rate(jobs)
+        # 「耗纸 / 预估打印时间」同理（同一批 jobs，同一个刷新点，别再各挂一套信号）
+        self._update_print_estimate(jobs)
 
     def _reveal_in_explorer(self, path: str) -> bool:
         """在资源管理器里打开所在文件夹，**并把这个文件选中**（右键菜单「打开文件位置」）。
